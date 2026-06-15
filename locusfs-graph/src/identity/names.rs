@@ -1,7 +1,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{LocusFsError, Result};
+use crate::{GraphError, Result};
+
+use super::validate_identifier;
 
 macro_rules! identity_type {
     ($type_name:ident, $kind:literal) => {
@@ -31,7 +33,7 @@ macro_rules! identity_type {
         }
 
         impl FromStr for $type_name {
-            type Err = LocusFsError;
+            type Err = GraphError;
 
             fn from_str(value: &str) -> Result<Self> {
                 Self::new(value)
@@ -40,36 +42,7 @@ macro_rules! identity_type {
     };
 }
 
-identity_type!(NodeId, "node id");
 identity_type!(NodeKind, "node kind");
 identity_type!(PathName, "path name");
-identity_type!(ProjectName, "project name");
 identity_type!(PropertyKey, "property key");
 identity_type!(RelationName, "relation name");
-
-pub(crate) fn validate_identifier(kind: &'static str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Err(LocusFsError::invalid_identifier(kind, value, "empty"));
-    }
-
-    if value == "." || value == ".." {
-        return Err(LocusFsError::invalid_identifier(
-            kind,
-            value,
-            "reserved path segment",
-        ));
-    }
-
-    if value.contains('\0') {
-        return Err(LocusFsError::invalid_identifier(
-            kind,
-            value,
-            "contains NUL",
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod test;

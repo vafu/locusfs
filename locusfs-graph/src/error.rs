@@ -2,12 +2,12 @@ use std::io;
 
 use thiserror::Error;
 
-/// Result type used by `locusfs-core`.
-pub type Result<T> = std::result::Result<T, LocusFsError>;
+/// Result type used by `locusfs-graph`.
+pub type Result<T> = std::result::Result<T, GraphError>;
 
-/// Typed error surface for graph and filesystem-domain operations.
+/// Typed error surface for graph-domain operations.
 #[derive(Debug, Error)]
-pub enum LocusFsError {
+pub enum GraphError {
     #[error("invalid {kind} {value:?}: {reason}")]
     InvalidIdentifier {
         kind: &'static str,
@@ -23,8 +23,10 @@ pub enum LocusFsError {
     InvalidEncoding { segment: String },
     #[error("{kind} not found: {name}")]
     NotFound { kind: &'static str, name: String },
-    #[error("unsupported filesystem operation: {operation}")]
+    #[error("unsupported graph operation: {operation}")]
     Unsupported { operation: &'static str },
+    #[error("internal graph failure: {reason}")]
+    Internal { reason: &'static str },
     #[error("invalid {kind} value {value:?}: {reason}")]
     InvalidValue {
         kind: &'static str,
@@ -35,7 +37,7 @@ pub enum LocusFsError {
     Io(String),
 }
 
-impl LocusFsError {
+impl GraphError {
     pub(crate) fn invalid_identifier(
         kind: &'static str,
         value: impl Into<String>,
@@ -47,21 +49,9 @@ impl LocusFsError {
             reason,
         }
     }
-
-    pub(crate) fn invalid_value(
-        kind: &'static str,
-        value: impl Into<String>,
-        reason: &'static str,
-    ) -> Self {
-        Self::InvalidValue {
-            kind,
-            value: value.into(),
-            reason,
-        }
-    }
 }
 
-impl From<io::Error> for LocusFsError {
+impl From<io::Error> for GraphError {
     fn from(error: io::Error) -> Self {
         Self::Io(error.to_string())
     }

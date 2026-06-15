@@ -5,81 +5,89 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use locusfs_core::InMemoryGraph;
 use locusfs_fuse::{FuseMountConfig, mount};
+use locusfs_graph::{DynamicGraph, InMemoryProvider, NodeKind};
 
 #[test]
 #[ignore = "requires host /dev/fuse access"]
-fn project_symlink_flow_works_through_real_fuse_mount() {
+fn generic_nodes_props_and_out_relations_work_through_real_fuse_mount() {
     let mountpoint = Path::new("/tmp/locusfs-test");
     cleanup_mount(mountpoint);
     fs::create_dir_all(mountpoint).unwrap();
 
-    let project = tempfile::tempdir().unwrap();
-    init_git_repo(project.path());
-
-    let _mount = mount(FuseMountConfig::new(mountpoint), InMemoryGraph::new()).unwrap();
+    let kind = NodeKind::new("node").unwrap();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph.register_node_provider(provider.clone()).unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .unwrap();
+    graph
+        .register_property_provider(kind.clone(), provider.clone())
+        .unwrap();
+    graph
+        .register_property_mutation_provider(kind.clone(), provider.clone())
+        .unwrap();
+    graph
+        .register_relation_provider(kind.clone(), provider.clone())
+        .unwrap();
+    graph
+        .register_relation_mutation_provider(kind, provider)
+        .unwrap();
+    let _mount = mount(FuseMountConfig::new(mountpoint), graph).unwrap();
     wait_for_mount(mountpoint);
 
-    let project_path = mountpoint.join("projects/my-project");
-    symlink(project.path(), &project_path).unwrap();
+    let source = mountpoint.join("nodes/node/57");
+    let target = mountpoint.join("nodes/node/6");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&target).unwrap();
 
-    let projects = fs::read_dir(mountpoint.join("projects"))
+    fs::write(source.join("props/title"), "value\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(source.join("props/title")).unwrap(),
+        "value\n"
+    );
+
+    fs::create_dir(source.join("out/linked-to")).unwrap();
+    fs::create_dir(source.join("out/linked-to/node")).unwrap();
+    symlink("../../../../../node/6", source.join("out/linked-to/node/6")).unwrap();
+    assert_eq!(
+        fs::read_link(source.join("out/linked-to/node/6")).unwrap(),
+        Path::new("../../../../../node/6")
+    );
+
+    let relation_target_kinds = fs::read_dir(source.join("out/linked-to"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert_eq!(projects, vec!["my-project"]);
+    assert_eq!(relation_target_kinds, vec!["node"]);
 
-    assert_eq!(
-        fs::read_to_string(project_path.join("git-branch")).unwrap(),
-        format!("{}\n", expected_git_branch(project.path()))
+    let relation_targets = fs::read_dir(source.join("out/linked-to/node"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(relation_targets, vec!["6"]);
+
+    fs::remove_file(source.join("out/linked-to/node/6")).unwrap();
+    fs::remove_dir(source.join("out/linked-to/node")).unwrap();
+    assert!(
+        fs::read_dir(source.join("out/linked-to"))
+            .unwrap()
+            .next()
+            .is_none()
     );
 
-    fs::write(project_path.join("name"), "Display Name\n").unwrap();
-    assert_eq!(
-        fs::read_to_string(project_path.join("name")).unwrap(),
-        "Display Name\n"
-    );
-
-    assert_eq!(
-        fs::read_to_string(project_path.join("path")).unwrap(),
-        format!("{}\n", project.path().display())
-    );
+    fs::remove_file(source.join("props/title")).unwrap();
+    assert!(fs::read_dir(source.join("props")).unwrap().next().is_none());
 
     drop(_mount);
     cleanup_mount(mountpoint);
 }
 
-fn init_git_repo(path: &Path) {
-    run(Command::new("git").arg("-C").arg(path).arg("init"));
-}
-
-fn expected_git_branch(path: &Path) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("branch")
-        .arg("--show-current")
-        .output()
-        .unwrap();
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-fn run(command: &mut Command) {
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "command failed: status={:?} stdout={} stderr={}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 fn wait_for_mount(mountpoint: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if mountpoint.join("projects").is_dir() {
+        if mountpoint.join("nodes").is_dir() {
             return;
         }
         thread::sleep(Duration::from_millis(25));
