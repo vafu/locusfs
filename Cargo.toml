@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "locusfs",
+    "locusfs-core",
+    "locusfs-fuse",
+]
+resolver = "3"
+
