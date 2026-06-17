@@ -8,6 +8,7 @@ libc = "0.2"
 locusfs-client = { path = "../locusfs-client" }
 locusfs-graph = { path = "../locusfs-graph" }
 locusfs-fuse = { path = "../locusfs-fuse" }
+locusfs-plugin-dbus = { path = "../plugins/dbus" }
 locusfs-plugin-niri = { path = "../plugins/niri" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

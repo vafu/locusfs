@@ -88,7 +88,13 @@ fn usage(program: &str) -> String {
     format!("usage: {program} <mountpoint>\n       {program} --watch <path>")
 }
 
-async fn default_graph() -> Result<(DynamicGraph, Vec<locusfs_plugin_niri::NiriPluginHandle>)> {
+#[derive(Debug)]
+struct PluginHandles {
+    _dbus: locusfs_plugin_dbus::DbusPluginHandle,
+    _niri: locusfs_plugin_niri::NiriPluginHandle,
+}
+
+async fn default_graph() -> Result<(DynamicGraph, PluginHandles)> {
     let kind = NodeKind::new("node")?;
     let provider = InMemoryProvider::new(kind.clone());
     let graph = DynamicGraph::new();
@@ -108,8 +114,15 @@ async fn default_graph() -> Result<(DynamicGraph, Vec<locusfs_plugin_niri::NiriP
     graph
         .register_relation_mutation_provider(kind, provider)
         .await?;
+    let dbus = locusfs_plugin_dbus::register(&graph).await?;
     let niri = locusfs_plugin_niri::register(&graph).await?;
-    Ok((graph, vec![niri]))
+    Ok((
+        graph,
+        PluginHandles {
+            _dbus: dbus,
+            _niri: niri,
+        },
+    ))
 }
 
 async fn wait_for_shutdown() -> std::result::Result<(), Box<dyn std::error::Error>> {

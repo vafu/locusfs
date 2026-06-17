@@ -4,6 +4,7 @@ members = [
     "locusfs-client",
     "locusfs-graph",
     "locusfs-fuse",
+    "plugins/dbus",
     "plugins/niri",
 ]
 resolver = "3"

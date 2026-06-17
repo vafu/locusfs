@@ -1,0 +1,11 @@
+[package]
+name = "locusfs-plugin-dbus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+locusfs-graph = { path = "../../locusfs-graph" }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }
