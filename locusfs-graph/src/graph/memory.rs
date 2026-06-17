@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::RwLock;
 
 use crate::{
     GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName, Result,
@@ -31,20 +34,16 @@ impl InMemoryProvider {
     pub fn new(kind: NodeKind) -> Self {
         Self {
             kind,
-            inner: Arc::default(),
+            inner: Arc::new(RwLock::new(ProviderState::default())),
         }
     }
 
-    fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, ProviderState>> {
-        self.inner.read().map_err(|_| GraphError::Internal {
-            reason: "in-memory provider lock poisoned",
-        })
+    async fn read_state(&self) -> tokio::sync::RwLockReadGuard<'_, ProviderState> {
+        self.inner.read().await
     }
 
-    fn write_state(&self) -> Result<std::sync::RwLockWriteGuard<'_, ProviderState>> {
-        self.inner.write().map_err(|_| GraphError::Internal {
-            reason: "in-memory provider lock poisoned",
-        })
+    async fn write_state(&self) -> tokio::sync::RwLockWriteGuard<'_, ProviderState> {
+        self.inner.write().await
     }
 
     fn ensure_kind(&self, node: &NodeId) -> Result<()> {
@@ -80,34 +79,36 @@ impl InMemoryProvider {
     }
 }
 
+#[async_trait]
 impl NodeProvider for InMemoryProvider {
     fn kind(&self) -> &NodeKind {
         &self.kind
     }
 
-    fn contains_node(&self, node: &NodeId) -> Result<bool> {
+    async fn contains_node(&self, node: &NodeId) -> Result<bool> {
         self.ensure_kind(node)?;
-        let state = self.read_state()?;
+        let state = self.read_state().await;
         Ok(state.nodes.contains_key(node))
     }
 
-    fn nodes(&self) -> Result<Vec<NodeId>> {
-        let state = self.read_state()?;
+    async fn nodes(&self) -> Result<Vec<NodeId>> {
+        let state = self.read_state().await;
         Ok(state.nodes.keys().cloned().collect())
     }
 }
 
+#[async_trait]
 impl NodeMutationProvider for InMemoryProvider {
-    fn create_node(&self, node: &NodeId) -> Result<()> {
+    async fn create_node(&self, node: &NodeId) -> Result<()> {
         self.ensure_kind(node)?;
-        let mut state = self.write_state()?;
+        let mut state = self.write_state().await;
         state.nodes.entry(node.clone()).or_default();
         Ok(())
     }
 
-    fn remove_node(&self, node: &NodeId) -> Result<()> {
+    async fn remove_node(&self, node: &NodeId) -> Result<()> {
         self.ensure_kind(node)?;
-        let mut state = self.write_state()?;
+        let mut state = self.write_state().await;
         state
             .nodes
             .remove(node)
@@ -127,9 +128,10 @@ impl NodeMutationProvider for InMemoryProvider {
     }
 }
 
+#[async_trait]
 impl PropertyProvider for InMemoryProvider {
-    fn property_spec(&self, subject: &NodeId, key: &PropertyKey) -> Result<PropertySpec> {
-        let state = self.read_state()?;
+    async fn property_spec(&self, subject: &NodeId, key: &PropertyKey) -> Result<PropertySpec> {
+        let state = self.read_state().await;
         let node = self.existing_node(&state, subject)?;
         let value = node
             .properties
@@ -141,8 +143,8 @@ impl PropertyProvider for InMemoryProvider {
         Ok(PropertySpec::read_write(key.clone(), value.kind()))
     }
 
-    fn properties(&self, subject: &NodeId) -> Result<Vec<PropertySpec>> {
-        let state = self.read_state()?;
+    async fn properties(&self, subject: &NodeId) -> Result<Vec<PropertySpec>> {
+        let state = self.read_state().await;
         let node = self.existing_node(&state, subject)?;
         Ok(node
             .properties
@@ -151,8 +153,8 @@ impl PropertyProvider for InMemoryProvider {
             .collect())
     }
 
-    fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
-        let state = self.read_state()?;
+    async fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
+        let state = self.read_state().await;
         let node = self.existing_node(&state, subject)?;
         node.properties
             .get(key)
@@ -164,16 +166,22 @@ impl PropertyProvider for InMemoryProvider {
     }
 }
 
+#[async_trait]
 impl PropertyMutationProvider for InMemoryProvider {
-    fn set_property(&self, subject: &NodeId, key: &PropertyKey, value: LocusValue) -> Result<()> {
-        let mut state = self.write_state()?;
+    async fn set_property(
+        &self,
+        subject: &NodeId,
+        key: &PropertyKey,
+        value: LocusValue,
+    ) -> Result<()> {
+        let mut state = self.write_state().await;
         let node = self.existing_node_mut(&mut state, subject)?;
         node.properties.insert(key.clone(), value);
         Ok(())
     }
 
-    fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
-        let mut state = self.write_state()?;
+    async fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
+        let mut state = self.write_state().await;
         let node = self.existing_node_mut(&mut state, subject)?;
         if node.properties.remove(key).is_some() {
             Ok(())
@@ -186,15 +194,16 @@ impl PropertyMutationProvider for InMemoryProvider {
     }
 }
 
+#[async_trait]
 impl RelationProvider for InMemoryProvider {
-    fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
-        let state = self.read_state()?;
+    async fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
+        let state = self.read_state().await;
         let node = self.existing_node(&state, source)?;
         Ok(node.links.keys().cloned().collect())
     }
 
-    fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
-        let state = self.read_state()?;
+    async fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
+        let state = self.read_state().await;
         let node = self.existing_node(&state, source)?;
         node.links
             .get(relation)
@@ -206,9 +215,15 @@ impl RelationProvider for InMemoryProvider {
     }
 }
 
+#[async_trait]
 impl RelationMutationProvider for InMemoryProvider {
-    fn set_link(&self, source: &NodeId, relation: &RelationName, target: &NodeId) -> Result<()> {
-        let mut state = self.write_state()?;
+    async fn set_link(
+        &self,
+        source: &NodeId,
+        relation: &RelationName,
+        target: &NodeId,
+    ) -> Result<()> {
+        let mut state = self.write_state().await;
         let source_node = self.existing_node_mut(&mut state, source)?;
         source_node
             .links
@@ -218,8 +233,13 @@ impl RelationMutationProvider for InMemoryProvider {
         Ok(())
     }
 
-    fn remove_link(&self, source: &NodeId, relation: &RelationName, target: &NodeId) -> Result<()> {
-        let mut state = self.write_state()?;
+    async fn remove_link(
+        &self,
+        source: &NodeId,
+        relation: &RelationName,
+        target: &NodeId,
+    ) -> Result<()> {
+        let mut state = self.write_state().await;
         let source_node = self.existing_node_mut(&mut state, source)?;
         let removed = {
             let targets =

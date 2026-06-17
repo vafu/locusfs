@@ -1,12 +1,21 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use fuser::{Errno, FileHandle, PollEvents, PollFlags, PollNotifier};
+use fuse3::Errno;
+use fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY;
 use locusfs_graph::{NodeId, PropertyKey, RelationName};
+use tokio::sync::Mutex;
 
 use super::entry::FsEntry;
+use crate::errno;
 
 pub type SharedWatchRegistry = Arc<Mutex<WatchRegistry>>;
+pub type PollHandle = u64;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FileHandle(pub u64);
+
+const READABLE_EVENTS: u32 = libc::POLLIN as u32 | libc::POLLRDNORM as u32;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum WatchKey {
@@ -44,7 +53,7 @@ enum OpenFileState {
 #[derive(Debug, Default)]
 struct PropertyWatchState {
     generation: u64,
-    poll_handles: Vec<fuser::PollHandle>,
+    poll_handles: Vec<(FileHandle, PollHandle)>,
 }
 
 #[derive(Debug, Default)]
@@ -53,7 +62,7 @@ struct WatchHandle {
     resolved_subject: Option<WatchSubjectKey>,
     dependencies: Vec<WatchKey>,
     pending: bool,
-    poll_handles: Vec<fuser::PollHandle>,
+    poll_handles: Vec<PollHandle>,
 }
 
 #[derive(Debug, Default)]
@@ -92,10 +101,13 @@ impl WatchRegistry {
             None if matches!(entry, FsEntry::WatchFile) => {
                 OpenFileState::Watch(WatchHandle::default())
             }
-            None => return Err(Errno::EINVAL),
+            None => return Err(errno(libc::EINVAL)),
         };
         let handle = self.next_handle;
-        self.next_handle = self.next_handle.checked_add(1).ok_or(Errno::EOVERFLOW)?;
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .ok_or(errno(libc::EOVERFLOW))?;
         self.open_files.insert(handle, state);
         Ok(FileHandle(handle))
     }
@@ -125,12 +137,12 @@ impl WatchRegistry {
             self.open_files.get(&handle.0),
             Some(OpenFileState::Watch(_))
         ) {
-            return Err(Errno::EBADF);
+            return Err(errno(libc::EBADF));
         }
 
         self.detach_watch(handle);
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
-            return Err(Errno::EBADF);
+            return Err(errno(libc::EBADF));
         };
 
         watch.original_path = Some(path);
@@ -143,7 +155,7 @@ impl WatchRegistry {
 
     pub fn read_watch(&mut self, handle: FileHandle) -> std::result::Result<Vec<u8>, Errno> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
-            return Err(Errno::EINVAL);
+            return Err(errno(libc::EINVAL));
         };
         if watch.pending {
             watch.pending = false;
@@ -156,11 +168,11 @@ impl WatchRegistry {
     pub fn poll(
         &mut self,
         handle: FileHandle,
-        notifier: PollNotifier,
-        flags: PollFlags,
-    ) -> std::result::Result<PollEvents, Errno> {
+        kh: Option<PollHandle>,
+        flags: u32,
+    ) -> std::result::Result<u32, Errno> {
         let Some(open_file) = self.open_files.get(&handle.0) else {
-            return Err(Errno::EBADF);
+            return Err(errno(libc::EBADF));
         };
 
         match open_file {
@@ -170,39 +182,38 @@ impl WatchRegistry {
             } => {
                 let state = self.property_watches.entry(key.clone()).or_default();
                 if state.generation > *seen_generation {
-                    return Ok(PollEvents::POLLIN | PollEvents::POLLRDNORM);
+                    return Ok(READABLE_EVENTS);
                 }
 
-                if flags.contains(PollFlags::FUSE_POLL_SCHEDULE_NOTIFY) {
-                    state.poll_handles.push(notifier.handle());
+                if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
+                    if let Some(kh) = kh {
+                        state.poll_handles.push((handle, kh));
+                    }
                 }
-                Ok(PollEvents::empty())
+                Ok(0)
             }
-            OpenFileState::Watch(watch) if watch.pending => {
-                Ok(PollEvents::POLLIN | PollEvents::POLLRDNORM)
-            }
+            OpenFileState::Watch(watch) if watch.pending => Ok(READABLE_EVENTS),
             OpenFileState::Watch(_) => {
                 let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
-                    return Err(Errno::EBADF);
+                    return Err(errno(libc::EBADF));
                 };
-                if flags.contains(PollFlags::FUSE_POLL_SCHEDULE_NOTIFY) {
-                    watch.poll_handles.push(notifier.handle());
+                if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
+                    if let Some(kh) = kh {
+                        watch.poll_handles.push(kh);
+                    }
                 }
-                Ok(PollEvents::empty())
+                Ok(0)
             }
         }
     }
 
     pub fn release(&mut self, handle: FileHandle) {
         self.detach_watch(handle);
+        self.remove_property_poll_handles(handle);
         self.open_files.remove(&handle.0);
     }
 
-    pub fn notify_property_change(
-        &mut self,
-        node: &NodeId,
-        key: &PropertyKey,
-    ) -> Vec<fuser::PollHandle> {
+    pub fn notify_property_change(&mut self, node: &NodeId, key: &PropertyKey) -> Vec<PollHandle> {
         let watch_key = WatchKey::Property(node.clone(), key.clone());
         let mut handles = self.notify_property_poll_change(&watch_key);
         handles.extend(
@@ -211,7 +222,7 @@ impl WatchRegistry {
         handles
     }
 
-    pub fn notify_node_change(&mut self, node: &NodeId) -> Vec<fuser::PollHandle> {
+    pub fn notify_node_change(&mut self, node: &NodeId) -> Vec<PollHandle> {
         let mut handles = Vec::new();
         let keys = self
             .property_watches
@@ -242,49 +253,71 @@ impl WatchRegistry {
         handles
     }
 
-    pub fn retarget_dependents(
-        &mut self,
-        dependency: &WatchKey,
-        mut resolve: impl FnMut(&str) -> std::result::Result<WatchTarget, Errno>,
-    ) -> Vec<fuser::PollHandle> {
-        let handles = self
-            .dependency_index
-            .get(dependency)
-            .cloned()
-            .unwrap_or_default();
-        let mut poll_handles = Vec::new();
-
-        for handle in handles {
-            let Some(path) = self.watch_original_path(handle) else {
-                continue;
-            };
-            match resolve(&path) {
-                Ok(target) => {
-                    self.detach_watch(handle);
-                    if let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) {
-                        watch.original_path = Some(path);
-                        watch.resolved_subject = Some(target.subject.clone());
-                        watch.dependencies = target.dependencies.clone();
-                    }
-                    self.attach_watch(handle, &target.subject, &target.dependencies);
-                }
-                Err(_) => {
-                    self.detach_subject(handle);
-                }
-            }
-            poll_handles.extend(self.mark_watch_pending(handle));
+    pub fn notify_all(&mut self) -> Vec<PollHandle> {
+        let mut handles = Vec::new();
+        let keys = self.property_watches.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            handles.extend(self.notify_property_poll_change(&key));
         }
 
-        poll_handles
+        let watchers = self
+            .open_files
+            .iter()
+            .filter_map(|(handle, state)| match state {
+                OpenFileState::Watch(_) => Some(FileHandle(*handle)),
+                OpenFileState::PropertyPoll { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for watcher in watchers {
+            handles.extend(self.mark_watch_pending(watcher));
+        }
+        handles
     }
 
-    fn notify_property_poll_change(&mut self, key: &WatchKey) -> Vec<fuser::PollHandle> {
+    pub fn dependent_watch_paths(&self, dependency: &WatchKey) -> Vec<(FileHandle, String)> {
+        self.dependency_index
+            .get(dependency)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|handle| self.watch_original_path(handle).map(|path| (handle, path)))
+            .collect()
+    }
+
+    pub fn apply_retarget_result(
+        &mut self,
+        handle: FileHandle,
+        path: String,
+        result: std::result::Result<WatchTarget, Errno>,
+    ) -> Vec<PollHandle> {
+        match result {
+            Ok(target) => {
+                self.detach_watch(handle);
+                if let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) {
+                    watch.original_path = Some(path);
+                    watch.resolved_subject = Some(target.subject.clone());
+                    watch.dependencies = target.dependencies.clone();
+                }
+                self.attach_watch(handle, &target.subject, &target.dependencies);
+            }
+            Err(_) => {
+                self.detach_subject(handle);
+                return Vec::new();
+            }
+        }
+        self.mark_watch_pending(handle)
+    }
+
+    fn notify_property_poll_change(&mut self, key: &WatchKey) -> Vec<PollHandle> {
         let state = self.property_watches.entry(key.clone()).or_default();
         state.generation = state.generation.saturating_add(1);
         std::mem::take(&mut state.poll_handles)
+            .into_iter()
+            .map(|(_, kh)| kh)
+            .collect()
     }
 
-    fn notify_subject_change(&mut self, subject: &WatchSubjectKey) -> Vec<fuser::PollHandle> {
+    fn notify_subject_change(&mut self, subject: &WatchSubjectKey) -> Vec<PollHandle> {
         let watchers = self
             .subjects
             .get(subject)
@@ -297,7 +330,7 @@ impl WatchRegistry {
         handles
     }
 
-    fn mark_watch_pending(&mut self, handle: FileHandle) -> Vec<fuser::PollHandle> {
+    fn mark_watch_pending(&mut self, handle: FileHandle) -> Vec<PollHandle> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Vec::new();
         };
@@ -334,6 +367,14 @@ impl WatchRegistry {
     fn detach_watch(&mut self, handle: FileHandle) {
         self.detach_subject(handle);
         self.detach_dependencies(handle);
+    }
+
+    fn remove_property_poll_handles(&mut self, handle: FileHandle) {
+        for state in self.property_watches.values_mut() {
+            state
+                .poll_handles
+                .retain(|(poll_file, _)| *poll_file != handle);
+        }
     }
 
     fn detach_subject(&mut self, handle: FileHandle) {

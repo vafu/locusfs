@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use fuser::FileType;
+use fuse3::FileType;
 use locusfs_graph::{NodeId, NodeKind, PropertyKey, RelationName};
 
 use crate::layout::encode_segment;

@@ -1,15 +1,22 @@
 use std::ffi::OsStr;
-use std::io;
+use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::vec::IntoIter;
 
-use fuser::{
-    Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, KernelConfig,
-    LockOwner, OpenFlags, PollEvents, PollFlags, PollNotifier, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyWrite, Request, TimeOrNow,
+use bytes::Bytes;
+use fuse3::notify::Notify;
+use fuse3::raw::Filesystem;
+use fuse3::raw::Request;
+use fuse3::raw::reply::{
+    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyCreated, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyPoll, ReplyWrite,
 };
+use fuse3::{Errno, FileType, Inode, SetAttr};
+use futures_util::stream::{self, Iter};
 use locusfs_graph::{DynamicGraph, GraphError, NodeId, PropertyKey, RelationName};
+use tokio::sync::Mutex;
 
 use super::attr::{EntryTimes, TTL, file_attr};
 use super::entry::{
@@ -26,8 +33,14 @@ use super::value::{
     parse_property_write, property_file_string, property_perm, property_spec_or_new_string,
     slice_for_read,
 };
-use super::watch::{SharedWatchRegistry, WatchRegistry};
-use crate::graph_error_to_errno;
+use super::watch::{FileHandle, SharedWatchRegistry, WatchRegistry};
+use crate::{errno, graph_error_to_errno};
+
+const FOPEN_DIRECT_IO: u32 = 1;
+
+type VecDirEntryStream = Iter<IntoIter<fuse3::Result<DirectoryEntry>>>;
+type VecDirEntryPlusStream = Iter<IntoIter<fuse3::Result<DirectoryEntryPlus>>>;
+pub(crate) type SharedKernelNotify = Arc<Mutex<Option<Notify>>>;
 
 /// FUSE request adapter over the generic graph filesystem.
 #[derive(Debug)]
@@ -35,28 +48,36 @@ pub struct LocusFs {
     pub(super) graph: DynamicGraph,
     inodes: SharedInodeTable,
     watch: SharedWatchRegistry,
+    notify: SharedKernelNotify,
 }
 
 impl LocusFs {
     pub fn new(graph: DynamicGraph) -> Self {
-        Self::new_with_state(graph, InodeTable::shared(), WatchRegistry::shared())
+        Self::new_with_state(
+            graph,
+            InodeTable::shared(),
+            WatchRegistry::shared(),
+            Arc::new(Mutex::new(None)),
+        )
     }
 
     pub(crate) fn new_with_state(
         graph: DynamicGraph,
         inodes: SharedInodeTable,
         watch: SharedWatchRegistry,
+        notify: SharedKernelNotify,
     ) -> Self {
         Self {
             graph,
             inodes,
             watch,
+            notify,
         }
     }
 
-    fn lookup_entry(&self, parent: u64, name: &OsStr) -> std::result::Result<FsEntry, Errno> {
+    async fn lookup_entry(&self, parent: u64, name: &OsStr) -> std::result::Result<FsEntry, Errno> {
         let name = os_str_to_str(name)?;
-        let parent = self.entry(parent)?;
+        let parent = self.entry(parent).await?;
         match parent {
             FsEntry::Root => {
                 if name == WATCH_FILE_NAME {
@@ -66,12 +87,13 @@ impl LocusFs {
                 if self
                     .graph
                     .node_kinds()
+                    .await
                     .map_err(graph_error_to_errno)?
                     .contains(&kind)
                 {
                     Ok(FsEntry::KindDir(kind))
                 } else {
-                    Err(Errno::ENOENT)
+                    Err(errno(libc::ENOENT))
                 }
             }
             FsEntry::KindDir(kind) => {
@@ -79,29 +101,30 @@ impl LocusFs {
                 if self
                     .graph
                     .contains_node(&node)
+                    .await
                     .map_err(graph_error_to_errno)?
                 {
                     Ok(FsEntry::NodeDir(node))
                 } else {
-                    Err(Errno::ENOENT)
+                    Err(errno(libc::ENOENT))
                 }
             }
             FsEntry::NodeDir(node) => {
                 let property = property_key_from_segment(name)?;
-                let has_property = self.graph.property_spec(&node, &property).is_ok();
+                let has_property = self.graph.property_spec(&node, &property).await.is_ok();
                 let relation = relation_name_from_segment(name)?;
-                let targets = self.relation_targets(&node, &relation)?;
+                let targets = self.relation_targets(&node, &relation).await?;
                 let has_relation = !targets.is_empty();
 
                 if has_property && has_relation {
-                    return Err(Errno::EIO);
+                    return Err(errno(libc::EIO));
                 }
                 if has_property {
                     return Ok(FsEntry::PropertyFile(node, property));
                 }
 
                 match targets.as_slice() {
-                    [] => Err(Errno::ENOENT),
+                    [] => Err(errno(libc::ENOENT)),
                     [target] => Ok(FsEntry::RelationLink {
                         source: node,
                         relation,
@@ -116,6 +139,7 @@ impl LocusFs {
                 if self
                     .graph
                     .targets(&source, &relation)
+                    .await
                     .map_err(graph_error_to_errno)?
                     .contains(&target)
                 {
@@ -125,76 +149,75 @@ impl LocusFs {
                         target,
                     })
                 } else {
-                    Err(Errno::ENOENT)
+                    Err(errno(libc::ENOENT))
                 }
             }
             FsEntry::WatchFile
             | FsEntry::PropertyFile(_, _)
             | FsEntry::RelationLink { .. }
-            | FsEntry::RelationTargetLink { .. } => Err(Errno::ENOTDIR),
+            | FsEntry::RelationTargetLink { .. } => Err(errno(libc::ENOTDIR)),
         }
     }
 
-    fn entry(&self, ino: u64) -> std::result::Result<FsEntry, Errno> {
+    async fn entry(&self, ino: u64) -> std::result::Result<FsEntry, Errno> {
         self.inodes
             .lock()
-            .map_err(|_| Errno::EIO)?
+            .await
             .entry(ino)
-            .ok_or(Errno::ENOENT)
+            .ok_or(errno(libc::ENOENT))
     }
 
-    pub(super) fn inode(&self, entry: FsEntry) -> std::result::Result<u64, Errno> {
-        self.inodes.lock().map_err(|_| Errno::EIO)?.inode(entry)
+    pub(super) async fn inode(&self, entry: FsEntry) -> std::result::Result<u64, Errno> {
+        self.inodes.lock().await.inode(entry)
     }
 
-    fn acquire_inode(&self, entry: FsEntry) -> std::result::Result<u64, Errno> {
-        self.inodes.lock().map_err(|_| Errno::EIO)?.acquire(entry)
+    async fn acquire_inode(&self, entry: FsEntry) -> std::result::Result<u64, Errno> {
+        self.inodes.lock().await.acquire(entry)
     }
 
-    fn forget_inode(&self, ino: u64, nlookup: u64) {
-        if let Ok(mut inodes) = self.inodes.lock() {
-            inodes.forget(ino, nlookup);
-        }
+    async fn forget_inode(&self, ino: u64, nlookup: u64) {
+        self.inodes.lock().await.forget(ino, nlookup);
     }
 
-    fn forget_entry(&self, entry: &FsEntry) {
-        if let Ok(mut inodes) = self.inodes.lock() {
-            inodes.forget_entry(entry);
-        }
+    async fn forget_entry(&self, entry: &FsEntry) {
+        self.inodes.lock().await.forget_entry(entry);
     }
 
-    fn attr(&self, entry: &FsEntry, ino: u64) -> std::result::Result<fuser::FileAttr, Errno> {
+    async fn attr(&self, entry: &FsEntry, ino: u64) -> std::result::Result<FileAttr, Errno> {
         let (kind, perm, size) = match entry {
             FsEntry::Root => (FileType::Directory, 0o755, 0),
-            FsEntry::WatchFile => (FileType::RegularFile, 0o600, 0),
+            FsEntry::WatchFile => (FileType::RegularFile, 0o600, 4096),
             FsEntry::KindDir(kind) => {
                 if !self
                     .graph
                     .node_kinds()
+                    .await
                     .map_err(graph_error_to_errno)?
                     .contains(kind)
                 {
-                    return Err(Errno::ENOENT);
+                    return Err(errno(libc::ENOENT));
                 }
                 (FileType::Directory, 0o755, 0)
             }
             FsEntry::NodeDir(node) => {
-                self.ensure_node_exists(node)?;
+                self.ensure_node_exists(node).await?;
                 (FileType::Directory, 0o755, 0)
             }
             FsEntry::RelationDir(node, _) => {
-                self.ensure_node_exists(node)?;
+                self.ensure_node_exists(node).await?;
                 (FileType::Directory, 0o755, 0)
             }
             FsEntry::PropertyFile(node, key) => {
                 let spec = self
                     .graph
                     .property_spec(node, key)
+                    .await
                     .map_err(graph_error_to_errno)?;
                 let size = if spec.is_readable() {
                     let value = self
                         .graph
                         .property(node, key)
+                        .await
                         .map_err(graph_error_to_errno)?;
                     property_file_string(&value).len() as u64
                 } else {
@@ -207,7 +230,8 @@ impl LocusFs {
                 relation,
                 target,
             } => {
-                self.ensure_relation_link_exists(source, relation, target)?;
+                self.ensure_relation_link_exists(source, relation, target)
+                    .await?;
                 (
                     FileType::Symlink,
                     0o777,
@@ -222,7 +246,8 @@ impl LocusFs {
                 relation,
                 target,
             } => {
-                self.ensure_relation_link_exists(source, relation, target)?;
+                self.ensure_relation_link_exists(source, relation, target)
+                    .await?;
                 (
                     FileType::Symlink,
                     0o777,
@@ -234,32 +259,36 @@ impl LocusFs {
             }
         };
 
-        Ok(file_attr(ino, kind, perm, size, self.entry_times(entry)?))
+        Ok(file_attr(
+            ino,
+            kind,
+            perm,
+            size,
+            self.entry_times(entry).await?,
+        ))
     }
 
-    fn entry_times(&self, entry: &FsEntry) -> std::result::Result<EntryTimes, Errno> {
-        Ok(self.inodes.lock().map_err(|_| Errno::EIO)?.times(entry))
+    async fn entry_times(&self, entry: &FsEntry) -> std::result::Result<EntryTimes, Errno> {
+        Ok(self.inodes.lock().await.times(entry))
     }
 
-    fn touch_entry(&self, entry: &FsEntry) {
-        if let Ok(mut inodes) = self.inodes.lock() {
-            inodes.touch(entry);
-        }
+    async fn touch_entry(&self, entry: &FsEntry) {
+        self.inodes.lock().await.touch(entry);
     }
 
-    fn create_property_file(
+    async fn create_property_file(
         &self,
         parent: u64,
         name: &OsStr,
     ) -> std::result::Result<FsEntry, Errno> {
-        let FsEntry::NodeDir(node) = self.entry(parent)? else {
-            return Err(Errno::ENOTDIR);
+        let FsEntry::NodeDir(node) = self.entry(parent).await? else {
+            return Err(errno(libc::ENOTDIR));
         };
         let key = property_key_from_segment(os_str_to_str(name)?)?;
         Ok(FsEntry::PropertyFile(node, key))
     }
 
-    fn read_property(
+    async fn read_property(
         &self,
         node: &NodeId,
         key: &PropertyKey,
@@ -267,440 +296,382 @@ impl LocusFs {
         let spec = self
             .graph
             .property_spec(node, key)
+            .await
             .map_err(graph_error_to_errno)?;
         if spec.is_readable() {
             let value = self
                 .graph
                 .property(node, key)
+                .await
                 .map_err(graph_error_to_errno)?;
             Ok(property_file_string(&value).into_bytes())
         } else {
-            Err(Errno::EACCES)
+            Err(errno(libc::EACCES))
         }
+    }
+
+    async fn entry_reply(&self, entry: FsEntry) -> std::result::Result<ReplyEntry, Errno> {
+        let ino = self.acquire_inode(entry.clone()).await?;
+        let attr = self.attr(&entry, ino).await?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr,
+            generation: 0,
+        })
+    }
+
+    async fn attr_reply(&self, ino: u64) -> std::result::Result<ReplyAttr, Errno> {
+        let entry = self.entry(ino).await?;
+        Ok(ReplyAttr {
+            ttl: TTL,
+            attr: self.attr(&entry, ino).await?,
+        })
     }
 }
 
 impl Filesystem for LocusFs {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
-        Ok(())
+    async fn init(&self, _req: Request) -> fuse3::Result<ReplyInit> {
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(128 * 1024).expect("nonzero max write"),
+        })
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup_entry(parent.0, name).and_then(|entry| {
-            let ino = self.acquire_inode(entry.clone())?;
-            let attr = self.attr(&entry, ino)?;
-            Ok(attr)
-        }) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-            Err(error) => reply.error(error),
-        }
-    }
+    async fn destroy(&self, _req: Request) {}
 
-    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.forget_inode(ino.0, nlookup);
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.entry(ino.0).and_then(|entry| self.attr(&entry, ino.0)) {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.entry(ino.0) {
-            Ok(
-                FsEntry::Root
-                | FsEntry::KindDir(_)
-                | FsEntry::NodeDir(_)
-                | FsEntry::RelationDir(_, _),
-            ) => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Ok(
-                FsEntry::WatchFile
-                | FsEntry::PropertyFile(_, _)
-                | FsEntry::RelationLink { .. }
-                | FsEntry::RelationTargetLink { .. },
-            ) => reply.error(Errno::ENOTDIR),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn readdir(
+    async fn lookup(
         &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        let result = self
-            .entry(ino.0)
-            .and_then(|entry| self.dir_entries(&entry, ino.0));
-        match result {
-            Ok(entries) => {
-                for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    if reply.add(
-                        INodeNo(entry.ino),
-                        (index + 1) as u64,
-                        entry.kind,
-                        entry.name,
-                    ) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
-            Err(error) => reply.error(error),
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+    ) -> fuse3::Result<ReplyEntry> {
+        let entry = self.lookup_entry(parent, name).await?;
+        self.entry_reply(entry).await
+    }
+
+    async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
+        self.forget_inode(inode, nlookup).await;
+    }
+
+    async fn getattr(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: Option<u64>,
+        _flags: u32,
+    ) -> fuse3::Result<ReplyAttr> {
+        self.attr_reply(inode).await
+    }
+
+    async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        match self.entry(inode).await? {
+            FsEntry::Root
+            | FsEntry::KindDir(_)
+            | FsEntry::NodeDir(_)
+            | FsEntry::RelationDir(_, _) => Ok(ReplyOpen { fh: 0, flags: 0 }),
+            FsEntry::WatchFile
+            | FsEntry::PropertyFile(_, _)
+            | FsEntry::RelationLink { .. }
+            | FsEntry::RelationTargetLink { .. } => Err(errno(libc::ENOTDIR)),
         }
     }
 
-    fn mkdir(
+    type DirEntryStream<'a>
+        = VecDirEntryStream
+    where
+        Self: 'a;
+
+    async fn readdir<'a>(
+        &'a self,
+        _req: Request,
+        parent: Inode,
+        _fh: u64,
+        offset: i64,
+    ) -> fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a>>> {
+        let entry = self.entry(parent).await?;
+        let entries = self.dir_entries(&entry, parent).await?;
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .skip(offset.max(0) as usize)
+            .map(|(index, entry)| {
+                Ok(DirectoryEntry {
+                    inode: entry.ino,
+                    kind: entry.kind,
+                    name: entry.name.into(),
+                    offset: (index + 1) as i64,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(ReplyDirectory {
+            entries: stream::iter(entries),
+        })
+    }
+
+    async fn mkdir(
         &self,
-        _req: &Request,
-        parent: INodeNo,
+        _req: Request,
+        parent: Inode,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        let result = self.entry(parent.0).and_then(|entry| match entry {
+    ) -> fuse3::Result<ReplyEntry> {
+        let entry = match self.entry(parent).await? {
             FsEntry::KindDir(kind) => {
                 let node = node_id_from_kind_and_segment(kind, os_str_to_str(name)?)?;
                 self.graph
                     .create_node(&node)
+                    .await
                     .map_err(graph_error_to_errno)?;
-                Ok(FsEntry::NodeDir(node))
+                FsEntry::NodeDir(node)
             }
             FsEntry::NodeDir(node) => {
                 let relation = relation_name_from_segment(os_str_to_str(name)?)?;
-                Ok(FsEntry::RelationDir(node, relation))
+                FsEntry::RelationDir(node, relation)
             }
-            _ => Err(Errno::ENOTDIR),
-        });
+            _ => return Err(errno(libc::ENOTDIR)),
+        };
+        self.entry_reply(entry).await
+    }
 
-        match result.and_then(|entry| {
-            let ino = self.acquire_inode(entry.clone())?;
-            self.attr(&entry, ino)
-        }) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-            Err(error) => reply.error(error),
+    async fn open(&self, _req: Request, inode: Inode, _flags: u32) -> fuse3::Result<ReplyOpen> {
+        match self.entry(inode).await? {
+            entry @ (FsEntry::PropertyFile(_, _) | FsEntry::WatchFile) => {
+                let handle = self.watch.lock().await.open(&entry)?;
+                Ok(ReplyOpen {
+                    fh: handle.0,
+                    flags: FOPEN_DIRECT_IO,
+                })
+            }
+            FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => {
+                Err(errno(libc::EINVAL))
+            }
+            _ => Err(errno(libc::EISDIR)),
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.entry(ino.0) {
-            Ok(entry @ (FsEntry::PropertyFile(_, _) | FsEntry::WatchFile)) => {
-                let handle = self
-                    .watch
-                    .lock()
-                    .map_err(|_| Errno::EIO)
-                    .and_then(|mut watch| watch.open(&entry));
-                match handle {
-                    Ok(handle) => {
-                        reply.opened(handle, FopenFlags::FOPEN_DIRECT_IO);
-                    }
-                    Err(error) => reply.error(error),
-                }
-            }
-            Ok(FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. }) => {
-                reply.error(Errno::EINVAL)
-            }
-            Ok(_) => reply.error(Errno::EISDIR),
-            Err(error) => reply.error(error),
-        }
-    }
-
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.entry(ino.0) {
-            Ok(FsEntry::RelationLink {
+    async fn readlink(&self, _req: Request, inode: Inode) -> fuse3::Result<ReplyData> {
+        let data = match self.entry(inode).await? {
+            FsEntry::RelationLink {
                 source,
                 relation,
                 target,
-            }) => match self.ensure_relation_link_exists(&source, &relation, &target) {
-                Ok(()) => reply.data(direct_relation_link_target(&target).as_os_str().as_bytes()),
-                Err(error) => reply.error(error),
-            },
-            Ok(FsEntry::RelationTargetLink {
+            } => {
+                self.ensure_relation_link_exists(&source, &relation, &target)
+                    .await?;
+                direct_relation_link_target(&target)
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
+            }
+            FsEntry::RelationTargetLink {
                 source,
                 relation,
                 target,
-            }) => match self.ensure_relation_link_exists(&source, &relation, &target) {
-                Ok(()) => reply.data(nested_relation_link_target(&target).as_os_str().as_bytes()),
-                Err(error) => reply.error(error),
-            },
-            Ok(_) => reply.error(Errno::EINVAL),
-            Err(error) => reply.error(error),
-        }
+            } => {
+                self.ensure_relation_link_exists(&source, &relation, &target)
+                    .await?;
+                nested_relation_link_target(&target)
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
+            }
+            _ => return Err(errno(libc::EINVAL)),
+        };
+        Ok(ReplyData {
+            data: Bytes::from(data),
+        })
     }
 
-    fn read(
+    async fn read(
         &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
+        _req: Request,
+        inode: Inode,
+        fh: u64,
         offset: u64,
         size: u32,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        let result = self.entry(ino.0).and_then(|entry| match entry {
-            FsEntry::PropertyFile(node, key) => self
-                .read_property(&node, &key)
-                .map(|data| slice_for_read(&data, offset, size).to_vec()),
+    ) -> fuse3::Result<ReplyData> {
+        let data = match self.entry(inode).await? {
+            FsEntry::PropertyFile(node, key) => {
+                let data = self.read_property(&node, &key).await?;
+                slice_for_read(&data, offset, size).to_vec()
+            }
             FsEntry::WatchFile => {
-                self.watch
-                    .lock()
-                    .map_err(|_| Errno::EIO)
-                    .and_then(|mut watch| {
-                        let data = watch.read_watch(fh)?;
-                        Ok(slice_for_read(&data, 0, size).to_vec())
-                    })
+                let data = self.watch.lock().await.read_watch(FileHandle(fh))?;
+                slice_for_read(&data, offset, size).to_vec()
             }
-            FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => Err(Errno::EINVAL),
-            _ => Err(Errno::EISDIR),
-        });
+            FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => {
+                return Err(errno(libc::EINVAL));
+            }
+            _ => return Err(errno(libc::EISDIR)),
+        };
 
-        match result {
-            Ok(data) => {
-                if let Ok(mut watch) = self.watch.lock() {
-                    watch.mark_read(fh);
-                }
-                reply.data(&data)
-            }
-            Err(error) => reply.error(error),
-        }
+        self.watch.lock().await.mark_read(FileHandle(fh));
+        Ok(ReplyData {
+            data: Bytes::from(data),
+        })
     }
 
-    fn write(
+    async fn write(
         &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
+        _req: Request,
+        inode: Inode,
+        fh: u64,
         offset: u64,
         data: &[u8],
-        _write_flags: fuser::WriteFlags,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        if offset != 0 {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-
-        let result = self.entry(ino.0).and_then(|entry| match entry {
-            FsEntry::PropertyFile(node, key) => {
-                let input = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-                let spec = property_spec_or_new_string(&self.graph, &node, &key)?;
-                if !spec.is_writable() {
-                    return Err(Errno::EACCES);
-                }
-                let value =
-                    parse_property_write(spec.kind(), input).map_err(graph_error_to_errno)?;
-                self.graph
-                    .set_property(&node, &key, value)
-                    .map_err(graph_error_to_errno)?;
-                self.touch_entry(&FsEntry::PropertyFile(node.clone(), key.clone()));
-                self.touch_entry(&FsEntry::NodeDir(node));
-                Ok(data.len() as u32)
-            }
-            FsEntry::WatchFile => {
-                let path = parse_watch_subscription(data)?;
-                let target = resolve_watch_path(&self.graph, &path)?;
-                self.watch
-                    .lock()
-                    .map_err(|_| Errno::EIO)?
-                    .configure_watch(fh, path, target)?;
-                Ok(data.len() as u32)
-            }
-            _ => Err(Errno::EISDIR),
-        });
-
-        match result {
-            Ok(written) => reply.written(written),
-            Err(error) => reply.error(error),
-        }
+        _write_flags: u32,
+        _flags: u32,
+    ) -> fuse3::Result<ReplyWrite> {
+        let data = data.to_vec();
+        // fuse3 0.8.1's generated write future is not general enough to await after borrowing
+        // the input buffer. The buffer is owned here; keep the bridge local until fuse3 fixes it.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| handle.block_on(self.write_owned(inode, fh, offset, data)))
     }
 
-    fn release(
+    async fn release(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
+        _req: Request,
+        _inode: Inode,
+        fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
         _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        if let Ok(mut watch) = self.watch.lock() {
-            watch.release(fh);
-        }
-        reply.ok();
+    ) -> fuse3::Result<()> {
+        self.watch.lock().await.release(FileHandle(fh));
+        Ok(())
     }
 
-    fn create(
+    async fn create(
         &self,
-        _req: &Request,
-        parent: INodeNo,
+        _req: Request,
+        parent: Inode,
         name: &OsStr,
         _mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: ReplyCreate,
-    ) {
-        match self.create_property_file(parent.0, name).and_then(|entry| {
-            let ino = self.acquire_inode(entry.clone())?;
-            Ok(file_attr(
+        _flags: u32,
+    ) -> fuse3::Result<ReplyCreated> {
+        let entry = self.create_property_file(parent, name).await?;
+        let ino = self.acquire_inode(entry.clone()).await?;
+        let handle = self.watch.lock().await.open(&entry)?;
+        Ok(ReplyCreated {
+            ttl: TTL,
+            attr: file_attr(
                 ino,
                 FileType::RegularFile,
                 0o644,
                 0,
-                self.entry_times(&entry)?,
-            ))
-        }) {
-            Ok(attr) => reply.created(
-                &TTL,
-                &attr,
-                Generation(0),
-                FileHandle(0),
-                FopenFlags::empty(),
+                self.entry_times(&entry).await?,
             ),
-            Err(error) => reply.error(error),
-        }
+            generation: 0,
+            fh: handle.0,
+            flags: FOPEN_DIRECT_IO,
+        })
     }
 
-    fn setattr(
+    async fn setattr(
         &self,
-        _req: &Request,
-        ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
-        if matches!(size, Some(0)) {
-            match self.entry(ino.0).and_then(|entry| self.attr(&entry, ino.0)) {
-                Ok(attr) => reply.attr(&TTL, &attr),
-                Err(error) => reply.error(error),
-            }
+        _req: Request,
+        inode: Inode,
+        _fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> fuse3::Result<ReplyAttr> {
+        if matches!(set_attr.size, Some(0)) {
+            self.attr_reply(inode).await
         } else {
-            reply.error(Errno::ENOSYS);
+            Err(errno(libc::ENOSYS))
         }
     }
 
-    fn poll(
+    async fn poll(
         &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        ph: PollNotifier,
-        _events: PollEvents,
-        flags: PollFlags,
-        reply: ReplyPoll,
-    ) {
-        match self.entry(ino.0) {
-            Ok(FsEntry::PropertyFile(_, _) | FsEntry::WatchFile) => {
-                let result = self
-                    .watch
-                    .lock()
-                    .map_err(|_| Errno::EIO)
-                    .and_then(|mut watch| watch.poll(fh, ph, flags));
-                match result {
-                    Ok(events) => reply.poll(events),
-                    Err(error) => reply.error(error),
-                }
+        _req: Request,
+        inode: Inode,
+        fh: u64,
+        kh: Option<u64>,
+        flags: u32,
+        _events: u32,
+        notify: &Notify,
+    ) -> fuse3::Result<ReplyPoll> {
+        *self.notify.lock().await = Some(notify.clone());
+        let revents = match self.entry(inode).await? {
+            FsEntry::PropertyFile(_, _) | FsEntry::WatchFile => {
+                self.watch.lock().await.poll(FileHandle(fh), kh, flags)?
             }
-            Ok(_) => reply.poll(PollEvents::POLLNVAL),
-            Err(error) => reply.error(error),
-        }
+            _ => libc::POLLNVAL as u32,
+        };
+        Ok(ReplyPoll { revents })
     }
 
-    fn symlink(
+    async fn symlink(
         &self,
-        _req: &Request,
-        parent: INodeNo,
+        _req: Request,
+        parent: Inode,
         link_name: &OsStr,
-        _target: &Path,
-        reply: ReplyEntry,
-    ) {
-        let result = self.entry(parent.0).and_then(|entry| {
-            let symlink_target = node_id_from_relation_link_target_path(_target)?;
-            match entry {
-                FsEntry::NodeDir(source) => {
-                    let relation = relation_name_from_segment(os_str_to_str(link_name)?)?;
-                    self.graph
-                        .set_link(&source, &relation, &symlink_target)
-                        .map_err(graph_error_to_errno)?;
-                    Ok(FsEntry::RelationLink {
-                        source,
-                        relation,
-                        target: symlink_target,
-                    })
+        target: &OsStr,
+    ) -> fuse3::Result<ReplyEntry> {
+        let symlink_target = node_id_from_relation_link_target_path(Path::new(target))?;
+        let entry = match self.entry(parent).await? {
+            FsEntry::NodeDir(source) => {
+                let relation = relation_name_from_segment(os_str_to_str(link_name)?)?;
+                self.graph
+                    .set_link(&source, &relation, &symlink_target)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                FsEntry::RelationLink {
+                    source,
+                    relation,
+                    target: symlink_target,
                 }
-                FsEntry::RelationDir(source, relation) => {
-                    let target =
-                        NodeId::parse(&decode_relation_target_name(os_str_to_str(link_name)?)?)
-                            .map_err(graph_error_to_errno)?;
-                    if symlink_target != target {
-                        return Err(Errno::EINVAL);
-                    }
-                    self.graph
-                        .set_link(&source, &relation, &target)
-                        .map_err(graph_error_to_errno)?;
-                    Ok(FsEntry::RelationTargetLink {
-                        source,
-                        relation,
-                        target,
-                    })
-                }
-                _ => Err(Errno::ENOTDIR),
             }
-        });
+            FsEntry::RelationDir(source, relation) => {
+                let target =
+                    NodeId::parse(&decode_relation_target_name(os_str_to_str(link_name)?)?)
+                        .map_err(graph_error_to_errno)?;
+                if symlink_target != target {
+                    return Err(errno(libc::EINVAL));
+                }
+                self.graph
+                    .set_link(&source, &relation, &target)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                FsEntry::RelationTargetLink {
+                    source,
+                    relation,
+                    target,
+                }
+            }
+            _ => return Err(errno(libc::ENOTDIR)),
+        };
 
-        match result.and_then(|entry| {
-            let ino = self.acquire_inode(entry.clone())?;
-            self.attr(&entry, ino)
-        }) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-            Err(error) => reply.error(error),
-        }
+        self.entry_reply(entry).await
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let result = self.entry(parent.0).and_then(|entry| match entry {
+    async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> fuse3::Result<()> {
+        match self.entry(parent).await? {
             FsEntry::NodeDir(node) => {
                 let name = os_str_to_str(name)?;
                 let key = property_key_from_segment(name)?;
-                let has_property = self.graph.property_spec(&node, &key).is_ok();
+                let has_property = self.graph.property_spec(&node, &key).await.is_ok();
                 let relation = relation_name_from_segment(name)?;
-                let targets = self.relation_targets(&node, &relation)?;
+                let targets = self.relation_targets(&node, &relation).await?;
                 let has_relation = !targets.is_empty();
 
                 if has_property && has_relation {
-                    return Err(Errno::EIO);
+                    return Err(errno(libc::EIO));
                 }
                 if has_property {
                     return self
                         .graph
                         .remove_property(&node, &key)
+                        .await
                         .map_err(graph_error_to_errno);
                 }
 
                 let [target] = targets.as_slice() else {
-                    return Err(Errno::ENOENT);
+                    return Err(errno(libc::ENOENT));
                 };
                 self.graph
                     .remove_link(&node, &relation, target)
+                    .await
                     .map_err(graph_error_to_errno)
             }
             FsEntry::RelationDir(source, relation) => {
@@ -708,61 +679,133 @@ impl Filesystem for LocusFs {
                     .map_err(graph_error_to_errno)?;
                 self.graph
                     .remove_link(&source, &relation, &target)
+                    .await
                     .map_err(graph_error_to_errno)
             }
-            _ => Err(Errno::ENOTDIR),
-        });
-
-        match result {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            _ => Err(errno(libc::ENOTDIR)),
         }
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let result = self.entry(parent.0).and_then(|entry| match entry {
+    async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> fuse3::Result<()> {
+        match self.entry(parent).await? {
             FsEntry::KindDir(kind) => {
                 let node = node_id_from_kind_and_segment(kind, os_str_to_str(name)?)?;
                 self.graph
                     .remove_node(&node)
+                    .await
                     .map_err(graph_error_to_errno)?;
-                self.forget_entry(&FsEntry::NodeDir(node));
+                self.forget_entry(&FsEntry::NodeDir(node)).await;
                 Ok(())
             }
             FsEntry::NodeDir(source) => {
                 let relation = relation_name_from_segment(os_str_to_str(name)?)?;
                 let entry = FsEntry::RelationDir(source.clone(), relation.clone());
-                if self.relation_targets(&source, &relation)?.is_empty() {
-                    self.forget_entry(&entry);
+                if self.relation_targets(&source, &relation).await?.is_empty() {
+                    self.forget_entry(&entry).await;
                     Ok(())
                 } else {
-                    Err(Errno::ENOTEMPTY)
+                    Err(errno(libc::ENOTEMPTY))
                 }
             }
-            _ => Err(Errno::ENOTDIR),
-        });
-
-        match result {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            _ => Err(errno(libc::ENOTDIR)),
         }
+    }
+
+    type DirEntryPlusStream<'a>
+        = VecDirEntryPlusStream
+    where
+        Self: 'a;
+
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        parent: Inode,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
+        let entry = self.entry(parent).await?;
+        let entries = self.dir_entries(&entry, parent).await?;
+        let mut plus_entries = Vec::new();
+        for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+            let fs_entry = self.entry(entry.ino).await?;
+            let ino = self.acquire_inode(fs_entry.clone()).await?;
+            let attr = self.attr(&fs_entry, ino).await?;
+            plus_entries.push(Ok(DirectoryEntryPlus {
+                inode: ino,
+                generation: 0,
+                kind: entry.kind,
+                name: entry.name.into(),
+                offset: (index + 1) as i64,
+                attr,
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            }));
+        }
+        Ok(ReplyDirectoryPlus {
+            entries: stream::iter(plus_entries),
+        })
     }
 }
 
 impl LocusFs {
-    fn ensure_node_exists(&self, node: &NodeId) -> std::result::Result<(), Errno> {
+    async fn write_owned(
+        &self,
+        inode: Inode,
+        fh: u64,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> fuse3::Result<ReplyWrite> {
+        if offset != 0 {
+            return Err(errno(libc::EINVAL));
+        }
+
+        let written = match self.entry(inode).await? {
+            FsEntry::PropertyFile(node, key) => {
+                let input = String::from_utf8(data.clone()).map_err(|_| errno(libc::EINVAL))?;
+                let spec = property_spec_or_new_string(&self.graph, &node, &key).await?;
+                if !spec.is_writable() {
+                    return Err(errno(libc::EACCES));
+                }
+                let value =
+                    parse_property_write(spec.kind(), input).map_err(graph_error_to_errno)?;
+                self.graph
+                    .set_property(&node, &key, value)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                self.touch_entry(&FsEntry::PropertyFile(node.clone(), key.clone()))
+                    .await;
+                self.touch_entry(&FsEntry::NodeDir(node)).await;
+                data.len() as u32
+            }
+            FsEntry::WatchFile => {
+                let path = parse_watch_subscription(&data)?;
+                let target = resolve_watch_path(&self.graph, &path).await?;
+                self.watch
+                    .lock()
+                    .await
+                    .configure_watch(FileHandle(fh), path, target)?;
+                data.len() as u32
+            }
+            _ => return Err(errno(libc::EISDIR)),
+        };
+
+        Ok(ReplyWrite { written })
+    }
+    async fn ensure_node_exists(&self, node: &NodeId) -> std::result::Result<(), Errno> {
         if self
             .graph
             .contains_node(node)
+            .await
             .map_err(graph_error_to_errno)?
         {
             Ok(())
         } else {
-            Err(Errno::ENOENT)
+            Err(errno(libc::ENOENT))
         }
     }
 
-    fn ensure_relation_link_exists(
+    async fn ensure_relation_link_exists(
         &self,
         source: &NodeId,
         relation: &RelationName,
@@ -771,21 +814,22 @@ impl LocusFs {
         if self
             .graph
             .targets(source, relation)
+            .await
             .map_err(graph_error_to_errno)?
             .contains(target)
         {
             Ok(())
         } else {
-            Err(Errno::ENOENT)
+            Err(errno(libc::ENOENT))
         }
     }
 
-    pub(super) fn relation_targets(
+    pub(super) async fn relation_targets(
         &self,
         source: &NodeId,
         relation: &RelationName,
     ) -> std::result::Result<Vec<NodeId>, Errno> {
-        match self.graph.targets(source, relation) {
+        match self.graph.targets(source, relation).await {
             Ok(targets) => Ok(targets),
             Err(GraphError::NotFound { .. }) => Ok(Vec::new()),
             Err(error) => Err(graph_error_to_errno(error)),

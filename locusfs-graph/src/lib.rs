@@ -10,7 +10,8 @@ pub mod value;
 
 pub use error::{GraphError, Result};
 pub use graph::{
-    DynamicGraph, GraphChange, InMemoryProvider, NodeMutationProvider, NodeProvider,
+    DynamicGraph, GraphChange, GraphChangeReceiver, GraphChangeStreamError,
+    GraphChangeSubscription, InMemoryProvider, NodeMutationProvider, NodeProvider,
     PropertyMutationProvider, PropertyProvider, RelationMutationProvider, RelationProvider,
     TracedProvider,
 };

@@ -4,5 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
 thiserror = "2.0.18"
+tokio = { workspace = true, features = ["sync"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

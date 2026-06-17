@@ -7,3 +7,10 @@ members = [
     "plugins/niri",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+tokio = "1.48.0"

@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use async_trait::async_trait;
 use tracing::trace;
 
 use crate::{
@@ -24,6 +25,7 @@ impl<P> TracedProvider<P> {
     }
 }
 
+#[async_trait]
 impl<P> NodeProvider for TracedProvider<P>
 where
     P: NodeProvider,
@@ -32,9 +34,9 @@ where
         self.inner.kind()
     }
 
-    fn contains_node(&self, node: &NodeId) -> Result<bool> {
+    async fn contains_node(&self, node: &NodeId) -> Result<bool> {
         let started = Instant::now();
-        let result = self.inner.contains_node(node);
+        let result = self.inner.contains_node(node).await;
         trace!(
             target: "locusfs_graph::provider",
             provider = self.label,
@@ -46,9 +48,9 @@ where
         result
     }
 
-    fn nodes(&self) -> Result<Vec<NodeId>> {
+    async fn nodes(&self) -> Result<Vec<NodeId>> {
         let started = Instant::now();
-        let result = self.inner.nodes();
+        let result = self.inner.nodes().await;
         trace!(
             target: "locusfs_graph::provider",
             provider = self.label,
@@ -61,39 +63,41 @@ where
     }
 }
 
+#[async_trait]
 impl<P> NodeMutationProvider for TracedProvider<P>
 where
     P: NodeMutationProvider,
 {
-    fn create_node(&self, node: &NodeId) -> Result<()> {
+    async fn create_node(&self, node: &NodeId) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.create_node(node);
+        let result = self.inner.create_node(node).await;
         trace_provider_node_result(self.label, "create_node", node, started, &result);
         result
     }
 
-    fn remove_node(&self, node: &NodeId) -> Result<()> {
+    async fn remove_node(&self, node: &NodeId) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.remove_node(node);
+        let result = self.inner.remove_node(node).await;
         trace_provider_node_result(self.label, "remove_node", node, started, &result);
         result
     }
 }
 
+#[async_trait]
 impl<P> PropertyProvider for TracedProvider<P>
 where
     P: PropertyProvider,
 {
-    fn property_spec(&self, subject: &NodeId, key: &PropertyKey) -> Result<PropertySpec> {
+    async fn property_spec(&self, subject: &NodeId, key: &PropertyKey) -> Result<PropertySpec> {
         let started = Instant::now();
-        let result = self.inner.property_spec(subject, key);
+        let result = self.inner.property_spec(subject, key).await;
         trace_property_result(self.label, "property_spec", subject, key, started, &result);
         result
     }
 
-    fn properties(&self, subject: &NodeId) -> Result<Vec<PropertySpec>> {
+    async fn properties(&self, subject: &NodeId) -> Result<Vec<PropertySpec>> {
         let started = Instant::now();
-        let result = self.inner.properties(subject);
+        let result = self.inner.properties(subject).await;
         trace!(
             target: "locusfs_graph::provider",
             provider = self.label,
@@ -105,28 +109,34 @@ where
         result
     }
 
-    fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
+    async fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
         let started = Instant::now();
-        let result = self.inner.property(subject, key);
+        let result = self.inner.property(subject, key).await;
         trace_property_result(self.label, "property", subject, key, started, &result);
         result
     }
 }
 
+#[async_trait]
 impl<P> PropertyMutationProvider for TracedProvider<P>
 where
     P: PropertyMutationProvider,
 {
-    fn set_property(&self, subject: &NodeId, key: &PropertyKey, value: LocusValue) -> Result<()> {
+    async fn set_property(
+        &self,
+        subject: &NodeId,
+        key: &PropertyKey,
+        value: LocusValue,
+    ) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.set_property(subject, key, value);
+        let result = self.inner.set_property(subject, key, value).await;
         trace_property_result(self.label, "set_property", subject, key, started, &result);
         result
     }
 
-    fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
+    async fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.remove_property(subject, key);
+        let result = self.inner.remove_property(subject, key).await;
         trace_property_result(
             self.label,
             "remove_property",
@@ -139,13 +149,14 @@ where
     }
 }
 
+#[async_trait]
 impl<P> RelationProvider for TracedProvider<P>
 where
     P: RelationProvider,
 {
-    fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
+    async fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
         let started = Instant::now();
-        let result = self.inner.relations(source);
+        let result = self.inner.relations(source).await;
         trace!(
             target: "locusfs_graph::provider",
             provider = self.label,
@@ -157,28 +168,39 @@ where
         result
     }
 
-    fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
+    async fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
         let started = Instant::now();
-        let result = self.inner.targets(source, relation);
+        let result = self.inner.targets(source, relation).await;
         trace_relation_result(self.label, "targets", source, relation, started, &result);
         result
     }
 }
 
+#[async_trait]
 impl<P> RelationMutationProvider for TracedProvider<P>
 where
     P: RelationMutationProvider,
 {
-    fn set_link(&self, source: &NodeId, relation: &RelationName, target: &NodeId) -> Result<()> {
+    async fn set_link(
+        &self,
+        source: &NodeId,
+        relation: &RelationName,
+        target: &NodeId,
+    ) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.set_link(source, relation, target);
+        let result = self.inner.set_link(source, relation, target).await;
         trace_relation_result(self.label, "set_link", source, relation, started, &result);
         result
     }
 
-    fn remove_link(&self, source: &NodeId, relation: &RelationName, target: &NodeId) -> Result<()> {
+    async fn remove_link(
+        &self,
+        source: &NodeId,
+        relation: &RelationName,
+        target: &NodeId,
+    ) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.remove_link(source, relation, target);
+        let result = self.inner.remove_link(source, relation, target).await;
         trace_relation_result(
             self.label,
             "remove_link",

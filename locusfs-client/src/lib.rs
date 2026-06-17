@@ -5,8 +5,6 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
 
 /// Reads a locusfs path into memory.
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
@@ -195,10 +193,16 @@ fn read_retrying(path: &Path) -> io::Result<Vec<u8>> {
                 return Ok(value);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                thread::sleep(Duration::from_millis(25));
+                retry_delay();
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn retry_delay() {
+    unsafe {
+        libc::poll(std::ptr::null_mut(), 0, 25);
     }
 }
 

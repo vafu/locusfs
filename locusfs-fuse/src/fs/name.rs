@@ -1,14 +1,14 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
-use fuser::Errno;
+use fuse3::Errno;
 use locusfs_graph::{NodeId, NodeKind, PropertyKey, RelationName};
 
-use crate::graph_error_to_errno;
 use crate::layout::{decode_segment, encode_segment};
+use crate::{errno, graph_error_to_errno};
 
 pub(super) fn os_str_to_str(value: &OsStr) -> std::result::Result<&str, Errno> {
-    value.to_str().ok_or(Errno::EINVAL)
+    value.to_str().ok_or(errno(libc::EINVAL))
 }
 
 pub(super) fn node_kind_from_segment(segment: &str) -> std::result::Result<NodeKind, Errno> {
@@ -53,17 +53,17 @@ pub(super) fn node_id_from_relation_link_target_path(
     }
 
     let Some(Component::Normal(kind)) = components.next() else {
-        return Err(Errno::EINVAL);
+        return Err(errno(libc::EINVAL));
     };
     let kind = node_kind_from_segment(os_str_to_str(kind)?)?;
 
     let Some(Component::Normal(local)) = components.next() else {
-        return Err(Errno::EINVAL);
+        return Err(errno(libc::EINVAL));
     };
     let target = node_id_from_kind_and_segment(kind, os_str_to_str(local)?)?;
 
     if components.next().is_some() {
-        return Err(Errno::EINVAL);
+        return Err(errno(libc::EINVAL));
     }
 
     Ok(target)

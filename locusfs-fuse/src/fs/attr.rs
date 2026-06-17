@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime};
 
-use fuser::{FileAttr, FileType, INodeNo};
+use fuse3::raw::reply::FileAttr;
+use fuse3::{FileType, Timestamp};
 
 pub const TTL: Duration = Duration::from_millis(250);
 
@@ -32,13 +33,14 @@ impl EntryTimes {
 
 pub fn file_attr(ino: u64, kind: FileType, perm: u16, size: u64, times: EntryTimes) -> FileAttr {
     FileAttr {
-        ino: INodeNo(ino),
+        ino,
         size,
         blocks: size.div_ceil(512),
-        atime: times.accessed,
-        mtime: times.modified,
-        ctime: times.changed,
-        crtime: times.created,
+        atime: Timestamp::from(times.accessed),
+        mtime: Timestamp::from(times.modified),
+        ctime: Timestamp::from(times.changed),
+        #[cfg(target_os = "macos")]
+        crtime: Timestamp::from(times.created),
         kind,
         perm,
         // TODO: compute directory link counts from child directory entries instead of using a
@@ -48,6 +50,7 @@ pub fn file_attr(ino: u64, kind: FileType, perm: u16, size: u64, times: EntryTim
         gid: unsafe { libc::getgid() },
         rdev: 0,
         blksize: 4096,
+        #[cfg(target_os = "macos")]
         flags: 0,
     }
 }

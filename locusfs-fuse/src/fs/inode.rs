@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use fuser::Errno;
+use fuse3::Errno;
+use tokio::sync::Mutex;
 
 use super::attr::EntryTimes;
 use super::entry::{FsEntry, ROOT_INO};
+use crate::errno;
 
 pub type SharedInodeTable = Arc<Mutex<InodeTable>>;
 
@@ -73,7 +75,7 @@ impl InodeTable {
             return Ok(*ino);
         }
         let ino = self.next;
-        self.next = self.next.checked_add(1).ok_or(Errno::EOVERFLOW)?;
+        self.next = self.next.checked_add(1).ok_or(errno(libc::EOVERFLOW))?;
         self.insert(ino, entry);
         Ok(ino)
     }
@@ -81,9 +83,12 @@ impl InodeTable {
     pub fn acquire(&mut self, entry: FsEntry) -> std::result::Result<u64, Errno> {
         let ino = self.inode(entry)?;
         let Some(record) = self.by_ino.get_mut(&ino) else {
-            return Err(Errno::EIO);
+            return Err(errno(libc::EIO));
         };
-        record.lookups = record.lookups.checked_add(1).ok_or(Errno::EOVERFLOW)?;
+        record.lookups = record
+            .lookups
+            .checked_add(1)
+            .ok_or(errno(libc::EOVERFLOW))?;
         Ok(ino)
     }
 

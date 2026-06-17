@@ -1,35 +1,90 @@
 use std::ffi::OsString;
-use std::sync::mpsc::Receiver;
-use std::thread::{self, JoinHandle};
 
-use fuser::{INodeNo, Notifier};
-use locusfs_graph::{DynamicGraph, GraphChange};
+use locusfs_graph::{DynamicGraph, GraphChange, GraphChangeReceiver};
+use tokio::sync::{broadcast, oneshot};
+use tokio::task::JoinHandle;
 
-use crate::fs::{FsEntry, SharedInodeTable, SharedWatchRegistry, WatchKey, resolve_watch_path};
+use crate::fs::{
+    FsEntry, SharedInodeTable, SharedKernelNotify, SharedWatchRegistry, WatchKey,
+    resolve_watch_path,
+};
 use crate::layout::encode_segment;
 
+#[derive(Debug)]
+pub(crate) struct InvalidationWorker {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl InvalidationWorker {
+    pub fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for InvalidationWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 pub(crate) fn spawn_change_invalidator(
-    changes: Receiver<GraphChange>,
-    notifier: Notifier,
+    mut changes: GraphChangeReceiver,
+    notifier: SharedKernelNotify,
     graph: DynamicGraph,
     inodes: SharedInodeTable,
     watch: SharedWatchRegistry,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("locusfs-fuse-invalidator".to_string())
-        .spawn(move || {
-            for change in changes {
-                invalidate_change(&notifier, &graph, &inodes, &watch, change);
+) -> InvalidationWorker {
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build FUSE invalidation runtime");
+        runtime.block_on(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_receiver => break,
+                    received = changes.recv() => {
+                        match received {
+                            Ok(change) => {
+                                invalidate_change(
+                                    notifier.clone(),
+                                    graph.clone(),
+                                    inodes.clone(),
+                                    watch.clone(),
+                                    change,
+                                )
+                                .await;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                resync_known_state(notifier.clone(), inodes.clone(), watch.clone())
+                                    .await;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
             }
-        })
-        .expect("spawn FUSE invalidation worker")
+        });
+    });
+
+    InvalidationWorker {
+        shutdown: Some(shutdown),
+        task: Some(task),
+    }
 }
 
-fn invalidate_change(
-    notifier: &Notifier,
-    graph: &DynamicGraph,
-    inodes: &SharedInodeTable,
-    watch: &SharedWatchRegistry,
+async fn invalidate_change(
+    notifier: SharedKernelNotify,
+    graph: DynamicGraph,
+    inodes: SharedInodeTable,
+    watch: SharedWatchRegistry,
     change: GraphChange,
 ) {
     match change {
@@ -38,18 +93,27 @@ fn invalidate_change(
                 Ok(name) => name,
                 Err(_) => return,
             };
-            invalidate_known_child(notifier, inodes, &FsEntry::Root, name);
-            invalidate_known_inode(notifier, inodes, &FsEntry::KindDir(kind));
+            invalidate_known_child(notifier.clone(), inodes.clone(), FsEntry::Root, name).await;
+            invalidate_known_inode(notifier.clone(), inodes.clone(), FsEntry::KindDir(kind)).await;
         }
         GraphChange::NodeChanged { node } | GraphChange::NodeRemoved { node } => {
+            let had_poll_waiters =
+                notify_node_watchers(notifier.clone(), watch.clone(), node.clone()).await;
+            if had_poll_waiters {
+                return;
+            }
             let parent = FsEntry::KindDir(node.kind().clone());
             let name = match encode_segment(node.local()) {
                 Ok(name) => name,
                 Err(_) => return,
             };
-            invalidate_known_child(notifier, inodes, &parent, name);
-            invalidate_known_inode(notifier, inodes, &FsEntry::NodeDir(node.clone()));
-            notify_node_watchers(notifier, watch, &node);
+            invalidate_known_child(notifier.clone(), inodes.clone(), parent, name).await;
+            invalidate_known_inode(
+                notifier.clone(),
+                inodes.clone(),
+                FsEntry::NodeDir(node.clone()),
+            )
+            .await;
         }
         GraphChange::PropertyChanged { node, key } => {
             let name = match encode_segment(key.as_str()) {
@@ -57,101 +121,164 @@ fn invalidate_change(
                 Err(_) => return,
             };
             let parent = FsEntry::NodeDir(node.clone());
-            invalidate_known_child(notifier, inodes, &parent, name.clone());
-            invalidate_known_inode(notifier, inodes, &parent);
+            let had_poll_waiters = notify_property_watchers(
+                notifier.clone(),
+                watch.clone(),
+                node.clone(),
+                key.clone(),
+            )
+            .await;
+            if had_poll_waiters {
+                return;
+            }
+            invalidate_known_child(
+                notifier.clone(),
+                inodes.clone(),
+                parent.clone(),
+                name.clone(),
+            )
+            .await;
+            invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
             invalidate_known_inode(
-                notifier,
-                inodes,
-                &FsEntry::PropertyFile(node.clone(), key.clone()),
-            );
-            notify_property_watchers(notifier, watch, &node, &key);
+                notifier.clone(),
+                inodes.clone(),
+                FsEntry::PropertyFile(node.clone(), key.clone()),
+            )
+            .await;
         }
         GraphChange::RelationChanged { source, relation } => {
+            let affected_watch = retarget_relation_watchers(
+                notifier.clone(),
+                graph.clone(),
+                watch.clone(),
+                source.clone(),
+                relation.clone(),
+            )
+            .await;
+            if affected_watch {
+                return;
+            }
+
             let parent = FsEntry::NodeDir(source.clone());
             let name = match encode_segment(relation.as_str()) {
                 Ok(name) => name,
                 Err(_) => return,
             };
-            notify_relation_entries_deleted(notifier, inodes, &source, &relation);
-            invalidate_known_child(notifier, inodes, &parent, name);
-            invalidate_known_inode(notifier, inodes, &parent);
-            invalidate_matching_relation_inodes(notifier, inodes, &source, &relation);
-            retarget_relation_watchers(notifier, graph, watch, &source, &relation);
+            invalidate_known_child(notifier.clone(), inodes.clone(), parent.clone(), name).await;
+            invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
+            invalidate_matching_relation_inodes(notifier, inodes, source, relation).await;
         }
     }
 }
 
-fn invalidate_known_child(
-    notifier: &Notifier,
-    inodes: &SharedInodeTable,
-    parent: &FsEntry,
+async fn resync_known_state(
+    notifier: SharedKernelNotify,
+    inodes: SharedInodeTable,
+    watch: SharedWatchRegistry,
+) {
+    let entries = {
+        let mut inodes = inodes.lock().await;
+        let entries = inodes.entries();
+        for (entry, _) in &entries {
+            inodes.touch(entry);
+        }
+        entries
+    };
+
+    for (_, ino) in entries {
+        if let Some(notifier) = current_notifier(notifier.clone()).await {
+            notifier.invalid_inode(ino, 0, 0).await;
+        }
+    }
+
+    let handles = {
+        let mut watch = watch.lock().await;
+        watch.notify_all()
+    };
+    notify_poll_handles(notifier, handles).await;
+}
+
+async fn invalidate_known_child(
+    notifier: SharedKernelNotify,
+    inodes: SharedInodeTable,
+    parent: FsEntry,
     name: String,
 ) {
-    let Ok(mut inodes) = inodes.lock() else {
-        return;
-    };
-    inodes.touch(parent);
-    let Some(parent_ino) = inodes.known_inode(parent) else {
-        return;
-    };
-    drop(inodes);
-    invalidate_entry(notifier, INodeNo(parent_ino), name);
-}
-
-fn invalidate_entry(notifier: &Notifier, parent: INodeNo, name: String) {
-    let name = OsString::from(name);
-    let _ = notifier.inval_entry(parent, &name);
-}
-
-fn notify_relation_entries_deleted(
-    notifier: &Notifier,
-    inodes: &SharedInodeTable,
-    source: &locusfs_graph::NodeId,
-    relation: &locusfs_graph::RelationName,
-) {
-    let Ok(inodes) = inodes.lock() else {
-        return;
-    };
-    let entries = inodes.entries();
-    let mut deletes = Vec::new();
-
-    for (entry, child_ino) in &entries {
-        let Some((parent, name)) = relation_entry_parent_and_name(entry) else {
-            continue;
-        };
-        if !relation_entry_matches(entry, source, relation) {
-            continue;
-        }
+    let parent_ino = {
+        let mut inodes = inodes.lock().await;
+        inodes.touch(&parent);
         let Some(parent_ino) = inodes.known_inode(&parent) else {
-            continue;
+            return;
         };
-        deletes.push((parent_ino, *child_ino, name));
-    }
-    drop(inodes);
-
-    for (parent_ino, child_ino, name) in deletes {
-        let name = OsString::from(name);
-        let _ = notifier.delete(INodeNo(parent_ino), INodeNo(child_ino), &name);
+        parent_ino
+    };
+    if let Some(notifier) = current_notifier(notifier).await {
+        notifier
+            .invalid_entry(parent_ino, OsString::from(name))
+            .await;
     }
 }
 
-fn relation_entry_parent_and_name(entry: &FsEntry) -> Option<(FsEntry, String)> {
-    match entry {
-        FsEntry::RelationDir(source, relation)
-        | FsEntry::RelationLink {
-            source, relation, ..
-        } => encode_segment(relation.as_str())
-            .ok()
-            .map(|name| (FsEntry::NodeDir(source.clone()), name)),
-        FsEntry::RelationTargetLink {
-            source,
-            relation,
-            target,
-        } => encode_segment(&target.to_string())
-            .ok()
-            .map(|name| (FsEntry::RelationDir(source.clone(), relation.clone()), name)),
-        _ => None,
+async fn notify_property_watchers(
+    notifier: SharedKernelNotify,
+    watch: SharedWatchRegistry,
+    node: locusfs_graph::NodeId,
+    key: locusfs_graph::PropertyKey,
+) -> bool {
+    let handles = {
+        let mut watch = watch.lock().await;
+        watch.notify_property_change(&node, &key)
+    };
+
+    notify_poll_handles(notifier, handles).await
+}
+
+async fn notify_node_watchers(
+    notifier: SharedKernelNotify,
+    watch: SharedWatchRegistry,
+    node: locusfs_graph::NodeId,
+) -> bool {
+    let handles = {
+        let mut watch = watch.lock().await;
+        watch.notify_node_change(&node)
+    };
+
+    notify_poll_handles(notifier, handles).await
+}
+
+async fn retarget_relation_watchers(
+    notifier: SharedKernelNotify,
+    graph: DynamicGraph,
+    watch: SharedWatchRegistry,
+    source: locusfs_graph::NodeId,
+    relation: locusfs_graph::RelationName,
+) -> bool {
+    let key = WatchKey::Relation(source, relation);
+    let paths = {
+        let watch = watch.lock().await;
+        watch.dependent_watch_paths(&key)
+    };
+
+    let mut had_poll_waiters = !paths.is_empty();
+    for (handle, path) in paths {
+        let result = resolve_watch_path(&graph, &path).await;
+        let handles = {
+            let mut watch = watch.lock().await;
+            watch.apply_retarget_result(handle, path, result)
+        };
+        had_poll_waiters |= notify_poll_handles(notifier.clone(), handles).await;
     }
+    had_poll_waiters
+}
+
+async fn notify_poll_handles(notifier: SharedKernelNotify, handles: Vec<u64>) -> bool {
+    let had_handles = !handles.is_empty();
+    for handle in handles {
+        if let Some(notifier) = current_notifier(notifier.clone()).await {
+            notifier.wakeup(handle).await;
+        }
+    }
+    had_handles
 }
 
 fn relation_entry_matches(
@@ -175,89 +302,49 @@ fn relation_entry_matches(
     }
 }
 
-fn notify_property_watchers(
-    notifier: &Notifier,
-    watch: &SharedWatchRegistry,
-    node: &locusfs_graph::NodeId,
-    key: &locusfs_graph::PropertyKey,
+async fn invalidate_known_inode(
+    notifier: SharedKernelNotify,
+    inodes: SharedInodeTable,
+    entry: FsEntry,
 ) {
-    let Ok(mut watch) = watch.lock() else {
-        return;
+    let ino = {
+        let mut inodes = inodes.lock().await;
+        let Some(ino) = inodes.touch(&entry) else {
+            return;
+        };
+        ino
     };
-    let handles = watch.notify_property_change(node, key);
-    drop(watch);
-
-    notify_poll_handles(notifier, handles);
-}
-
-fn notify_node_watchers(
-    notifier: &Notifier,
-    watch: &SharedWatchRegistry,
-    node: &locusfs_graph::NodeId,
-) {
-    let Ok(mut watch) = watch.lock() else {
-        return;
-    };
-    let handles = watch.notify_node_change(node);
-    drop(watch);
-
-    notify_poll_handles(notifier, handles);
-}
-
-fn retarget_relation_watchers(
-    notifier: &Notifier,
-    graph: &DynamicGraph,
-    watch: &SharedWatchRegistry,
-    source: &locusfs_graph::NodeId,
-    relation: &locusfs_graph::RelationName,
-) {
-    let key = WatchKey::Relation(source.clone(), relation.clone());
-    let Ok(mut watch) = watch.lock() else {
-        return;
-    };
-    let handles = watch.retarget_dependents(&key, |path| resolve_watch_path(graph, path));
-    drop(watch);
-
-    notify_poll_handles(notifier, handles);
-}
-
-fn notify_poll_handles(notifier: &Notifier, handles: Vec<fuser::PollHandle>) {
-    for handle in handles {
-        let _ = notifier.poll(handle);
+    if let Some(notifier) = current_notifier(notifier).await {
+        notifier.invalid_inode(ino, 0, 0).await;
     }
 }
 
-fn invalidate_known_inode(notifier: &Notifier, inodes: &SharedInodeTable, entry: &FsEntry) {
-    let Ok(mut inodes) = inodes.lock() else {
-        return;
-    };
-    let Some(ino) = inodes.touch(entry) else {
-        return;
-    };
-    drop(inodes);
-    let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
-}
-
-fn invalidate_matching_relation_inodes(
-    notifier: &Notifier,
-    inodes: &SharedInodeTable,
-    source: &locusfs_graph::NodeId,
-    relation: &locusfs_graph::RelationName,
+async fn invalidate_matching_relation_inodes(
+    notifier: SharedKernelNotify,
+    inodes: SharedInodeTable,
+    source: locusfs_graph::NodeId,
+    relation: locusfs_graph::RelationName,
 ) {
-    let Ok(mut inodes) = inodes.lock() else {
-        return;
-    };
-    let entries = inodes.entries();
-    for (entry, _) in &entries {
-        if relation_entry_matches(entry, source, relation) {
-            inodes.touch(entry);
+    let entries = {
+        let mut inodes = inodes.lock().await;
+        let entries = inodes.entries();
+        for (entry, _) in &entries {
+            if relation_entry_matches(entry, &source, &relation) {
+                inodes.touch(entry);
+            }
         }
-    }
-    drop(inodes);
+        entries
+    };
 
     for (entry, ino) in entries {
-        if relation_entry_matches(&entry, source, relation) {
-            let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+        if relation_entry_matches(&entry, &source, &relation) {
+            if let Some(notifier) = current_notifier(notifier.clone()).await {
+                notifier.invalid_inode(ino, 0, 0).await;
+            }
         }
     }
+}
+
+async fn current_notifier(notifier: SharedKernelNotify) -> Option<fuse3::notify::Notify> {
+    notifier.lock().await.clone()
 }

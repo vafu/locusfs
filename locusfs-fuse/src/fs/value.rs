@@ -1,4 +1,4 @@
-use fuser::Errno;
+use fuse3::Errno;
 use locusfs_graph::{
     DynamicGraph, GraphError, LocusValue, NodeId, PropertyKey, PropertySpec, ValueKind,
 };
@@ -14,12 +14,12 @@ pub(super) fn slice_for_read(data: &[u8], offset: u64, size: u32) -> &[u8] {
     &data[offset..end]
 }
 
-pub(super) fn property_spec_or_new_string(
+pub(super) async fn property_spec_or_new_string(
     graph: &DynamicGraph,
     node: &NodeId,
     key: &PropertyKey,
 ) -> std::result::Result<PropertySpec, Errno> {
-    match graph.property_spec(node, key) {
+    match graph.property_spec(node, key).await {
         Ok(spec) => Ok(spec),
         Err(GraphError::NotFound { .. }) => {
             Ok(PropertySpec::read_write(key.clone(), ValueKind::String))
@@ -39,7 +39,7 @@ pub(super) fn property_perm(spec: &PropertySpec) -> u16 {
 
 pub(super) fn parse_property_write(
     kind: ValueKind,
-    input: &str,
+    input: String,
 ) -> std::result::Result<LocusValue, GraphError> {
     let value = strip_single_trailing_newline(input);
     match kind {
@@ -51,9 +51,9 @@ pub(super) fn parse_property_write(
                     reason: "contains NUL",
                 });
             }
-            Ok(LocusValue::String(value.to_string()))
+            Ok(LocusValue::String(value))
         }
-        ValueKind::Bool => parse_bool(value).map(LocusValue::Bool),
+        ValueKind::Bool => parse_bool(&value).map(LocusValue::Bool),
         ValueKind::U32 => {
             value
                 .parse::<u32>()
@@ -108,9 +108,11 @@ fn parse_bool(value: &str) -> std::result::Result<bool, GraphError> {
     }
 }
 
-fn strip_single_trailing_newline(input: &str) -> &str {
+fn strip_single_trailing_newline(mut input: String) -> String {
+    if input.ends_with("\r\n") {
+        input.truncate(input.len() - 2);
+    } else if input.ends_with('\n') {
+        input.truncate(input.len() - 1);
+    }
     input
-        .strip_suffix("\r\n")
-        .or_else(|| input.strip_suffix('\n'))
-        .unwrap_or(input)
 }

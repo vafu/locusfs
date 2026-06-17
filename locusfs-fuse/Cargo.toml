@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fuser = "0.17.0"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
 libc = "0.2.177"
 locusfs-graph = { path = "../locusfs-graph" }
 thiserror = "2.0.18"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }

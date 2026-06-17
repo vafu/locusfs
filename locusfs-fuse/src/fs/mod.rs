@@ -11,6 +11,7 @@ mod watch;
 pub use filesystem::LocusFs;
 
 pub(crate) use entry::FsEntry;
+pub(crate) use filesystem::SharedKernelNotify;
 pub(crate) use inode::{InodeTable, SharedInodeTable};
 pub(crate) use resolve::resolve_watch_path;
 pub(crate) use watch::{SharedWatchRegistry, WatchKey, WatchRegistry};

@@ -1,4 +1,4 @@
-use fuser::Errno;
+use fuse3::Errno;
 use locusfs_graph::GraphError;
 use thiserror::Error;
 
@@ -15,12 +15,16 @@ pub enum FuseError {
 
 pub(crate) fn graph_error_to_errno(error: GraphError) -> Errno {
     match error {
-        GraphError::NotFound { .. } => Errno::ENOENT,
+        GraphError::NotFound { .. } => errno(libc::ENOENT),
         GraphError::InvalidIdentifier { .. }
         | GraphError::InvalidPathSegment { .. }
         | GraphError::InvalidEncoding { .. }
-        | GraphError::InvalidValue { .. } => Errno::EINVAL,
-        GraphError::Unsupported { .. } => Errno::ENOSYS,
-        GraphError::Internal { .. } | GraphError::Io(_) => Errno::EIO,
+        | GraphError::InvalidValue { .. } => errno(libc::EINVAL),
+        GraphError::Unsupported { .. } => errno(libc::ENOSYS),
+        GraphError::Internal { .. } | GraphError::Io(_) => errno(libc::EIO),
     }
+}
+
+pub(crate) fn errno(code: libc::c_int) -> Errno {
+    Errno::from(code)
 }

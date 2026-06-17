@@ -40,7 +40,7 @@ fn touching_entry_updates_mtime_and_ctime() {
     let entry = FsEntry::NodeDir(test_node("57"));
     let before = table.times(&entry);
 
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    wait_for_clock_tick();
     table.touch(&entry);
     let after = table.times(&entry);
 
@@ -48,6 +48,12 @@ fn touching_entry_updates_mtime_and_ctime() {
     assert_eq!(after.accessed, before.accessed);
     assert!(after.modified > before.modified);
     assert!(after.changed > before.changed);
+}
+
+fn wait_for_clock_tick() {
+    unsafe {
+        libc::poll(std::ptr::null_mut(), 0, 1);
+    }
 }
 
 #[test]

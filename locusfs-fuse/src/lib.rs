@@ -9,8 +9,8 @@ mod invalidation;
 pub mod layout;
 mod mount;
 
-pub(crate) use error::graph_error_to_errno;
 pub use error::{FuseError, Result};
+pub(crate) use error::{errno, graph_error_to_errno};
 pub use fs::LocusFs;
 pub use layout::{Layout, decode_segment, encode_segment};
 pub use mount::{FuseMount, FuseMountConfig, mount};
