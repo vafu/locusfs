@@ -109,10 +109,18 @@ name = "locusfs"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "locusfs-client",
  "locusfs-fuse",
  "locusfs-graph",
  "locusfs-plugin-niri",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "locusfs-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

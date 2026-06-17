@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "locusfs",
+    "locusfs-client",
     "locusfs-graph",
     "locusfs-fuse",
     "plugins/niri",

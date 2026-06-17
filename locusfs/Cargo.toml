@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
+locusfs-client = { path = "../locusfs-client" }
 locusfs-graph = { path = "../locusfs-graph" }
 locusfs-fuse = { path = "../locusfs-fuse" }
 locusfs-plugin-niri = { path = "../plugins/niri" }
