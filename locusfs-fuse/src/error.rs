@@ -11,6 +11,8 @@ pub enum FuseError {
     Graph(#[from] GraphError),
     #[error("FUSE mount failed: {0}")]
     Mount(String),
+    #[error("FUSE unmount failed: {0}")]
+    Unmount(String),
 }
 
 pub(crate) fn graph_error_to_errno(error: GraphError) -> Errno {

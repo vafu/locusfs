@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::env;
+use std::io;
 use std::sync::Arc;
 
 use locusfs_graph::{DynamicGraph, GraphError, Result};
-use niri_ipc::socket::Socket;
-use niri_ipc::{Output, Request, Response};
-use tokio::runtime::Handle;
+use niri_ipc::socket::SOCKET_PATH_ENV;
+use niri_ipc::{Event, Output, Reply, Request, Response};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -16,36 +19,29 @@ pub type SharedNiriState = Arc<RwLock<NiriState>>;
 pub struct IpcNiriClient;
 
 impl IpcNiriClient {
-    pub fn start(
-        graph: DynamicGraph,
-        runtime: Handle,
-    ) -> Result<(SharedNiriState, JoinHandle<()>)> {
-        let mut socket = Socket::connect()?;
-        let outputs = request_outputs(&mut socket)?;
+    pub async fn start(graph: DynamicGraph) -> Result<(SharedNiriState, JoinHandle<()>)> {
+        let mut socket = AsyncNiriSocket::connect().await?;
+        let outputs = request_outputs(&mut socket).await?;
         let state = Arc::new(RwLock::new(NiriState::new(outputs)));
-        let event_stream = spawn_event_stream(state.clone(), graph, runtime)?;
+        let event_stream = spawn_event_stream(state.clone(), graph).await?;
 
         Ok((state, event_stream))
     }
 }
 
-fn spawn_event_stream(
-    state: SharedNiriState,
-    graph: DynamicGraph,
-    runtime: Handle,
-) -> Result<JoinHandle<()>> {
-    let mut socket = Socket::connect()?;
-    match send(&mut socket, Request::EventStream)? {
+async fn spawn_event_stream(state: SharedNiriState, graph: DynamicGraph) -> Result<JoinHandle<()>> {
+    let mut socket = AsyncNiriSocket::connect().await?;
+    match socket.send(Request::EventStream).await? {
         Response::Handled => {}
         response => return Err(unexpected_response("event stream", response)),
     }
+    socket.shutdown_write().await?;
 
-    Ok(runtime.spawn_blocking(move || {
-        let mut read_event = socket.read_events();
+    Ok(tokio::spawn(async move {
         loop {
-            match read_event() {
+            match socket.read_event().await {
                 Ok(event) => {
-                    let mut state = state.blocking_write();
+                    let mut state = state.write().await;
                     match state.apply_event(event) {
                         Ok(changes) => {
                             for change in changes {
@@ -68,22 +64,60 @@ fn spawn_event_stream(
     }))
 }
 
-fn request_outputs(socket: &mut Socket) -> Result<HashMap<String, Output>> {
-    match send(socket, Request::Outputs)? {
+async fn request_outputs(socket: &mut AsyncNiriSocket) -> Result<HashMap<String, Output>> {
+    match socket.send(Request::Outputs).await? {
         Response::Outputs(outputs) => Ok(outputs),
         response => Err(unexpected_response("outputs", response)),
     }
-}
-
-fn send(socket: &mut Socket, request: Request) -> Result<Response> {
-    socket
-        .send(request)
-        .map_err(GraphError::from)?
-        .map_err(|message| GraphError::Io(format!("niri rejected IPC request: {message}")))
 }
 
 fn unexpected_response(request: &'static str, response: Response) -> GraphError {
     GraphError::Io(format!(
         "unexpected niri response for {request} request: {response:?}"
     ))
+}
+
+struct AsyncNiriSocket {
+    stream: BufReader<UnixStream>,
+}
+
+impl AsyncNiriSocket {
+    async fn connect() -> io::Result<Self> {
+        let socket_path = env::var_os(SOCKET_PATH_ENV).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{SOCKET_PATH_ENV} is not set, are you running this within niri?"),
+            )
+        })?;
+        let stream = UnixStream::connect(socket_path).await?;
+        Ok(Self {
+            stream: BufReader::new(stream),
+        })
+    }
+
+    async fn send(&mut self, request: Request) -> Result<Response> {
+        let reply = self.send_raw(request).await.map_err(GraphError::from)?;
+        reply.map_err(|message| GraphError::Io(format!("niri rejected IPC request: {message}")))
+    }
+
+    async fn send_raw(&mut self, request: Request) -> io::Result<Reply> {
+        let mut request = serde_json::to_string(&request)?;
+        request.push('\n');
+        self.stream.get_mut().write_all(request.as_bytes()).await?;
+        self.stream.get_mut().flush().await?;
+
+        let mut response = String::new();
+        self.stream.read_line(&mut response).await?;
+        serde_json::from_str(&response).map_err(Into::into)
+    }
+
+    async fn shutdown_write(&mut self) -> io::Result<()> {
+        self.stream.get_mut().shutdown().await
+    }
+
+    async fn read_event(&mut self) -> io::Result<Event> {
+        let mut event = String::new();
+        self.stream.read_line(&mut event).await?;
+        serde_json::from_str(&event).map_err(Into::into)
+    }
 }

@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -43,7 +44,7 @@ type VecDirEntryPlusStream = Iter<IntoIter<fuse3::Result<DirectoryEntryPlus>>>;
 pub(crate) type SharedKernelNotify = Arc<Mutex<Option<Notify>>>;
 
 /// FUSE request adapter over the generic graph filesystem.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocusFs {
     pub(super) graph: DynamicGraph,
     inodes: SharedInodeTable,
@@ -497,7 +498,7 @@ impl Filesystem for LocusFs {
             }
             FsEntry::WatchFile => {
                 let data = self.watch.lock().await.read_watch(FileHandle(fh))?;
-                slice_for_read(&data, offset, size).to_vec()
+                slice_for_read(&data, 0, size).to_vec()
             }
             FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => {
                 return Err(errno(libc::EINVAL));
@@ -511,7 +512,7 @@ impl Filesystem for LocusFs {
         })
     }
 
-    async fn write(
+    fn write(
         &self,
         _req: Request,
         inode: Inode,
@@ -520,12 +521,10 @@ impl Filesystem for LocusFs {
         data: &[u8],
         _write_flags: u32,
         _flags: u32,
-    ) -> fuse3::Result<ReplyWrite> {
+    ) -> impl Future<Output = fuse3::Result<ReplyWrite>> + Send {
+        let fs = self.clone();
         let data = data.to_vec();
-        // fuse3 0.8.1's generated write future is not general enough to await after borrowing
-        // the input buffer. The buffer is owned here; keep the bridge local until fuse3 fixes it.
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(self.write_owned(inode, fh, offset, data)))
+        async move { fs.write_owned(inode, fh, offset, data).await }
     }
 
     async fn release(

@@ -22,15 +22,16 @@ pub(crate) async fn resolve_watch_path(
     graph: &DynamicGraph,
     path: &str,
 ) -> std::result::Result<WatchTarget, Errno> {
-    let mut segments = path
+    let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .peekable();
+        .collect::<Vec<_>>();
+    let mut index = 0;
 
-    let Some(kind_segment) = segments.next() else {
+    let Some(kind_segment) = next_segment(&segments, &mut index) else {
         return Err(errno(libc::EINVAL));
     };
-    let Some(local_segment) = segments.next() else {
+    let Some(local_segment) = next_segment(&segments, &mut index) else {
         return Err(errno(libc::EINVAL));
     };
 
@@ -39,7 +40,7 @@ pub(crate) async fn resolve_watch_path(
     ensure_node_exists(graph, &node).await?;
 
     let mut dependencies = Vec::new();
-    while let Some(segment) = segments.next() {
+    while let Some(segment) = next_segment(&segments, &mut index) {
         let relation = relation_name_from_segment(segment)?;
         let targets = relation_targets(graph, &node, &relation).await?;
         let has_relation = !targets.is_empty();
@@ -51,7 +52,7 @@ pub(crate) async fn resolve_watch_path(
         }
 
         if has_property {
-            if segments.next().is_some() {
+            if next_segment(&segments, &mut index).is_some() {
                 return Err(errno(libc::ENOTDIR));
             }
             let key = property_key_from_segment(segment)?;
@@ -73,7 +74,7 @@ pub(crate) async fn resolve_watch_path(
         let target = if targets.len() == 1 {
             targets[0].clone()
         } else {
-            let Some(target_segment) = segments.next() else {
+            let Some(target_segment) = next_segment(&segments, &mut index) else {
                 return Ok(WatchTarget {
                     subject: WatchSubjectKey::Node(node),
                     dependencies,
@@ -93,6 +94,12 @@ pub(crate) async fn resolve_watch_path(
         subject: WatchSubjectKey::Node(node),
         dependencies,
     })
+}
+
+fn next_segment<'a>(segments: &'a [&'a str], index: &mut usize) -> Option<&'a str> {
+    let segment = segments.get(*index).copied();
+    *index += usize::from(segment.is_some());
+    segment
 }
 
 async fn ensure_node_exists(graph: &DynamicGraph, node: &NodeId) -> std::result::Result<(), Errno> {

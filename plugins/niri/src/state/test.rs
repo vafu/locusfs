@@ -30,12 +30,20 @@ fn projects_live_niri_state_into_nodes_properties_and_relations() {
         LocusValue::String("Terminal".to_string())
     );
     assert_eq!(
+        state.property(&window, &property("selected")).unwrap(),
+        LocusValue::Bool(true)
+    );
+    assert_eq!(
         state.targets(&window, &relation("workspace")).unwrap(),
         vec![workspace.clone()]
     );
     assert_eq!(
         state.targets(&workspace, &relation("output")).unwrap(),
         vec![output]
+    );
+    assert_eq!(
+        state.property(&workspace, &property("selected")).unwrap(),
+        LocusValue::Bool(true)
     );
     assert_eq!(
         state.targets(&selected, &relation("workspace")).unwrap(),
@@ -105,6 +113,95 @@ fn focus_events_update_selected_window_relation_in_place() {
             .unwrap(),
         vec![node("window", "8")]
     );
+    assert_eq!(
+        state
+            .property(&node("window", "7"), &property("selected"))
+            .unwrap(),
+        LocusValue::Bool(false)
+    );
+    assert_eq!(
+        state
+            .property(&node("window", "8"), &property("selected"))
+            .unwrap(),
+        LocusValue::Bool(true)
+    );
+}
+
+#[test]
+fn focus_events_emit_selected_window_property_changes() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+    state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(7, 42, "Terminal"), window(8, 42, "Browser")],
+        })
+        .unwrap();
+
+    let changes = state
+        .apply_event(Event::WindowFocusChanged { id: Some(8) })
+        .unwrap();
+
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("selected"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "8"),
+            key: property("selected"),
+        })
+    );
+}
+
+#[test]
+fn workspace_activation_updates_selected_workspace_property() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![
+                workspace(42, "DP-1"),
+                workspace_with_focus(43, "DP-1", false),
+            ],
+        })
+        .unwrap();
+
+    let changes = state
+        .apply_event(Event::WorkspaceActivated {
+            id: 43,
+            focused: true,
+        })
+        .unwrap();
+
+    assert_eq!(
+        state
+            .property(&node("workspace", "42"), &property("selected"))
+            .unwrap(),
+        LocusValue::Bool(false)
+    );
+    assert_eq!(
+        state
+            .property(&node("workspace", "43"), &property("selected"))
+            .unwrap(),
+        LocusValue::Bool(true)
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("workspace", "42"),
+            key: property("selected"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("workspace", "43"),
+            key: property("selected"),
+        })
+    );
 }
 
 fn state_with_output(name: &str) -> NiriState {
@@ -135,6 +232,10 @@ fn output(name: &str) -> Output {
 }
 
 fn workspace(id: u64, output: &str) -> Workspace {
+    workspace_with_focus(id, output, true)
+}
+
+fn workspace_with_focus(id: u64, output: &str, focused: bool) -> Workspace {
     Workspace {
         id,
         idx: 1,
@@ -142,7 +243,7 @@ fn workspace(id: u64, output: &str) -> Workspace {
         output: Some(output.to_string()),
         is_urgent: false,
         is_active: true,
-        is_focused: true,
+        is_focused: focused,
         active_window_id: Some(7),
     }
 }

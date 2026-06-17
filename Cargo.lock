@@ -430,6 +430,8 @@ name = "locusfs-client"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -445,6 +447,7 @@ dependencies = [
  "locusfs-graph",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -477,6 +480,7 @@ dependencies = [
  "async-trait",
  "locusfs-graph",
  "niri-ipc",
+ "serde_json",
  "tokio",
 ]
 

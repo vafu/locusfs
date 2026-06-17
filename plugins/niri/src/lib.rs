@@ -25,14 +25,7 @@ pub struct NiriPluginHandle {
 }
 
 pub async fn register(graph: &DynamicGraph) -> Result<NiriPluginHandle> {
-    let graph_for_start = graph.clone();
-    let runtime = tokio::runtime::Handle::current();
-    let (state, event_stream) =
-        tokio::task::spawn_blocking(move || IpcNiriClient::start(graph_for_start, runtime))
-            .await
-            .map_err(|_| {
-                locusfs_graph::GraphError::Io("niri startup task panicked".to_string())
-            })??;
+    let (state, event_stream) = IpcNiriClient::start(graph.clone()).await?;
 
     for kind in PROVIDER_KINDS {
         let kind = NodeKind::new(*kind)?;

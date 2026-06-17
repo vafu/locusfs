@@ -1,5 +1,5 @@
 use std::env;
-use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -24,23 +24,77 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let command = parse_command()?;
 
     if let Command::Watch { path } = command {
-        return watch::watch_path(&path).map_err(Into::into);
+        return watch::watch_path(&path).await.map_err(Into::into);
     }
 
     let Command::Mount { mountpoint } = command else {
         unreachable!("all commands are handled above");
     };
-    fs::create_dir_all(&mountpoint)?;
+    let created_mountpoint = prepare_mountpoint(&mountpoint).await?;
+    tokio::fs::create_dir_all(&mountpoint).await?;
 
     let (graph, _plugins) = default_graph().await?;
-    let _mount = mount(FuseMountConfig::new(&mountpoint), graph).await?;
+    let mount = mount(FuseMountConfig::new(&mountpoint), graph).await?;
 
     eprintln!("locusfs mounted at {}", mountpoint.display());
     eprintln!("press Ctrl-C to unmount");
 
-    wait_for_shutdown().await?;
+    let shutdown_result = wait_for_shutdown().await;
+    let unmount_result = mount.unmount().await;
+    if created_mountpoint {
+        remove_mountpoint_dir(&mountpoint).await?;
+    }
+
+    shutdown_result?;
+    unmount_result?;
 
     Ok(())
+}
+
+async fn prepare_mountpoint(mountpoint: &PathBuf) -> io::Result<bool> {
+    match tokio::fs::try_exists(mountpoint).await {
+        Ok(exists) => Ok(!exists),
+        Err(error) if is_disconnected_fuse_mount(&error) => {
+            unmount_stale_mountpoint(mountpoint).await?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_disconnected_fuse_mount(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOTCONN)
+}
+
+async fn unmount_stale_mountpoint(mountpoint: &PathBuf) -> io::Result<()> {
+    let status = tokio::process::Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(mountpoint)
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "failed to unmount stale FUSE mountpoint {}",
+            mountpoint.display()
+        )))
+    }
+}
+
+async fn remove_mountpoint_dir(mountpoint: &PathBuf) -> io::Result<()> {
+    match tokio::fs::remove_dir(mountpoint).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn init_tracing() {

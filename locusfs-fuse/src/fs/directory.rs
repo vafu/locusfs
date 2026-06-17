@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use fuse3::{Errno, FileType};
+use locusfs_graph::{GraphError, NodeId, RelationName};
 
 use super::entry::{DirEntry, FsEntry, WATCH_FILE_NAME, parent_entry};
 use super::filesystem::LocusFs;
@@ -82,12 +83,7 @@ impl LocusFs {
                     entries.push(DirEntry::new(child_ino, FileType::RegularFile, name));
                 }
 
-                for relation in self
-                    .graph
-                    .relations(node)
-                    .await
-                    .map_err(graph_error_to_errno)?
-                {
+                for relation in self.relations(node).await? {
                     let name = encode_segment(relation.as_str()).map_err(graph_error_to_errno)?;
                     if !names.insert(name.clone()) {
                         return Err(errno(libc::EIO));
@@ -138,5 +134,13 @@ impl LocusFs {
         }
 
         Ok(entries)
+    }
+
+    async fn relations(&self, node: &NodeId) -> std::result::Result<Vec<RelationName>, Errno> {
+        match self.graph.relations(node).await {
+            Ok(relations) => Ok(relations),
+            Err(GraphError::NotFound { .. }) => Ok(Vec::new()),
+            Err(error) => Err(graph_error_to_errno(error)),
+        }
     }
 }

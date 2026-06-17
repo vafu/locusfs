@@ -122,12 +122,12 @@ impl NiriState {
         match node.kind().as_str() {
             WINDOW_KIND => self
                 .window(node)
-                .map(window_properties)
+                .map(|window| window_properties(window, self.focused_window_id()))
                 .transpose()?
                 .ok_or_else(|| node_not_found(node)),
             WORKSPACE_KIND => self
                 .workspace(node)
-                .map(workspace_properties)
+                .map(|workspace| workspace_properties(workspace, self.focused_workspace_id()))
                 .transpose()?
                 .ok_or_else(|| node_not_found(node)),
             OUTPUT_KIND => self
@@ -210,6 +210,10 @@ impl NiriState {
             .find(|workspace| workspace.is_focused)
     }
 
+    fn focused_workspace_id(&self) -> Option<u64> {
+        self.focused_workspace().map(|workspace| workspace.id)
+    }
+
     fn focused_window_id(&self) -> Option<u64> {
         self.stream
             .windows
@@ -224,6 +228,7 @@ impl NiriState {
         let mut changes = Vec::new();
         match event {
             Event::WorkspacesChanged { workspaces } => {
+                let old_selected_workspace_id = self.focused_workspace_id();
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WORKSPACE_KIND)?,
                 });
@@ -235,6 +240,15 @@ impl NiriState {
                         relation: relation(OUTPUT_RELATION)?,
                     });
                 }
+                let new_selected_workspace_id = workspaces
+                    .iter()
+                    .find(|workspace| workspace.is_focused)
+                    .map(|workspace| workspace.id);
+                push_selected_workspace_property_changes(
+                    &mut changes,
+                    old_selected_workspace_id,
+                    new_selected_workspace_id,
+                )?;
                 changes.push(GraphChange::RelationChanged {
                     source: selected_context_node()?,
                     relation: relation(WORKSPACE_RELATION)?,
@@ -248,12 +262,18 @@ impl NiriState {
                 changes.push(property_change(workspace_id_node(*id)?, "urgent")?);
             }
             Event::WorkspaceActivated { id, focused } => {
+                let old_selected_workspace_id = self.focused_workspace_id();
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WORKSPACE_KIND)?,
                 });
                 changes.push(property_change(workspace_id_node(*id)?, "active")?);
                 changes.push(property_change(workspace_id_node(*id)?, "focused")?);
                 if *focused {
+                    push_selected_workspace_property_changes(
+                        &mut changes,
+                        old_selected_workspace_id,
+                        Some(*id),
+                    )?;
                     changes.push(GraphChange::RelationChanged {
                         source: selected_context_node()?,
                         relation: relation(WORKSPACE_RELATION)?,
@@ -265,10 +285,21 @@ impl NiriState {
                 }
             }
             Event::WorkspaceActiveWindowChanged { workspace_id, .. } => {
+                let old_selected_window_id = self.focused_window_id();
                 changes.push(property_change(
                     workspace_id_node(*workspace_id)?,
                     "active-window-id",
                 )?);
+                if self
+                    .focused_workspace()
+                    .is_some_and(|workspace| workspace.id == *workspace_id)
+                {
+                    push_selected_window_property_changes(
+                        &mut changes,
+                        old_selected_window_id,
+                        self.workspace_event_active_window_id(event),
+                    )?;
+                }
                 changes.push(GraphChange::RelationChanged {
                     source: selected_context_node()?,
                     relation: relation(WINDOW_RELATION)?,
@@ -292,6 +323,7 @@ impl NiriState {
                 });
             }
             Event::WindowOpenedOrChanged { window } => {
+                let old_selected_window_id = self.focused_window_id();
                 let node = window_id_node(window.id)?;
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WINDOW_KIND)?,
@@ -302,6 +334,11 @@ impl NiriState {
                     relation: relation(WORKSPACE_RELATION)?,
                 });
                 if window.is_focused {
+                    push_selected_window_property_changes(
+                        &mut changes,
+                        old_selected_window_id,
+                        Some(window.id),
+                    )?;
                     changes.push(GraphChange::RelationChanged {
                         source: selected_context_node()?,
                         relation: relation(WINDOW_RELATION)?,
@@ -309,24 +346,30 @@ impl NiriState {
                 }
             }
             Event::WindowClosed { id } => {
+                let old_selected_window_id = self.focused_window_id();
                 changes.push(GraphChange::NodeRemoved {
                     node: window_id_node(*id)?,
                 });
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WINDOW_KIND)?,
                 });
+                if old_selected_window_id == Some(*id) {
+                    changes.push(property_change(window_id_node(*id)?, "selected")?);
+                }
                 changes.push(GraphChange::RelationChanged {
                     source: selected_context_node()?,
                     relation: relation(WINDOW_RELATION)?,
                 });
             }
             Event::WindowFocusChanged { id } => {
+                let old_selected_window_id = self.focused_window_id();
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WINDOW_KIND)?,
                 });
                 if let Some(id) = id {
                     changes.push(property_change(window_id_node(*id)?, "focused")?);
                 }
+                push_selected_window_property_changes(&mut changes, old_selected_window_id, *id)?;
                 changes.push(GraphChange::RelationChanged {
                     source: selected_context_node()?,
                     relation: relation(WINDOW_RELATION)?,
@@ -353,6 +396,15 @@ impl NiriState {
             | Event::CastStopped { .. } => {}
         }
         Ok(changes)
+    }
+
+    fn workspace_event_active_window_id(&self, event: &Event) -> Option<u64> {
+        match event {
+            Event::WorkspaceActiveWindowChanged {
+                active_window_id, ..
+            } => *active_window_id,
+            _ => None,
+        }
     }
 }
 
@@ -404,7 +456,10 @@ fn output_properties(output: &Output) -> Result<BTreeMap<PropertyKey, LocusValue
     Ok(properties)
 }
 
-fn workspace_properties(workspace: &Workspace) -> Result<BTreeMap<PropertyKey, LocusValue>> {
+fn workspace_properties(
+    workspace: &Workspace,
+    selected_workspace_id: Option<u64>,
+) -> Result<BTreeMap<PropertyKey, LocusValue>> {
     let mut properties = BTreeMap::new();
     insert(&mut properties, "kind", string(WORKSPACE_KIND))?;
     insert(&mut properties, "source", string(SOURCE))?;
@@ -444,6 +499,11 @@ fn workspace_properties(workspace: &Workspace) -> Result<BTreeMap<PropertyKey, L
         "focused",
         LocusValue::Bool(workspace.is_focused),
     )?;
+    insert(
+        &mut properties,
+        "selected",
+        LocusValue::Bool(selected_workspace_id == Some(workspace.id)),
+    )?;
     if let Some(active_window_id) = workspace.active_window_id {
         insert(
             &mut properties,
@@ -454,7 +514,10 @@ fn workspace_properties(workspace: &Workspace) -> Result<BTreeMap<PropertyKey, L
     Ok(properties)
 }
 
-fn window_properties(window: &Window) -> Result<BTreeMap<PropertyKey, LocusValue>> {
+fn window_properties(
+    window: &Window,
+    selected_window_id: Option<u64>,
+) -> Result<BTreeMap<PropertyKey, LocusValue>> {
     let mut properties = BTreeMap::new();
     insert(&mut properties, "kind", string(WINDOW_KIND))?;
     insert(&mut properties, "source", string(SOURCE))?;
@@ -475,6 +538,11 @@ fn window_properties(window: &Window) -> Result<BTreeMap<PropertyKey, LocusValue
         &mut properties,
         "focused",
         LocusValue::Bool(window.is_focused),
+    )?;
+    insert(
+        &mut properties,
+        "selected",
+        LocusValue::Bool(selected_window_id == Some(window.id)),
     )?;
     insert(
         &mut properties,
@@ -579,6 +647,38 @@ fn property_change(node: NodeId, key: &'static str) -> Result<GraphChange> {
         node,
         key: PropertyKey::new(key)?,
     })
+}
+
+fn push_selected_window_property_changes(
+    changes: &mut Vec<GraphChange>,
+    old_selected_window_id: Option<u64>,
+    new_selected_window_id: Option<u64>,
+) -> Result<()> {
+    if let Some(id) = old_selected_window_id {
+        changes.push(property_change(window_id_node(id)?, "selected")?);
+    }
+    if let Some(id) = new_selected_window_id
+        && Some(id) != old_selected_window_id
+    {
+        changes.push(property_change(window_id_node(id)?, "selected")?);
+    }
+    Ok(())
+}
+
+fn push_selected_workspace_property_changes(
+    changes: &mut Vec<GraphChange>,
+    old_selected_workspace_id: Option<u64>,
+    new_selected_workspace_id: Option<u64>,
+) -> Result<()> {
+    if let Some(id) = old_selected_workspace_id {
+        changes.push(property_change(workspace_id_node(id)?, "selected")?);
+    }
+    if let Some(id) = new_selected_workspace_id
+        && Some(id) != old_selected_workspace_id
+    {
+        changes.push(property_change(workspace_id_node(id)?, "selected")?);
+    }
+    Ok(())
 }
 
 fn node_not_found(node: &NodeId) -> GraphError {

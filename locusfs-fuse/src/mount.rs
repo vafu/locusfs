@@ -31,8 +31,21 @@ impl FuseMountConfig {
 /// A live FUSE session. Dropping this value unmounts the filesystem.
 #[derive(Debug)]
 pub struct FuseMount {
-    _change_worker: InvalidationWorker,
-    _session: MountHandle,
+    change_worker: InvalidationWorker,
+    session: Option<MountHandle>,
+}
+
+impl FuseMount {
+    pub async fn unmount(mut self) -> Result<()> {
+        self.change_worker.shutdown();
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        session
+            .unmount()
+            .await
+            .map_err(|error| FuseError::Unmount(error.to_string()))
+    }
 }
 
 pub async fn mount(config: FuseMountConfig, graph: DynamicGraph) -> Result<FuseMount> {
@@ -57,7 +70,7 @@ pub async fn mount(config: FuseMountConfig, graph: DynamicGraph) -> Result<FuseM
         spawn_change_invalidator(changes, notify, invalidation_graph, inodes, watch);
 
     Ok(FuseMount {
-        _change_worker: change_worker,
-        _session: session,
+        change_worker,
+        session: Some(session),
     })
 }

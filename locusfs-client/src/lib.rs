@@ -1,22 +1,22 @@
 //! Client helpers for reading and watching values exposed by a locusfs mount.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::time::{Duration, sleep};
+use tracing::info;
+
 /// Reads a locusfs path into memory.
-pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut value = Vec::new();
-    file.read_to_end(&mut value)?;
-    Ok(value)
+pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    tokio::fs::read(path).await
 }
 
 /// Reads a UTF-8 locusfs path into a string.
-pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
-    bytes_to_string(read(path)?)
+pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+    bytes_to_string(read(path).await?)
 }
 
 fn bytes_to_string(value: Vec<u8>) -> io::Result<String> {
@@ -39,11 +39,15 @@ pub fn absolute_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 }
 
 /// Finds the nearest locusfs mount root by walking upward until `/watch` exists.
-pub fn find_mount_root(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+pub async fn find_mount_root(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let path = path.as_ref();
-    for ancestor in path.ancestors() {
-        if ancestor.join("watch").is_file() {
-            return Ok(ancestor.to_path_buf());
+    let ancestors = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    for ancestor in ancestors {
+        if tokio::fs::metadata(ancestor.join("watch"))
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Ok(ancestor);
         }
     }
     Err(io::Error::new(
@@ -80,30 +84,36 @@ pub struct Watch {
     data_path: PathBuf,
     mount_root: PathBuf,
     logical_path: String,
-    watch_file: File,
+    watch_file: AsyncFd<OwnedFd>,
 }
 
 impl Watch {
     /// Opens `/watch` for `path` and subscribes this handle to that path.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let data_path = absolute_path(path)?;
-        let mount_root = find_mount_root(&data_path)?;
+        let mount_root = find_mount_root(&data_path).await?;
         let logical_path = logical_watch_path(&mount_root, &data_path)?;
-        Self::open_with_parts(data_path, mount_root, logical_path)
+        Self::open_with_parts(data_path, mount_root, logical_path).await
     }
 
     /// Opens a watch from already resolved path parts.
-    pub fn open_with_parts(
+    pub async fn open_with_parts(
         data_path: PathBuf,
         mount_root: PathBuf,
         logical_path: String,
     ) -> io::Result<Self> {
-        let watch_file = OpenOptions::new()
+        let mut watch_file = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(mount_root.join("watch"))?;
+            .open(mount_root.join("watch"))
+            .await?;
         let subscription = format!("{logical_path}\n");
-        watch_file.write_all_at(subscription.as_bytes(), 0)?;
+        watch_file.write_all(subscription.as_bytes()).await?;
+        info!("<<<< {}", logical_path);
+        watch_file.seek(std::io::SeekFrom::Start(0)).await?;
+        let watch_file = OwnedFd::from(watch_file.into_std().await);
+        set_nonblocking(&watch_file)?;
+        let watch_file = AsyncFd::new(watch_file)?;
 
         Ok(Self {
             data_path,
@@ -128,82 +138,126 @@ impl Watch {
         &self.logical_path
     }
 
-    /// Blocks until this subscription receives a change notification.
-    pub fn wait(&mut self) -> io::Result<()> {
-        let mut pollfd = libc::pollfd {
-            fd: self.watch_file.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
-            revents: 0,
-        };
+    /// Waits until this subscription receives a change notification.
+    pub async fn wait(&mut self) -> io::Result<()> {
+        self.wait_event().await.map(|_| ())
+    }
 
+    /// Waits until this subscription receives a watch event and returns its raw payload.
+    pub async fn wait_event(&mut self) -> io::Result<Vec<u8>> {
         loop {
-            let result = unsafe { libc::poll(&mut pollfd, 1, -1) };
-            if result >= 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            let mut guard = self.watch_file.readable().await?;
+            match guard.try_io(|watch_file| drain_watch_events(watch_file.get_ref())) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
             }
         }
+    }
 
-        check_poll_errors(pollfd.revents, "watch file")?;
-        if pollfd.revents & libc::POLLIN != 0 {
-            drain_watch_events(&mut self.watch_file)?;
-        }
-        Ok(())
+    /// Waits until this subscription receives a UTF-8 watch event.
+    pub async fn wait_event_to_string(&mut self) -> io::Result<String> {
+        bytes_to_string(self.wait_event().await?)
     }
 
     /// Reads the current value from the watched data path.
-    pub fn read(&self) -> io::Result<Vec<u8>> {
-        read_retrying(&self.data_path)
+    pub async fn read(&self) -> io::Result<Vec<u8>> {
+        let value = read_retrying(&self.data_path).await?;
+        info!("{} >>> {}", self.logical_path, format_watch_value(&value));
+        Ok(value)
     }
 
     /// Reads the current UTF-8 value from the watched data path.
-    pub fn read_to_string(&self) -> io::Result<String> {
-        bytes_to_string(self.read()?)
+    pub async fn read_to_string(&self) -> io::Result<String> {
+        bytes_to_string(self.read().await?)
     }
 
     /// Waits for a change and then reads the current value.
-    pub fn wait_and_read(&mut self) -> io::Result<Vec<u8>> {
-        self.wait()?;
-        self.read()
+    pub async fn wait_and_read(&mut self) -> io::Result<Vec<u8>> {
+        self.wait().await?;
+        self.read().await
     }
 }
 
-fn drain_watch_events(file: &mut File) -> io::Result<()> {
+fn drain_watch_events(fd: &OwnedFd) -> io::Result<Vec<u8>> {
+    let revents = poll_revents(fd)?;
+    check_poll_errors(revents, "watch file")?;
+    if revents & libc::POLLIN == 0 {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+
     let mut buffer = [0_u8; 4096];
+    let mut events = Vec::new();
     loop {
-        match file.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error),
+        let result = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        match result {
+            0 => return Ok(events),
+            read if read > 0 => {
+                events.extend_from_slice(&buffer[..read as usize]);
+                continue;
+            }
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return if events.is_empty() {
+                        Err(io::ErrorKind::WouldBlock.into())
+                    } else {
+                        Ok(events)
+                    };
+                }
+                return Err(error);
+            }
         }
     }
 }
 
-fn read_retrying(path: &Path) -> io::Result<Vec<u8>> {
+fn format_watch_value(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).escape_debug().to_string()
+}
+
+async fn read_retrying(path: &Path) -> io::Result<Vec<u8>> {
     loop {
-        match File::open(path) {
-            Ok(mut file) => {
-                let mut value = Vec::new();
-                file.read_to_end(&mut value)?;
-                return Ok(value);
-            }
+        match tokio::fs::read(path).await {
+            Ok(value) => return Ok(value),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                retry_delay();
+                sleep(Duration::from_millis(25)).await;
             }
             Err(error) => return Err(error),
         }
     }
 }
 
-fn retry_delay() {
-    unsafe {
-        libc::poll(std::ptr::null_mut(), 0, 25);
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
     }
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn poll_revents(fd: &OwnedFd) -> io::Result<libc::c_short> {
+    let mut pollfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pollfd.revents)
 }
 
 fn check_poll_errors(revents: libc::c_short, label: &str) -> io::Result<()> {

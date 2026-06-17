@@ -1,11 +1,9 @@
-use std::ffi::OsString;
-
 use locusfs_graph::{DynamicGraph, GraphChange, GraphChangeReceiver};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::fs::{
-    FsEntry, SharedInodeTable, SharedKernelNotify, SharedWatchRegistry, WatchKey,
+    FsEntry, SharedInodeTable, SharedKernelNotify, SharedWatchRegistry, WatchEvent, WatchKey,
     resolve_watch_path,
 };
 use crate::layout::encode_segment;
@@ -41,37 +39,31 @@ pub(crate) fn spawn_change_invalidator(
     watch: SharedWatchRegistry,
 ) -> InvalidationWorker {
     let (shutdown, mut shutdown_receiver) = oneshot::channel();
-    let task = tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build FUSE invalidation runtime");
-        runtime.block_on(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_receiver => break,
-                    received = changes.recv() => {
-                        match received {
-                            Ok(change) => {
-                                invalidate_change(
-                                    notifier.clone(),
-                                    graph.clone(),
-                                    inodes.clone(),
-                                    watch.clone(),
-                                    change,
-                                )
-                                .await;
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                resync_known_state(notifier.clone(), inodes.clone(), watch.clone())
-                                    .await;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_receiver => break,
+                received = changes.recv() => {
+                    match received {
+                        Ok(change) => {
+                            invalidate_change(
+                                notifier.clone(),
+                                graph.clone(),
+                                inodes.clone(),
+                                watch.clone(),
+                                change,
+                            )
+                            .await;
                         }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            resync_known_state(notifier.clone(), inodes.clone(), watch.clone())
+                                .await;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
-        });
+        }
     });
 
     InvalidationWorker {
@@ -96,9 +88,38 @@ async fn invalidate_change(
             invalidate_known_child(notifier.clone(), inodes.clone(), FsEntry::Root, name).await;
             invalidate_known_inode(notifier.clone(), inodes.clone(), FsEntry::KindDir(kind)).await;
         }
-        GraphChange::NodeChanged { node } | GraphChange::NodeRemoved { node } => {
-            let had_poll_waiters =
-                notify_node_watchers(notifier.clone(), watch.clone(), node.clone()).await;
+        GraphChange::NodeChanged { node } => {
+            let had_poll_waiters = notify_node_watchers(
+                notifier.clone(),
+                watch.clone(),
+                node.clone(),
+                WatchEvent::NodeChanged(node.clone()),
+            )
+            .await;
+            if had_poll_waiters {
+                return;
+            }
+            let parent = FsEntry::KindDir(node.kind().clone());
+            let name = match encode_segment(node.local()) {
+                Ok(name) => name,
+                Err(_) => return,
+            };
+            invalidate_known_child(notifier.clone(), inodes.clone(), parent, name).await;
+            invalidate_known_inode(
+                notifier.clone(),
+                inodes.clone(),
+                FsEntry::NodeDir(node.clone()),
+            )
+            .await;
+        }
+        GraphChange::NodeRemoved { node } => {
+            let had_poll_waiters = notify_node_watchers(
+                notifier.clone(),
+                watch.clone(),
+                node.clone(),
+                WatchEvent::NodeRemoved(node.clone()),
+            )
+            .await;
             if had_poll_waiters {
                 return;
             }
@@ -202,7 +223,7 @@ async fn invalidate_known_child(
     notifier: SharedKernelNotify,
     inodes: SharedInodeTable,
     parent: FsEntry,
-    name: String,
+    _name: String,
 ) {
     let parent_ino = {
         let mut inodes = inodes.lock().await;
@@ -213,9 +234,7 @@ async fn invalidate_known_child(
         parent_ino
     };
     if let Some(notifier) = current_notifier(notifier).await {
-        notifier
-            .invalid_entry(parent_ino, OsString::from(name))
-            .await;
+        notifier.invalid_inode(parent_ino, 0, 0).await;
     }
 }
 
@@ -237,10 +256,11 @@ async fn notify_node_watchers(
     notifier: SharedKernelNotify,
     watch: SharedWatchRegistry,
     node: locusfs_graph::NodeId,
+    event: WatchEvent,
 ) -> bool {
     let handles = {
         let mut watch = watch.lock().await;
-        watch.notify_node_change(&node)
+        watch.notify_node_change(&node, event)
     };
 
     notify_poll_handles(notifier, handles).await

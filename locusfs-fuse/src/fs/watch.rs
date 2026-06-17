@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use fuse3::Errno;
 use fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY;
 use locusfs_graph::{NodeId, PropertyKey, RelationName};
 use tokio::sync::Mutex;
+use tracing::info;
 
 use super::entry::FsEntry;
 use crate::errno;
@@ -35,6 +36,13 @@ pub struct WatchTarget {
     pub dependencies: Vec<WatchKey>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchEvent {
+    Change,
+    NodeChanged(NodeId),
+    NodeRemoved(NodeId),
+}
+
 #[derive(Debug)]
 pub struct WatchRegistry {
     next_handle: u64,
@@ -61,7 +69,7 @@ struct WatchHandle {
     original_path: Option<String>,
     resolved_subject: Option<WatchSubjectKey>,
     dependencies: Vec<WatchKey>,
-    pending: bool,
+    pending_events: VecDeque<WatchEvent>,
     poll_handles: Vec<PollHandle>,
 }
 
@@ -148,7 +156,7 @@ impl WatchRegistry {
         watch.original_path = Some(path);
         watch.resolved_subject = Some(target.subject.clone());
         watch.dependencies = target.dependencies.clone();
-        watch.pending = false;
+        watch.pending_events.clear();
         self.attach_watch(handle, &target.subject, &target.dependencies);
         Ok(())
     }
@@ -157,9 +165,11 @@ impl WatchRegistry {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Err(errno(libc::EINVAL));
         };
-        if watch.pending {
-            watch.pending = false;
-            Ok(b"change\n".to_vec())
+        if let Some(event) = watch.pending_events.pop_front() {
+            let value = event.into_bytes();
+            let path = watch.original_path.as_deref().unwrap_or("<unconfigured>");
+            info!("{} >>> {}", path, format_watch_value(&value));
+            Ok(value)
         } else {
             Ok(Vec::new())
         }
@@ -187,18 +197,22 @@ impl WatchRegistry {
 
                 if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
                     if let Some(kh) = kh {
+                        state
+                            .poll_handles
+                            .retain(|(poll_file, _)| *poll_file != handle);
                         state.poll_handles.push((handle, kh));
                     }
                 }
                 Ok(0)
             }
-            OpenFileState::Watch(watch) if watch.pending => Ok(READABLE_EVENTS),
+            OpenFileState::Watch(watch) if !watch.pending_events.is_empty() => Ok(READABLE_EVENTS),
             OpenFileState::Watch(_) => {
                 let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
                     return Err(errno(libc::EBADF));
                 };
                 if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
                     if let Some(kh) = kh {
+                        watch.poll_handles.clear();
                         watch.poll_handles.push(kh);
                     }
                 }
@@ -216,13 +230,14 @@ impl WatchRegistry {
     pub fn notify_property_change(&mut self, node: &NodeId, key: &PropertyKey) -> Vec<PollHandle> {
         let watch_key = WatchKey::Property(node.clone(), key.clone());
         let mut handles = self.notify_property_poll_change(&watch_key);
-        handles.extend(
-            self.notify_subject_change(&WatchSubjectKey::Property(node.clone(), key.clone())),
-        );
+        handles.extend(self.notify_subject_change(
+            &WatchSubjectKey::Property(node.clone(), key.clone()),
+            WatchEvent::Change,
+        ));
         handles
     }
 
-    pub fn notify_node_change(&mut self, node: &NodeId) -> Vec<PollHandle> {
+    pub fn notify_node_change(&mut self, node: &NodeId, event: WatchEvent) -> Vec<PollHandle> {
         let mut handles = Vec::new();
         let keys = self
             .property_watches
@@ -237,17 +252,30 @@ impl WatchRegistry {
             handles.extend(self.notify_property_poll_change(&key));
         }
 
-        let subjects = self
+        let node_subjects = self
             .subjects
             .keys()
             .filter(|subject| match subject {
                 WatchSubjectKey::Node(watched_node) => watched_node == node,
+                WatchSubjectKey::Property(_, _) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for subject in node_subjects {
+            handles.extend(self.notify_subject_change(&subject, event.clone()));
+        }
+
+        let property_subjects = self
+            .subjects
+            .keys()
+            .filter(|subject| match subject {
+                WatchSubjectKey::Node(_) => false,
                 WatchSubjectKey::Property(watched_node, _) => watched_node == node,
             })
             .cloned()
             .collect::<Vec<_>>();
-        for subject in subjects {
-            handles.extend(self.notify_subject_change(&subject));
+        for subject in property_subjects {
+            handles.extend(self.notify_subject_change(&subject, WatchEvent::Change));
         }
 
         handles
@@ -269,7 +297,7 @@ impl WatchRegistry {
             })
             .collect::<Vec<_>>();
         for watcher in watchers {
-            handles.extend(self.mark_watch_pending(watcher));
+            handles.extend(self.queue_watch_event(watcher, WatchEvent::Change));
         }
         handles
     }
@@ -305,7 +333,7 @@ impl WatchRegistry {
                 return Vec::new();
             }
         }
-        self.mark_watch_pending(handle)
+        self.queue_watch_event(handle, WatchEvent::Change)
     }
 
     fn notify_property_poll_change(&mut self, key: &WatchKey) -> Vec<PollHandle> {
@@ -317,7 +345,11 @@ impl WatchRegistry {
             .collect()
     }
 
-    fn notify_subject_change(&mut self, subject: &WatchSubjectKey) -> Vec<PollHandle> {
+    fn notify_subject_change(
+        &mut self,
+        subject: &WatchSubjectKey,
+        event: WatchEvent,
+    ) -> Vec<PollHandle> {
         let watchers = self
             .subjects
             .get(subject)
@@ -325,16 +357,16 @@ impl WatchRegistry {
             .unwrap_or_default();
         let mut handles = Vec::new();
         for watcher in watchers {
-            handles.extend(self.mark_watch_pending(watcher));
+            handles.extend(self.queue_watch_event(watcher, event.clone()));
         }
         handles
     }
 
-    fn mark_watch_pending(&mut self, handle: FileHandle) -> Vec<PollHandle> {
+    fn queue_watch_event(&mut self, handle: FileHandle, event: WatchEvent) -> Vec<PollHandle> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Vec::new();
         };
-        watch.pending = true;
+        watch.pending_events.push_back(event);
         std::mem::take(&mut watch.poll_handles)
     }
 
@@ -427,7 +459,17 @@ impl WatchRegistry {
                 .property_watches
                 .get(key)
                 .is_some_and(|state| state.generation > *seen_generation),
-            OpenFileState::Watch(watch) => watch.pending,
+            OpenFileState::Watch(watch) => !watch.pending_events.is_empty(),
+        }
+    }
+}
+
+impl WatchEvent {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Change => b"change\n".to_vec(),
+            Self::NodeChanged(node) => format!("node changed {node}\n").into_bytes(),
+            Self::NodeRemoved(node) => format!("node removed {node}\n").into_bytes(),
         }
     }
 }
@@ -437,4 +479,8 @@ fn property_poll_key(entry: &FsEntry) -> Option<WatchKey> {
         FsEntry::PropertyFile(node, key) => Some(WatchKey::Property(node.clone(), key.clone())),
         _ => None,
     }
+}
+
+fn format_watch_value(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).escape_debug().to_string()
 }

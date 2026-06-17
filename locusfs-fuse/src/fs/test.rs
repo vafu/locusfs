@@ -1,4 +1,8 @@
-use locusfs_graph::{NodeId, NodeKind, PropertyKey, RelationName};
+use async_trait::async_trait;
+use locusfs_graph::{
+    DynamicGraph, GraphError, LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey,
+    PropertyProvider, PropertySpec, RelationName, Result,
+};
 
 use super::watch;
 use super::*;
@@ -74,6 +78,38 @@ fn watch_registry_tracks_unread_property_changes() {
 }
 
 #[test]
+fn watch_registry_replaces_stale_property_poll_handles() {
+    let node = test_node("57");
+    let key = PropertyKey::new("title").unwrap();
+    let entry = FsEntry::PropertyFile(node.clone(), key.clone());
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&entry).unwrap();
+
+    assert_eq!(
+        registry
+            .poll(
+                handle,
+                Some(10),
+                fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        registry
+            .poll(
+                handle,
+                Some(11),
+                fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY
+            )
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(registry.notify_property_change(&node, &key), vec![11]);
+}
+
+#[test]
 fn watch_registry_tracks_unread_node_changes_for_open_properties() {
     let node = test_node("57");
     let key = PropertyKey::new("title").unwrap();
@@ -82,7 +118,11 @@ fn watch_registry_tracks_unread_node_changes_for_open_properties() {
     let handle = registry.open(&entry).unwrap();
 
     assert!(!registry.has_unread_change(handle));
-    assert!(registry.notify_node_change(&node).is_empty());
+    assert!(
+        registry
+            .notify_node_change(&node, WatchEvent::NodeChanged(node.clone()))
+            .is_empty()
+    );
     assert!(registry.has_unread_change(handle));
 
     registry.mark_read(handle);
@@ -118,6 +158,60 @@ fn watch_registry_marks_configured_watch_pending_for_subject_change() {
 }
 
 #[test]
+fn watch_registry_reports_node_change_event_for_node_subject() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        registry
+            .notify_node_change(&node, WatchEvent::NodeChanged(node.clone()))
+            .is_empty()
+    );
+
+    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
+    assert_eq!(event, "node changed node:57\n");
+}
+
+#[test]
+fn watch_registry_reports_node_removed_event_for_node_subject() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        registry
+            .notify_node_change(&node, WatchEvent::NodeRemoved(node.clone()))
+            .is_empty()
+    );
+
+    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
+    assert_eq!(event, "node removed node:57\n");
+}
+
+#[test]
 fn watch_registry_fans_out_shared_subjects_to_multiple_open_files() {
     let node = test_node("57");
     let key = PropertyKey::new("title").unwrap();
@@ -147,6 +241,47 @@ fn watch_registry_fans_out_shared_subjects_to_multiple_open_files() {
     assert_eq!(registry.read_watch(first).unwrap(), b"change\n");
     assert!(!registry.has_unread_change(first));
     assert!(registry.has_unread_change(second));
+}
+
+#[test]
+fn watch_registry_replaces_stale_meta_watch_poll_handles() {
+    let node = test_node("57");
+    let key = PropertyKey::new("title").unwrap();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57/title".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
+                dependencies: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        registry
+            .poll(
+                handle,
+                Some(20),
+                fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        registry
+            .poll(
+                handle,
+                Some(21),
+                fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY
+            )
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(registry.notify_property_change(&node, &key), vec![21]);
 }
 
 #[test]
@@ -191,10 +326,102 @@ fn relation_entries_are_hashable_and_stable() {
     assert_eq!(first, second);
 }
 
+#[tokio::test]
+async fn node_directory_lists_properties_without_relation_provider() {
+    let kind = NodeKind::new("property-only").unwrap();
+    let node = NodeId::new(kind.clone(), "upower").unwrap();
+    let key = PropertyKey::new("active").unwrap();
+    let provider = PropertyOnlyProvider {
+        kind,
+        node: node.clone(),
+        key: key.clone(),
+        value: LocusValue::Bool(true),
+    };
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_provider(node.kind().clone(), provider)
+        .await
+        .unwrap();
+    let fs = LocusFs::new(graph);
+
+    let entries = fs.dir_entries(&FsEntry::NodeDir(node), 7).await.unwrap();
+    let names = entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&".".to_string()));
+    assert!(names.contains(&"..".to_string()));
+    assert!(names.contains(&key.to_string()));
+}
+
 fn test_kind() -> NodeKind {
     NodeKind::new("node").unwrap()
 }
 
 fn test_node(local: &str) -> NodeId {
     NodeId::new(test_kind(), local).unwrap()
+}
+
+#[derive(Clone, Debug)]
+struct PropertyOnlyProvider {
+    kind: NodeKind,
+    node: NodeId,
+    key: PropertyKey,
+    value: LocusValue,
+}
+
+#[async_trait]
+impl NodeProvider for PropertyOnlyProvider {
+    fn kind(&self) -> &NodeKind {
+        &self.kind
+    }
+
+    async fn contains_node(&self, node: &NodeId) -> Result<bool> {
+        Ok(node == &self.node)
+    }
+
+    async fn nodes(&self) -> Result<Vec<NodeId>> {
+        Ok(vec![self.node.clone()])
+    }
+}
+
+#[async_trait]
+impl PropertyProvider for PropertyOnlyProvider {
+    async fn property_spec(&self, subject: &NodeId, key: &PropertyKey) -> Result<PropertySpec> {
+        if subject == &self.node && key == &self.key {
+            Ok(PropertySpec::new(key.clone(), self.value.kind()))
+        } else {
+            Err(GraphError::NotFound {
+                kind: "property",
+                name: format!("{subject}/{key}"),
+            })
+        }
+    }
+
+    async fn properties(&self, subject: &NodeId) -> Result<Vec<PropertySpec>> {
+        if subject == &self.node {
+            Ok(vec![PropertySpec::new(self.key.clone(), self.value.kind())])
+        } else {
+            Err(GraphError::NotFound {
+                kind: "node",
+                name: subject.to_string(),
+            })
+        }
+    }
+
+    async fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
+        if subject == &self.node && key == &self.key {
+            Ok(self.value.clone())
+        } else {
+            Err(GraphError::NotFound {
+                kind: "property",
+                name: format!("{subject}/{key}"),
+            })
+        }
+    }
 }

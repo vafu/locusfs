@@ -13,3 +13,4 @@ libc = "0.2.177"
 locusfs-graph = { path = "../locusfs-graph" }
 thiserror = "2.0.18"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
