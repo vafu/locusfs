@@ -5,7 +5,7 @@ use fuser::Errno;
 use locusfs_graph::{NodeId, NodeKind, PropertyKey, RelationName};
 
 use crate::graph_error_to_errno;
-use crate::layout::decode_segment;
+use crate::layout::{decode_segment, encode_segment};
 
 pub(super) fn os_str_to_str(value: &OsStr) -> std::result::Result<&str, Errno> {
     value.to_str().ok_or(Errno::EINVAL)
@@ -34,6 +34,14 @@ pub(super) fn relation_name_from_segment(
 ) -> std::result::Result<RelationName, Errno> {
     RelationName::new(decode_segment(segment).map_err(graph_error_to_errno)?)
         .map_err(graph_error_to_errno)
+}
+
+pub(super) fn encode_relation_target_name(target: &NodeId) -> locusfs_graph::Result<String> {
+    encode_segment(&target.to_string())
+}
+
+pub(super) fn decode_relation_target_name(name: &str) -> std::result::Result<String, Errno> {
+    decode_segment(name).map_err(graph_error_to_errno)
 }
 
 pub(super) fn node_id_from_relation_link_target_path(

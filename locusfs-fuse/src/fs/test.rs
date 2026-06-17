@@ -51,7 +51,7 @@ fn touching_entry_updates_mtime_and_ctime() {
 }
 
 #[test]
-fn poll_registry_tracks_unread_property_changes() {
+fn watch_registry_tracks_unread_property_changes() {
     let node = test_node("57");
     let key = PropertyKey::new("title").unwrap();
     let entry = FsEntry::PropertyFile(node.clone(), key.clone());
@@ -68,7 +68,7 @@ fn poll_registry_tracks_unread_property_changes() {
 }
 
 #[test]
-fn poll_registry_tracks_unread_node_changes_for_open_properties() {
+fn watch_registry_tracks_unread_node_changes_for_open_properties() {
     let node = test_node("57");
     let key = PropertyKey::new("title").unwrap();
     let entry = FsEntry::PropertyFile(node.clone(), key);

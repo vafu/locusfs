@@ -1,16 +1,18 @@
 mod attr;
+mod directory;
 mod entry;
 mod filesystem;
 mod inode;
 mod name;
+mod resolve;
 mod value;
 mod watch;
 
 pub use filesystem::LocusFs;
 
 pub(crate) use entry::FsEntry;
-pub(crate) use filesystem::resolve_watch_path;
 pub(crate) use inode::{InodeTable, SharedInodeTable};
+pub(crate) use resolve::resolve_watch_path;
 pub(crate) use watch::{SharedWatchRegistry, WatchKey, WatchRegistry};
 
 #[cfg(test)]
