@@ -48,20 +48,25 @@ fn round_trips_slashes_and_utf8() {
 fn builds_generic_node_paths() {
     let node = NodeId::new(NodeKind::new("node").unwrap(), "57").unwrap();
     let key = PropertyKey::new("title").unwrap();
+    assert_eq!(Layout::watch(), PathBuf::from("watch"));
     assert_eq!(
         Layout::node_property(&node, &key).unwrap(),
-        PathBuf::from("nodes/node/57/props/title")
+        PathBuf::from("node/57/title")
     );
 }
 
 #[test]
-fn builds_nested_relation_link_paths() {
+fn builds_inline_relation_link_paths() {
     let source = NodeId::new(NodeKind::new("window").unwrap(), "57").unwrap();
     let target = NodeId::new(NodeKind::new("workspace").unwrap(), "1").unwrap();
     let relation = RelationName::new("on-workspace").unwrap();
 
     assert_eq!(
         Layout::node_relation_link(&source, &relation, &target).unwrap(),
-        PathBuf::from("nodes/window/57/out/on-workspace/workspace/1")
+        PathBuf::from("window/57/on-workspace")
+    );
+    assert_eq!(
+        Layout::node_relation_target_link(&source, &relation, &target).unwrap(),
+        PathBuf::from("window/57/on-workspace/workspace%3A1")
     );
 }

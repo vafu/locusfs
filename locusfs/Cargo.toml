@@ -7,3 +7,5 @@ edition = "2024"
 libc = "0.2"
 locusfs-graph = { path = "../locusfs-graph" }
 locusfs-fuse = { path = "../locusfs-fuse" }
+locusfs-plugin-niri = { path = "../plugins/niri" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

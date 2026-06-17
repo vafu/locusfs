@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{
-    GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName, Result,
+    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
+    Result,
 };
 
 use super::{
@@ -23,6 +25,7 @@ type RegistryWriteGuard<'a> = std::sync::RwLockWriteGuard<'a, ProviderRegistry>;
 #[derive(Clone, Default)]
 pub struct DynamicGraph {
     providers: Arc<RwLock<ProviderRegistry>>,
+    change_subscribers: Arc<Mutex<Vec<Sender<GraphChange>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -38,6 +41,28 @@ struct ProviderRegistry {
 impl DynamicGraph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn subscribe_changes(&self) -> Result<Receiver<GraphChange>> {
+        let (sender, receiver) = mpsc::channel();
+        self.change_subscribers
+            .lock()
+            .map_err(|_| GraphError::Internal {
+                reason: "graph change subscriber lock poisoned",
+            })?
+            .push(sender);
+        Ok(receiver)
+    }
+
+    pub fn emit_change(&self, change: GraphChange) -> Result<()> {
+        let mut subscribers = self
+            .change_subscribers
+            .lock()
+            .map_err(|_| GraphError::Internal {
+                reason: "graph change subscriber lock poisoned",
+            })?;
+        subscribers.retain(|subscriber| subscriber.send(change.clone()).is_ok());
+        Ok(())
     }
 
     pub fn register_node_provider<P>(&self, provider: P) -> Result<()>
@@ -182,7 +207,11 @@ impl DynamicGraph {
 
     pub fn create_node(&self, node: &NodeId) -> Result<()> {
         self.node_mutation_provider_for_node(node)?
-            .create_node(node)
+            .create_node(node)?;
+        self.emit_change(GraphChange::NodeChanged { node: node.clone() })?;
+        self.emit_change(GraphChange::NodeKindChanged {
+            kind: node.kind().clone(),
+        })
     }
 
     pub fn remove_node(&self, node: &NodeId) -> Result<()> {
@@ -194,7 +223,11 @@ impl DynamicGraph {
         }
         self.remove_inbound_links(node)?;
         self.node_mutation_provider_for_node(node)?
-            .remove_node(node)
+            .remove_node(node)?;
+        self.emit_change(GraphChange::NodeRemoved { node: node.clone() })?;
+        self.emit_change(GraphChange::NodeKindChanged {
+            kind: node.kind().clone(),
+        })
     }
 
     pub fn contains_node(&self, node: &NodeId) -> Result<bool> {
@@ -247,12 +280,20 @@ impl DynamicGraph {
         value: LocusValue,
     ) -> Result<()> {
         self.property_mutation_provider_for_node(subject)?
-            .set_property(subject, key, value)
+            .set_property(subject, key, value)?;
+        self.emit_change(GraphChange::PropertyChanged {
+            node: subject.clone(),
+            key: key.clone(),
+        })
     }
 
     pub fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
         self.property_mutation_provider_for_node(subject)?
-            .remove_property(subject, key)
+            .remove_property(subject, key)?;
+        self.emit_change(GraphChange::PropertyChanged {
+            node: subject.clone(),
+            key: key.clone(),
+        })
     }
 
     pub fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
@@ -277,7 +318,11 @@ impl DynamicGraph {
             });
         }
         self.relation_mutation_provider_for_node(source)?
-            .set_link(source, relation, target)
+            .set_link(source, relation, target)?;
+        self.emit_change(GraphChange::RelationChanged {
+            source: source.clone(),
+            relation: relation.clone(),
+        })
     }
 
     pub fn remove_link(
@@ -287,7 +332,11 @@ impl DynamicGraph {
         target: &NodeId,
     ) -> Result<()> {
         self.relation_mutation_provider_for_node(source)?
-            .remove_link(source, relation, target)
+            .remove_link(source, relation, target)?;
+        self.emit_change(GraphChange::RelationChanged {
+            source: source.clone(),
+            relation: relation.clone(),
+        })
     }
 
     fn remove_inbound_links(&self, target: &NodeId) -> Result<()> {

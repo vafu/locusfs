@@ -4,18 +4,41 @@ use fuser::{FileAttr, FileType, INodeNo};
 
 pub const TTL: Duration = Duration::from_millis(250);
 
-pub fn file_attr(ino: u64, kind: FileType, perm: u16, size: u64) -> FileAttr {
-    // TODO: source atime/mtime/ctime/crtime from provider-backed metadata once graph entries
-    // expose stable filesystem timestamps.
-    let now = SystemTime::now();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryTimes {
+    pub accessed: SystemTime,
+    pub modified: SystemTime,
+    pub changed: SystemTime,
+    pub created: SystemTime,
+}
+
+impl EntryTimes {
+    pub fn now() -> Self {
+        let now = SystemTime::now();
+        Self {
+            accessed: now,
+            modified: now,
+            changed: now,
+            created: now,
+        }
+    }
+
+    pub fn touch(&mut self) {
+        let now = SystemTime::now();
+        self.modified = now;
+        self.changed = now;
+    }
+}
+
+pub fn file_attr(ino: u64, kind: FileType, perm: u16, size: u64, times: EntryTimes) -> FileAttr {
     FileAttr {
         ino: INodeNo(ino),
         size,
         blocks: size.div_ceil(512),
-        atime: now,
-        mtime: now,
-        ctime: now,
-        crtime: now,
+        atime: times.accessed,
+        mtime: times.modified,
+        ctime: times.changed,
+        crtime: times.created,
         kind,
         perm,
         // TODO: compute directory link counts from child directory entries instead of using a

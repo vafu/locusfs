@@ -5,6 +5,7 @@
 
 mod error;
 mod fs;
+mod invalidation;
 pub mod layout;
 mod mount;
 

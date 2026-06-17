@@ -1,20 +1,23 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use fuser::{
     Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, KernelConfig,
-    LockOwner, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    LockOwner, OpenFlags, PollEvents, PollFlags, PollNotifier, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyWrite, Request, TimeOrNow,
 };
 use locusfs_graph::{DynamicGraph, GraphError, NodeId, PropertyKey, RelationName};
 
-use super::attr::{TTL, file_attr};
-use super::entry::{self, DirEntry, FsEntry, parent_entry, relation_link_target};
-use super::inode::InodeTable;
+use super::attr::{EntryTimes, TTL, file_attr};
+use super::entry::{
+    DirEntry, FsEntry, WATCH_FILE_NAME, direct_relation_link_target, nested_relation_link_target,
+    parent_entry,
+};
+use super::inode::{InodeTable, SharedInodeTable};
 use super::name::{
     node_id_from_kind_and_segment, node_id_from_relation_link_target_path, node_kind_from_segment,
     os_str_to_str, property_key_from_segment, relation_name_from_segment,
@@ -23,21 +26,32 @@ use super::value::{
     parse_property_write, property_file_string, property_perm, property_spec_or_new_string,
     slice_for_read,
 };
+use super::watch::{SharedWatchRegistry, WatchKey, WatchRegistry, WatchSubjectKey, WatchTarget};
 use crate::graph_error_to_errno;
-use crate::layout::encode_segment;
+use crate::layout::{decode_segment, encode_segment};
 
 /// FUSE request adapter over the generic graph filesystem.
 #[derive(Debug)]
 pub struct LocusFs {
     graph: DynamicGraph,
-    inodes: Mutex<InodeTable>,
+    inodes: SharedInodeTable,
+    watch: SharedWatchRegistry,
 }
 
 impl LocusFs {
     pub fn new(graph: DynamicGraph) -> Self {
+        Self::new_with_state(graph, InodeTable::shared(), WatchRegistry::shared())
+    }
+
+    pub(crate) fn new_with_state(
+        graph: DynamicGraph,
+        inodes: SharedInodeTable,
+        watch: SharedWatchRegistry,
+    ) -> Self {
         Self {
             graph,
-            inodes: Mutex::new(InodeTable::new()),
+            inodes,
+            watch,
         }
     }
 
@@ -45,11 +59,10 @@ impl LocusFs {
         let name = os_str_to_str(name)?;
         let parent = self.entry(parent)?;
         match parent {
-            FsEntry::Root => match name {
-                "nodes" => Ok(FsEntry::NodesDir),
-                _ => Err(Errno::ENOENT),
-            },
-            FsEntry::NodesDir => {
+            FsEntry::Root => {
+                if name == WATCH_FILE_NAME {
+                    return Ok(FsEntry::WatchFile);
+                }
                 let kind = node_kind_from_segment(name)?;
                 if self
                     .graph
@@ -74,62 +87,40 @@ impl LocusFs {
                     Err(Errno::ENOENT)
                 }
             }
-            FsEntry::NodeDir(node) => match name {
-                "props" => Ok(FsEntry::PropsDir(node)),
-                "out" => Ok(FsEntry::OutDir(node)),
-                _ => Err(Errno::ENOENT),
-            },
-            FsEntry::PropsDir(node) => {
-                let key = property_key_from_segment(name)?;
-                self.graph
-                    .property_spec(&node, &key)
-                    .map_err(graph_error_to_errno)?;
-                Ok(FsEntry::PropertyFile(node, key))
-            }
-            FsEntry::OutDir(node) => {
+            FsEntry::NodeDir(node) => {
+                let property = property_key_from_segment(name)?;
+                let has_property = self.graph.property_spec(&node, &property).is_ok();
                 let relation = relation_name_from_segment(name)?;
-                if self
-                    .graph
-                    .relations(&node)
-                    .map_err(graph_error_to_errno)?
-                    .contains(&relation)
-                {
-                    Ok(FsEntry::RelationDir(node, relation))
-                } else {
-                    Err(Errno::ENOENT)
+                let targets = self.relation_targets(&node, &relation)?;
+                let has_relation = !targets.is_empty();
+
+                if has_property && has_relation {
+                    return Err(Errno::EIO);
+                }
+                if has_property {
+                    return Ok(FsEntry::PropertyFile(node, property));
+                }
+
+                match targets.as_slice() {
+                    [] => Err(Errno::ENOENT),
+                    [target] => Ok(FsEntry::RelationLink {
+                        source: node,
+                        relation,
+                        target: target.clone(),
+                    }),
+                    _ => Ok(FsEntry::RelationDir(node, relation)),
                 }
             }
             FsEntry::RelationDir(source, relation) => {
-                let target_kind = node_kind_from_segment(name)?;
-                if self
-                    .graph
-                    .targets(&source, &relation)
-                    .map_err(graph_error_to_errno)?
-                    .iter()
-                    .any(|target| target.kind() == &target_kind)
-                {
-                    Ok(FsEntry::RelationTargetKindDir {
-                        source,
-                        relation,
-                        target_kind,
-                    })
-                } else {
-                    Err(Errno::ENOENT)
-                }
-            }
-            FsEntry::RelationTargetKindDir {
-                source,
-                relation,
-                target_kind,
-            } => {
-                let target = node_id_from_kind_and_segment(target_kind, name)?;
+                let target = NodeId::parse(&decode_relation_target_name(name)?)
+                    .map_err(graph_error_to_errno)?;
                 if self
                     .graph
                     .targets(&source, &relation)
                     .map_err(graph_error_to_errno)?
                     .contains(&target)
                 {
-                    Ok(FsEntry::RelationLink {
+                    Ok(FsEntry::RelationTargetLink {
                         source,
                         relation,
                         target,
@@ -138,7 +129,10 @@ impl LocusFs {
                     Err(Errno::ENOENT)
                 }
             }
-            FsEntry::PropertyFile(_, _) | FsEntry::RelationLink { .. } => Err(Errno::ENOTDIR),
+            FsEntry::WatchFile
+            | FsEntry::PropertyFile(_, _)
+            | FsEntry::RelationLink { .. }
+            | FsEntry::RelationTargetLink { .. } => Err(Errno::ENOTDIR),
         }
     }
 
@@ -172,7 +166,8 @@ impl LocusFs {
 
     fn attr(&self, entry: &FsEntry, ino: u64) -> std::result::Result<fuser::FileAttr, Errno> {
         let (kind, perm, size) = match entry {
-            FsEntry::Root | FsEntry::NodesDir => (FileType::Directory, 0o755, 0),
+            FsEntry::Root => (FileType::Directory, 0o755, 0),
+            FsEntry::WatchFile => (FileType::RegularFile, 0o600, 0),
             FsEntry::KindDir(kind) => {
                 if !self
                     .graph
@@ -184,11 +179,11 @@ impl LocusFs {
                 }
                 (FileType::Directory, 0o755, 0)
             }
-            FsEntry::NodeDir(node) | FsEntry::PropsDir(node) | FsEntry::OutDir(node) => {
+            FsEntry::NodeDir(node) => {
                 self.ensure_node_exists(node)?;
                 (FileType::Directory, 0o755, 0)
             }
-            FsEntry::RelationDir(node, _) | FsEntry::RelationTargetKindDir { source: node, .. } => {
+            FsEntry::RelationDir(node, _) => {
                 self.ensure_node_exists(node)?;
                 (FileType::Directory, 0o755, 0)
             }
@@ -217,12 +212,40 @@ impl LocusFs {
                 (
                     FileType::Symlink,
                     0o777,
-                    relation_link_target(target).as_os_str().as_bytes().len() as u64,
+                    direct_relation_link_target(target)
+                        .as_os_str()
+                        .as_bytes()
+                        .len() as u64,
+                )
+            }
+            FsEntry::RelationTargetLink {
+                source,
+                relation,
+                target,
+            } => {
+                self.ensure_relation_link_exists(source, relation, target)?;
+                (
+                    FileType::Symlink,
+                    0o777,
+                    nested_relation_link_target(target)
+                        .as_os_str()
+                        .as_bytes()
+                        .len() as u64,
                 )
             }
         };
 
-        Ok(file_attr(ino, kind, perm, size))
+        Ok(file_attr(ino, kind, perm, size, self.entry_times(entry)?))
+    }
+
+    fn entry_times(&self, entry: &FsEntry) -> std::result::Result<EntryTimes, Errno> {
+        Ok(self.inodes.lock().map_err(|_| Errno::EIO)?.times(entry))
+    }
+
+    fn touch_entry(&self, entry: &FsEntry) {
+        if let Ok(mut inodes) = self.inodes.lock() {
+            inodes.touch(entry);
+        }
     }
 
     fn create_property_file(
@@ -230,7 +253,7 @@ impl LocusFs {
         parent: u64,
         name: &OsStr,
     ) -> std::result::Result<FsEntry, Errno> {
-        let FsEntry::PropsDir(node) = self.entry(parent)? else {
+        let FsEntry::NodeDir(node) = self.entry(parent)? else {
             return Err(Errno::ENOTDIR);
         };
         let key = property_key_from_segment(os_str_to_str(name)?)?;
@@ -255,6 +278,129 @@ impl LocusFs {
         } else {
             Err(Errno::EACCES)
         }
+    }
+
+    fn watch_target_for_path(&self, path: &str) -> std::result::Result<WatchTarget, Errno> {
+        resolve_watch_path(&self.graph, path)
+    }
+}
+
+pub(crate) fn resolve_watch_path(
+    graph: &DynamicGraph,
+    path: &str,
+) -> std::result::Result<WatchTarget, Errno> {
+    let mut segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .peekable();
+
+    let Some(kind_segment) = segments.next() else {
+        return Err(Errno::EINVAL);
+    };
+    let Some(local_segment) = segments.next() else {
+        return Err(Errno::EINVAL);
+    };
+
+    let kind = node_kind_from_segment(kind_segment)?;
+    let mut node = node_id_from_kind_and_segment(kind, local_segment)?;
+    ensure_node_exists(graph, &node)?;
+
+    let mut dependencies = Vec::new();
+    while let Some(segment) = segments.next() {
+        let relation = relation_name_from_segment(segment)?;
+        let targets = relation_targets(graph, &node, &relation)?;
+        let has_relation = !targets.is_empty();
+        let property = property_key_from_segment(segment)?;
+        let has_property = graph.property_spec(&node, &property).is_ok();
+
+        if has_property && has_relation {
+            return Err(Errno::EIO);
+        }
+
+        if has_property {
+            if segments.next().is_some() {
+                return Err(Errno::ENOTDIR);
+            }
+            let key = property_key_from_segment(segment)?;
+            return Ok(WatchTarget {
+                subject: WatchSubjectKey::Property(node, key),
+                dependencies,
+            });
+        }
+
+        if !has_relation {
+            return Err(Errno::ENOENT);
+        }
+
+        push_unique(
+            &mut dependencies,
+            WatchKey::Relation(node.clone(), relation.clone()),
+        );
+
+        let target = if targets.len() == 1 {
+            targets[0].clone()
+        } else {
+            let Some(target_segment) = segments.next() else {
+                return Ok(WatchTarget {
+                    subject: WatchSubjectKey::Node(node),
+                    dependencies,
+                });
+            };
+            let target = NodeId::parse(&decode_relation_target_name(target_segment)?)
+                .map_err(graph_error_to_errno)?;
+            if !targets.contains(&target) {
+                return Err(Errno::ENOENT);
+            }
+            target
+        };
+        node = target;
+    }
+
+    Ok(WatchTarget {
+        subject: WatchSubjectKey::Node(node),
+        dependencies,
+    })
+}
+
+fn ensure_node_exists(graph: &DynamicGraph, node: &NodeId) -> std::result::Result<(), Errno> {
+    if graph.contains_node(node).map_err(graph_error_to_errno)? {
+        Ok(())
+    } else {
+        Err(Errno::ENOENT)
+    }
+}
+
+fn relation_targets(
+    graph: &DynamicGraph,
+    source: &NodeId,
+    relation: &RelationName,
+) -> std::result::Result<Vec<NodeId>, Errno> {
+    match graph.targets(source, relation) {
+        Ok(targets) => Ok(targets),
+        Err(GraphError::NotFound { .. }) => Ok(Vec::new()),
+        Err(error) => Err(graph_error_to_errno(error)),
+    }
+}
+
+fn encode_relation_target_name(target: &NodeId) -> locusfs_graph::Result<String> {
+    encode_segment(&target.to_string())
+}
+
+fn decode_relation_target_name(name: &str) -> std::result::Result<String, Errno> {
+    decode_segment(name).map_err(graph_error_to_errno)
+}
+
+fn parse_watch_subscription(data: &[u8]) -> std::result::Result<String, Errno> {
+    let path = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?.trim();
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(Errno::EINVAL);
+    }
+    Ok(path.to_string())
+}
+
+fn push_unique<T: Eq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
     }
 }
 
@@ -285,21 +431,20 @@ impl Filesystem for LocusFs {
         }
     }
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         match self.entry(ino.0) {
             Ok(
                 FsEntry::Root
-                | FsEntry::NodesDir
                 | FsEntry::KindDir(_)
                 | FsEntry::NodeDir(_)
-                | FsEntry::PropsDir(_)
-                | FsEntry::OutDir(_)
-                | FsEntry::RelationDir(_, _)
-                | FsEntry::RelationTargetKindDir { .. },
+                | FsEntry::RelationDir(_, _),
             ) => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Ok(FsEntry::PropertyFile(_, _) | FsEntry::RelationLink { .. }) => {
-                reply.error(Errno::ENOTDIR)
-            }
+            Ok(
+                FsEntry::WatchFile
+                | FsEntry::PropertyFile(_, _)
+                | FsEntry::RelationLink { .. }
+                | FsEntry::RelationTargetLink { .. },
+            ) => reply.error(Errno::ENOTDIR),
             Err(error) => reply.error(error),
         }
     }
@@ -350,17 +495,9 @@ impl Filesystem for LocusFs {
                     .map_err(graph_error_to_errno)?;
                 Ok(FsEntry::NodeDir(node))
             }
-            FsEntry::OutDir(node) => {
+            FsEntry::NodeDir(node) => {
                 let relation = relation_name_from_segment(os_str_to_str(name)?)?;
                 Ok(FsEntry::RelationDir(node, relation))
-            }
-            FsEntry::RelationDir(source, relation) => {
-                let target_kind = node_kind_from_segment(os_str_to_str(name)?)?;
-                Ok(FsEntry::RelationTargetKindDir {
-                    source,
-                    relation,
-                    target_kind,
-                })
             }
             _ => Err(Errno::ENOTDIR),
         });
@@ -374,10 +511,24 @@ impl Filesystem for LocusFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         match self.entry(ino.0) {
-            Ok(FsEntry::PropertyFile(_, _)) => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Ok(FsEntry::RelationLink { .. }) => reply.error(Errno::EINVAL),
+            Ok(entry @ (FsEntry::PropertyFile(_, _) | FsEntry::WatchFile)) => {
+                let handle = self
+                    .watch
+                    .lock()
+                    .map_err(|_| Errno::EIO)
+                    .and_then(|mut watch| watch.open(&entry));
+                match handle {
+                    Ok(handle) => {
+                        reply.opened(handle, FopenFlags::FOPEN_DIRECT_IO);
+                    }
+                    Err(error) => reply.error(error),
+                }
+            }
+            Ok(FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. }) => {
+                reply.error(Errno::EINVAL)
+            }
             Ok(_) => reply.error(Errno::EISDIR),
             Err(error) => reply.error(error),
         }
@@ -390,7 +541,15 @@ impl Filesystem for LocusFs {
                 relation,
                 target,
             }) => match self.ensure_relation_link_exists(&source, &relation, &target) {
-                Ok(()) => reply.data(relation_link_target(&target).as_os_str().as_bytes()),
+                Ok(()) => reply.data(direct_relation_link_target(&target).as_os_str().as_bytes()),
+                Err(error) => reply.error(error),
+            },
+            Ok(FsEntry::RelationTargetLink {
+                source,
+                relation,
+                target,
+            }) => match self.ensure_relation_link_exists(&source, &relation, &target) {
+                Ok(()) => reply.data(nested_relation_link_target(&target).as_os_str().as_bytes()),
                 Err(error) => reply.error(error),
             },
             Ok(_) => reply.error(Errno::EINVAL),
@@ -402,20 +561,37 @@ impl Filesystem for LocusFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
-        _flags: fuser::OpenFlags,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let result = self.entry(ino.0).and_then(|entry| match entry {
-            FsEntry::PropertyFile(node, key) => self.read_property(&node, &key),
+            FsEntry::PropertyFile(node, key) => self
+                .read_property(&node, &key)
+                .map(|data| slice_for_read(&data, offset, size).to_vec()),
+            FsEntry::WatchFile => {
+                self.watch
+                    .lock()
+                    .map_err(|_| Errno::EIO)
+                    .and_then(|mut watch| {
+                        let data = watch.read_watch(fh)?;
+                        Ok(slice_for_read(&data, 0, size).to_vec())
+                    })
+            }
+            FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => Err(Errno::EINVAL),
             _ => Err(Errno::EISDIR),
         });
 
         match result {
-            Ok(data) => reply.data(slice_for_read(&data, offset, size)),
+            Ok(data) => {
+                if let Ok(mut watch) = self.watch.lock() {
+                    watch.mark_read(fh);
+                }
+                reply.data(&data)
+            }
             Err(error) => reply.error(error),
         }
     }
@@ -424,11 +600,11 @@ impl Filesystem for LocusFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: fuser::WriteFlags,
-        _flags: fuser::OpenFlags,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -437,26 +613,54 @@ impl Filesystem for LocusFs {
             return;
         }
 
-        let result = self.entry(ino.0).and_then(|entry| {
-            let FsEntry::PropertyFile(node, key) = entry else {
-                return Err(Errno::EISDIR);
-            };
-            let input = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-            let spec = property_spec_or_new_string(&self.graph, &node, &key)?;
-            if !spec.is_writable() {
-                return Err(Errno::EACCES);
+        let result = self.entry(ino.0).and_then(|entry| match entry {
+            FsEntry::PropertyFile(node, key) => {
+                let input = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+                let spec = property_spec_or_new_string(&self.graph, &node, &key)?;
+                if !spec.is_writable() {
+                    return Err(Errno::EACCES);
+                }
+                let value =
+                    parse_property_write(spec.kind(), input).map_err(graph_error_to_errno)?;
+                self.graph
+                    .set_property(&node, &key, value)
+                    .map_err(graph_error_to_errno)?;
+                self.touch_entry(&FsEntry::PropertyFile(node.clone(), key.clone()));
+                self.touch_entry(&FsEntry::NodeDir(node));
+                Ok(data.len() as u32)
             }
-            let value = parse_property_write(spec.kind(), input).map_err(graph_error_to_errno)?;
-            self.graph
-                .set_property(&node, &key, value)
-                .map_err(graph_error_to_errno)?;
-            Ok(data.len() as u32)
+            FsEntry::WatchFile => {
+                let path = parse_watch_subscription(data)?;
+                let target = self.watch_target_for_path(&path)?;
+                self.watch
+                    .lock()
+                    .map_err(|_| Errno::EIO)?
+                    .configure_watch(fh, path, target)?;
+                Ok(data.len() as u32)
+            }
+            _ => Err(Errno::EISDIR),
         });
 
         match result {
             Ok(written) => reply.written(written),
             Err(error) => reply.error(error),
         }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.release(fh);
+        }
+        reply.ok();
     }
 
     fn create(
@@ -471,7 +675,13 @@ impl Filesystem for LocusFs {
     ) {
         match self.create_property_file(parent.0, name).and_then(|entry| {
             let ino = self.acquire_inode(entry.clone())?;
-            Ok(file_attr(ino, FileType::RegularFile, 0o644, 0))
+            Ok(file_attr(
+                ino,
+                FileType::RegularFile,
+                0o644,
+                0,
+                self.entry_times(&entry)?,
+            ))
         }) {
             Ok(attr) => reply.created(
                 &TTL,
@@ -512,6 +722,33 @@ impl Filesystem for LocusFs {
         }
     }
 
+    fn poll(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        ph: PollNotifier,
+        _events: PollEvents,
+        flags: PollFlags,
+        reply: ReplyPoll,
+    ) {
+        match self.entry(ino.0) {
+            Ok(FsEntry::PropertyFile(_, _) | FsEntry::WatchFile) => {
+                let result = self
+                    .watch
+                    .lock()
+                    .map_err(|_| Errno::EIO)
+                    .and_then(|mut watch| watch.poll(fh, ph, flags));
+                match result {
+                    Ok(events) => reply.poll(events),
+                    Err(error) => reply.error(error),
+                }
+            }
+            Ok(_) => reply.poll(PollEvents::POLLNVAL),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn symlink(
         &self,
         _req: &Request,
@@ -521,27 +758,37 @@ impl Filesystem for LocusFs {
         reply: ReplyEntry,
     ) {
         let result = self.entry(parent.0).and_then(|entry| {
-            let FsEntry::RelationTargetKindDir {
-                source,
-                relation,
-                target_kind,
-            } = entry
-            else {
-                return Err(Errno::ENOTDIR);
-            };
-            let target = node_id_from_kind_and_segment(target_kind, os_str_to_str(link_name)?)?;
             let symlink_target = node_id_from_relation_link_target_path(_target)?;
-            if symlink_target != target {
-                return Err(Errno::EINVAL);
+            match entry {
+                FsEntry::NodeDir(source) => {
+                    let relation = relation_name_from_segment(os_str_to_str(link_name)?)?;
+                    self.graph
+                        .set_link(&source, &relation, &symlink_target)
+                        .map_err(graph_error_to_errno)?;
+                    Ok(FsEntry::RelationLink {
+                        source,
+                        relation,
+                        target: symlink_target,
+                    })
+                }
+                FsEntry::RelationDir(source, relation) => {
+                    let target =
+                        NodeId::parse(&decode_relation_target_name(os_str_to_str(link_name)?)?)
+                            .map_err(graph_error_to_errno)?;
+                    if symlink_target != target {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.graph
+                        .set_link(&source, &relation, &target)
+                        .map_err(graph_error_to_errno)?;
+                    Ok(FsEntry::RelationTargetLink {
+                        source,
+                        relation,
+                        target,
+                    })
+                }
+                _ => Err(Errno::ENOTDIR),
             }
-            self.graph
-                .set_link(&source, &relation, &target)
-                .map_err(graph_error_to_errno)?;
-            Ok(FsEntry::RelationLink {
-                source,
-                relation,
-                target,
-            })
         });
 
         match result.and_then(|entry| {
@@ -555,19 +802,34 @@ impl Filesystem for LocusFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result = self.entry(parent.0).and_then(|entry| match entry {
-            FsEntry::PropsDir(node) => {
-                let key = property_key_from_segment(os_str_to_str(name)?)?;
+            FsEntry::NodeDir(node) => {
+                let name = os_str_to_str(name)?;
+                let key = property_key_from_segment(name)?;
+                let has_property = self.graph.property_spec(&node, &key).is_ok();
+                let relation = relation_name_from_segment(name)?;
+                let targets = self.relation_targets(&node, &relation)?;
+                let has_relation = !targets.is_empty();
+
+                if has_property && has_relation {
+                    return Err(Errno::EIO);
+                }
+                if has_property {
+                    return self
+                        .graph
+                        .remove_property(&node, &key)
+                        .map_err(graph_error_to_errno);
+                }
+
+                let [target] = targets.as_slice() else {
+                    return Err(Errno::ENOENT);
+                };
                 self.graph
-                    .remove_property(&node, &key)
+                    .remove_link(&node, &relation, target)
                     .map_err(graph_error_to_errno)
             }
-            FsEntry::RelationDir(_, _) => Err(Errno::EISDIR),
-            FsEntry::RelationTargetKindDir {
-                source,
-                relation,
-                target_kind,
-            } => {
-                let target = node_id_from_kind_and_segment(target_kind, os_str_to_str(name)?)?;
+            FsEntry::RelationDir(source, relation) => {
+                let target = NodeId::parse(&decode_relation_target_name(os_str_to_str(name)?)?)
+                    .map_err(graph_error_to_errno)?;
                 self.graph
                     .remove_link(&source, &relation, &target)
                     .map_err(graph_error_to_errno)
@@ -591,22 +853,14 @@ impl Filesystem for LocusFs {
                 self.forget_entry(&FsEntry::NodeDir(node));
                 Ok(())
             }
-            FsEntry::RelationDir(source, relation) => {
-                let target_kind = node_kind_from_segment(os_str_to_str(name)?)?;
-                let entry = FsEntry::RelationTargetKindDir {
-                    source: source.clone(),
-                    relation: relation.clone(),
-                    target_kind: target_kind.clone(),
-                };
-                if self
-                    .relation_targets(&source, &relation)?
-                    .iter()
-                    .any(|target| target.kind() == &target_kind)
-                {
-                    Err(Errno::ENOTEMPTY)
-                } else {
+            FsEntry::NodeDir(source) => {
+                let relation = relation_name_from_segment(os_str_to_str(name)?)?;
+                let entry = FsEntry::RelationDir(source.clone(), relation.clone());
+                if self.relation_targets(&source, &relation)?.is_empty() {
                     self.forget_entry(&entry);
                     Ok(())
+                } else {
+                    Err(Errno::ENOTEMPTY)
                 }
             }
             _ => Err(Errno::ENOTDIR),
@@ -670,13 +924,14 @@ impl LocusFs {
 
         match entry {
             FsEntry::Root => {
+                let child = FsEntry::WatchFile;
+                let child_ino = self.inode(child)?;
                 entries.push(DirEntry::new(
-                    entry::NODES_INO,
-                    FileType::Directory,
-                    "nodes",
+                    child_ino,
+                    FileType::RegularFile,
+                    WATCH_FILE_NAME,
                 ));
-            }
-            FsEntry::NodesDir => {
+
                 for kind in self.graph.node_kinds().map_err(graph_error_to_errno)? {
                     let child = FsEntry::KindDir(kind.clone());
                     let child_ino = self.inode(child)?;
@@ -703,71 +958,50 @@ impl LocusFs {
                 }
             }
             FsEntry::NodeDir(node) => {
-                let props = FsEntry::PropsDir(node.clone());
-                let out = FsEntry::OutDir(node.clone());
-                entries.push(DirEntry::new(
-                    self.inode(props)?,
-                    FileType::Directory,
-                    "props",
-                ));
-                entries.push(DirEntry::new(self.inode(out)?, FileType::Directory, "out"));
-            }
-            FsEntry::PropsDir(node) => {
+                let mut names = BTreeSet::new();
                 for spec in self.graph.properties(node).map_err(graph_error_to_errno)? {
                     let key = spec.key();
+                    let name = encode_segment(key.as_str()).map_err(graph_error_to_errno)?;
+                    if !names.insert(name.clone()) {
+                        return Err(Errno::EIO);
+                    }
                     let child = FsEntry::PropertyFile(node.clone(), key.clone());
                     let child_ino = self.inode(child)?;
-                    entries.push(DirEntry::new(
-                        child_ino,
-                        FileType::RegularFile,
-                        encode_segment(key.as_str()).map_err(graph_error_to_errno)?,
-                    ));
+                    entries.push(DirEntry::new(child_ino, FileType::RegularFile, name));
                 }
-            }
-            FsEntry::OutDir(node) => {
+
                 for relation in self.graph.relations(node).map_err(graph_error_to_errno)? {
-                    let child = FsEntry::RelationDir(node.clone(), relation.clone());
-                    let child_ino = self.inode(child)?;
-                    entries.push(DirEntry::new(
-                        child_ino,
-                        FileType::Directory,
-                        encode_segment(relation.as_str()).map_err(graph_error_to_errno)?,
-                    ));
+                    let name = encode_segment(relation.as_str()).map_err(graph_error_to_errno)?;
+                    if !names.insert(name.clone()) {
+                        return Err(Errno::EIO);
+                    }
+                    let targets = self.relation_targets(node, &relation)?;
+                    match targets.as_slice() {
+                        [] => {}
+                        [target] => {
+                            let child = FsEntry::RelationLink {
+                                source: node.clone(),
+                                relation: relation.clone(),
+                                target: target.clone(),
+                            };
+                            let child_ino = self.inode(child)?;
+                            entries.push(DirEntry::new(child_ino, FileType::Symlink, name.clone()));
+                        }
+                        _ => {
+                            let child = FsEntry::RelationDir(node.clone(), relation.clone());
+                            let child_ino = self.inode(child)?;
+                            entries.push(DirEntry::new(
+                                child_ino,
+                                FileType::Directory,
+                                name.clone(),
+                            ));
+                        }
+                    };
                 }
             }
             FsEntry::RelationDir(source, relation) => {
-                let mut target_kinds = self
-                    .relation_targets(source, relation)?
-                    .into_iter()
-                    .map(|target| target.kind().clone())
-                    .collect::<Vec<_>>();
-                target_kinds.sort();
-                target_kinds.dedup();
-                for target_kind in target_kinds {
-                    let child = FsEntry::RelationTargetKindDir {
-                        source: source.clone(),
-                        relation: relation.clone(),
-                        target_kind: target_kind.clone(),
-                    };
-                    let child_ino = self.inode(child)?;
-                    entries.push(DirEntry::new(
-                        child_ino,
-                        FileType::Directory,
-                        encode_segment(target_kind.as_str()).map_err(graph_error_to_errno)?,
-                    ));
-                }
-            }
-            FsEntry::RelationTargetKindDir {
-                source,
-                relation,
-                target_kind,
-            } => {
-                for target in self
-                    .relation_targets(source, relation)?
-                    .into_iter()
-                    .filter(|target| target.kind() == target_kind)
-                {
-                    let child = FsEntry::RelationLink {
+                for target in self.relation_targets(source, relation)? {
+                    let child = FsEntry::RelationTargetLink {
                         source: source.clone(),
                         relation: relation.clone(),
                         target: target.clone(),
@@ -776,11 +1010,14 @@ impl LocusFs {
                     entries.push(DirEntry::new(
                         child_ino,
                         FileType::Symlink,
-                        encode_segment(target.local()).map_err(graph_error_to_errno)?,
+                        encode_relation_target_name(&target).map_err(graph_error_to_errno)?,
                     ));
                 }
             }
-            FsEntry::PropertyFile(_, _) | FsEntry::RelationLink { .. } => {}
+            FsEntry::WatchFile
+            | FsEntry::PropertyFile(_, _)
+            | FsEntry::RelationLink { .. }
+            | FsEntry::RelationTargetLink { .. } => {}
         }
 
         Ok(entries)

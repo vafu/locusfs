@@ -3,5 +3,6 @@ members = [
     "locusfs",
     "locusfs-graph",
     "locusfs-fuse",
+    "plugins/niri",
 ]
 resolver = "3"

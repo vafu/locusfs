@@ -40,11 +40,8 @@ pub(super) fn node_id_from_relation_link_target_path(
     path: &Path,
 ) -> std::result::Result<NodeId, Errno> {
     let mut components = path.components();
-    for _ in 0..5 {
-        match components.next() {
-            Some(Component::ParentDir) => {}
-            _ => return Err(Errno::EINVAL),
-        }
+    while matches!(components.clone().next(), Some(Component::ParentDir)) {
+        components.next();
     }
 
     let Some(Component::Normal(kind)) = components.next() else {

@@ -10,8 +10,9 @@ pub mod value;
 
 pub use error::{GraphError, Result};
 pub use graph::{
-    DynamicGraph, InMemoryProvider, NodeMutationProvider, NodeProvider, PropertyMutationProvider,
-    PropertyProvider, RelationMutationProvider, RelationProvider,
+    DynamicGraph, GraphChange, InMemoryProvider, NodeMutationProvider, NodeProvider,
+    PropertyMutationProvider, PropertyProvider, RelationMutationProvider, RelationProvider,
+    TracedProvider,
 };
 pub use identity::{NodeId, NodeKind, PathName, PropertyKey, RelationName};
 pub use value::{LocusValue, PropertySpec, ValueKind};

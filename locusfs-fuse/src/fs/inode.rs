@@ -1,14 +1,19 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use fuser::Errno;
 
-use super::entry::{FsEntry, NODES_INO, ROOT_INO};
+use super::attr::EntryTimes;
+use super::entry::{FsEntry, ROOT_INO};
+
+pub type SharedInodeTable = Arc<Mutex<InodeTable>>;
 
 #[derive(Debug)]
 pub struct InodeTable {
     next: u64,
     by_ino: HashMap<u64, InodeEntry>,
     by_entry: HashMap<FsEntry, u64>,
+    times: HashMap<FsEntry, EntryTimes>,
 }
 
 #[derive(Debug)]
@@ -18,19 +23,49 @@ struct InodeEntry {
 }
 
 impl InodeTable {
+    pub fn shared() -> SharedInodeTable {
+        Arc::new(Mutex::new(Self::new()))
+    }
+
     pub fn new() -> Self {
         let mut table = Self {
             next: 3,
             by_ino: HashMap::new(),
             by_entry: HashMap::new(),
+            times: HashMap::new(),
         };
         table.insert(ROOT_INO, FsEntry::Root);
-        table.insert(NODES_INO, FsEntry::NodesDir);
         table
     }
 
     pub fn entry(&self, ino: u64) -> Option<FsEntry> {
         self.by_ino.get(&ino).map(|record| record.entry.clone())
+    }
+
+    pub fn known_inode(&self, entry: &FsEntry) -> Option<u64> {
+        self.by_entry.get(entry).copied()
+    }
+
+    pub fn entries(&self) -> Vec<(FsEntry, u64)> {
+        self.by_entry
+            .iter()
+            .map(|(entry, ino)| (entry.clone(), *ino))
+            .collect()
+    }
+
+    pub fn times(&mut self, entry: &FsEntry) -> EntryTimes {
+        *self
+            .times
+            .entry(entry.clone())
+            .or_insert_with(EntryTimes::now)
+    }
+
+    pub fn touch(&mut self, entry: &FsEntry) -> Option<u64> {
+        self.times
+            .entry(entry.clone())
+            .or_insert_with(EntryTimes::now)
+            .touch();
+        self.known_inode(entry)
     }
 
     pub fn inode(&mut self, entry: FsEntry) -> std::result::Result<u64, Errno> {
@@ -53,7 +88,7 @@ impl InodeTable {
     }
 
     pub fn forget(&mut self, ino: u64, nlookup: u64) {
-        if matches!(ino, ROOT_INO | NODES_INO) {
+        if ino == ROOT_INO {
             return;
         }
 

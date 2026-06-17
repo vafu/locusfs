@@ -1,10 +1,14 @@
+mod change;
 mod dynamic;
 mod memory;
+mod trace;
 
 use crate::{LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName, Result};
 
+pub use change::GraphChange;
 pub use dynamic::DynamicGraph;
 pub use memory::InMemoryProvider;
+pub use trace::TracedProvider;
 
 pub trait NodeProvider: Send + Sync + 'static {
     fn kind(&self) -> &NodeKind;

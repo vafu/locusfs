@@ -1,6 +1,6 @@
 use crate::{
-    DynamicGraph, GraphError, InMemoryProvider, LocusValue, NodeId, NodeKind, NodeProvider,
-    PropertyKey, PropertyProvider, PropertySpec, RelationName, Result, ValueKind,
+    DynamicGraph, GraphChange, GraphError, InMemoryProvider, LocusValue, NodeId, NodeKind,
+    NodeProvider, PropertyKey, PropertyProvider, PropertySpec, RelationName, Result, ValueKind,
 };
 
 #[test]
@@ -70,6 +70,34 @@ fn links_round_trip_through_graph_contract() {
         graph.targets(&source, &relation).unwrap_err(),
         GraphError::NotFound { .. }
     ));
+}
+
+#[test]
+fn graph_mutations_emit_semantic_changes() {
+    let kind = NodeKind::new("node").unwrap();
+    let graph = in_memory_graph(kind.clone());
+    let changes = graph.subscribe_changes().unwrap();
+    let source = NodeId::new(kind.clone(), "57").unwrap();
+    let target = NodeId::new(kind, "6").unwrap();
+    let key = PropertyKey::new("title").unwrap();
+    let relation = RelationName::new("linked-to").unwrap();
+
+    graph.create_node(&source).unwrap();
+    graph.create_node(&target).unwrap();
+    graph
+        .set_property(&source, &key, LocusValue::String("value".to_string()))
+        .unwrap();
+    graph.set_link(&source, &relation, &target).unwrap();
+
+    let emitted = changes.try_iter().collect::<Vec<_>>();
+    assert!(emitted.contains(&GraphChange::NodeChanged {
+        node: source.clone()
+    }));
+    assert!(emitted.contains(&GraphChange::PropertyChanged {
+        node: source.clone(),
+        key
+    }));
+    assert!(emitted.contains(&GraphChange::RelationChanged { source, relation }));
 }
 
 #[test]

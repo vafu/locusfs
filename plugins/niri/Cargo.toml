@@ -1,0 +1,11 @@
+[package]
+name = "locusfs-plugin-niri"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+locusfs-graph = { path = "../../locusfs-graph" }
+niri-ipc = "=26.4.0"
