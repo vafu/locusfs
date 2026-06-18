@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::trace;
 
 use crate::{
-    LocusValue, NodeId, NodeKind, NodeMutationProvider, NodeProvider, PropertyKey,
+    LocusValue, NodeAccess, NodeId, NodeKind, NodeMutationProvider, NodeProvider, PropertyKey,
     PropertyMutationProvider, PropertyProvider, PropertySpec, RelationMutationProvider,
     RelationName, RelationProvider, Result,
 };
@@ -32,6 +32,10 @@ where
 {
     fn kind(&self) -> &NodeKind {
         self.inner.kind()
+    }
+
+    fn access(&self) -> NodeAccess {
+        self.inner.access()
     }
 
     async fn contains_node(&self, node: &NodeId) -> Result<bool> {

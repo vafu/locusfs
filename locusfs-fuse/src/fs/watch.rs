@@ -3,8 +3,11 @@ use std::sync::Arc;
 
 use fuse3::Errno;
 use fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY;
-use locusfs_graph::{NodeId, PropertyKey, RelationName};
+use locusfs_graph::{
+    GraphWatchEvent, GraphWatchTarget, NodeId, NodeKind, PropertyKey, RelationName,
+};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use super::entry::FsEntry;
@@ -26,8 +29,19 @@ pub enum WatchKey {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum WatchSubjectKey {
+    Kind(NodeKind),
     Node(NodeId),
     Property(NodeId, PropertyKey),
+}
+
+impl From<&WatchSubjectKey> for GraphWatchTarget {
+    fn from(subject: &WatchSubjectKey) -> Self {
+        match subject {
+            WatchSubjectKey::Kind(kind) => Self::Kind(kind.clone()),
+            WatchSubjectKey::Node(node) => Self::Node(node.clone()),
+            WatchSubjectKey::Property(node, key) => Self::Property(node.clone(), key.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +53,7 @@ pub struct WatchTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WatchEvent {
     Change,
+    NodeAdded(NodeId),
     NodeChanged(NodeId),
     NodeRemoved(NodeId),
 }
@@ -69,6 +84,8 @@ struct WatchHandle {
     original_path: Option<String>,
     resolved_subject: Option<WatchSubjectKey>,
     dependencies: Vec<WatchKey>,
+    uses_graph_watch: bool,
+    watch_task: Option<JoinHandle<()>>,
     pending_events: VecDeque<WatchEvent>,
     poll_handles: Vec<PollHandle>,
 }
@@ -140,6 +157,7 @@ impl WatchRegistry {
         handle: FileHandle,
         path: String,
         target: WatchTarget,
+        uses_graph_watch: bool,
     ) -> std::result::Result<(), Errno> {
         if !matches!(
             self.open_files.get(&handle.0),
@@ -156,8 +174,26 @@ impl WatchRegistry {
         watch.original_path = Some(path);
         watch.resolved_subject = Some(target.subject.clone());
         watch.dependencies = target.dependencies.clone();
+        watch.uses_graph_watch = uses_graph_watch;
         watch.pending_events.clear();
-        self.attach_watch(handle, &target.subject, &target.dependencies);
+        if !uses_graph_watch {
+            self.attach_watch(handle, &target.subject, &target.dependencies);
+        }
+        Ok(())
+    }
+
+    pub fn set_watch_task(
+        &mut self,
+        handle: FileHandle,
+        task: JoinHandle<()>,
+    ) -> std::result::Result<(), Errno> {
+        let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
+            task.abort();
+            return Err(errno(libc::EBADF));
+        };
+        if let Some(previous) = watch.watch_task.replace(task) {
+            previous.abort();
+        }
         Ok(())
     }
 
@@ -205,11 +241,13 @@ impl WatchRegistry {
                 }
                 Ok(0)
             }
-            OpenFileState::Watch(watch) if !watch.pending_events.is_empty() => Ok(READABLE_EVENTS),
             OpenFileState::Watch(_) => {
                 let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
                     return Err(errno(libc::EBADF));
                 };
+                if !watch.pending_events.is_empty() {
+                    return Ok(READABLE_EVENTS);
+                }
                 if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
                     if let Some(kh) = kh {
                         watch.poll_handles.clear();
@@ -256,6 +294,7 @@ impl WatchRegistry {
             .subjects
             .keys()
             .filter(|subject| match subject {
+                WatchSubjectKey::Kind(_) => false,
                 WatchSubjectKey::Node(watched_node) => watched_node == node,
                 WatchSubjectKey::Property(_, _) => false,
             })
@@ -269,6 +308,7 @@ impl WatchRegistry {
             .subjects
             .keys()
             .filter(|subject| match subject {
+                WatchSubjectKey::Kind(_) => false,
                 WatchSubjectKey::Node(_) => false,
                 WatchSubjectKey::Property(watched_node, _) => watched_node == node,
             })
@@ -277,6 +317,9 @@ impl WatchRegistry {
         for subject in property_subjects {
             handles.extend(self.notify_subject_change(&subject, WatchEvent::Change));
         }
+
+        let kind_subject = WatchSubjectKey::Kind(node.kind().clone());
+        handles.extend(self.notify_subject_change(&kind_subject, event));
 
         handles
     }
@@ -297,9 +340,17 @@ impl WatchRegistry {
             })
             .collect::<Vec<_>>();
         for watcher in watchers {
-            handles.extend(self.queue_watch_event(watcher, WatchEvent::Change));
+            handles.extend(self.queue_watch_event(watcher, WatchEvent::Change, false));
         }
         handles
+    }
+
+    pub fn queue_graph_watch_event(
+        &mut self,
+        handle: FileHandle,
+        event: GraphWatchEvent,
+    ) -> Vec<PollHandle> {
+        self.queue_watch_event(handle, WatchEvent::from(event), true)
     }
 
     pub fn dependent_watch_paths(&self, dependency: &WatchKey) -> Vec<(FileHandle, String)> {
@@ -333,7 +384,7 @@ impl WatchRegistry {
                 return Vec::new();
             }
         }
-        self.queue_watch_event(handle, WatchEvent::Change)
+        self.queue_watch_event(handle, WatchEvent::Change, false)
     }
 
     fn notify_property_poll_change(&mut self, key: &WatchKey) -> Vec<PollHandle> {
@@ -357,15 +408,23 @@ impl WatchRegistry {
             .unwrap_or_default();
         let mut handles = Vec::new();
         for watcher in watchers {
-            handles.extend(self.queue_watch_event(watcher, event.clone()));
+            handles.extend(self.queue_watch_event(watcher, event.clone(), false));
         }
         handles
     }
 
-    fn queue_watch_event(&mut self, handle: FileHandle, event: WatchEvent) -> Vec<PollHandle> {
+    fn queue_watch_event(
+        &mut self,
+        handle: FileHandle,
+        event: WatchEvent,
+        from_graph_watch: bool,
+    ) -> Vec<PollHandle> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Vec::new();
         };
+        if watch.uses_graph_watch && !from_graph_watch {
+            return Vec::new();
+        }
         watch.pending_events.push_back(event);
         std::mem::take(&mut watch.poll_handles)
     }
@@ -425,6 +484,10 @@ impl WatchRegistry {
         }
         if let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) {
             watch.resolved_subject = None;
+            watch.uses_graph_watch = false;
+            if let Some(task) = watch.watch_task.take() {
+                task.abort();
+            }
         }
     }
 
@@ -468,8 +531,20 @@ impl WatchEvent {
     fn into_bytes(self) -> Vec<u8> {
         match self {
             Self::Change => b"change\n".to_vec(),
+            Self::NodeAdded(node) => format!("node added {node}\n").into_bytes(),
             Self::NodeChanged(node) => format!("node changed {node}\n").into_bytes(),
             Self::NodeRemoved(node) => format!("node removed {node}\n").into_bytes(),
+        }
+    }
+}
+
+impl From<GraphWatchEvent> for WatchEvent {
+    fn from(event: GraphWatchEvent) -> Self {
+        match event {
+            GraphWatchEvent::Change => Self::Change,
+            GraphWatchEvent::NodeAdded(node) => Self::NodeAdded(node),
+            GraphWatchEvent::NodeChanged(node) => Self::NodeChanged(node),
+            GraphWatchEvent::NodeRemoved(node) => Self::NodeRemoved(node),
         }
     }
 }

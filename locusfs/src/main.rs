@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use locusfs::fuse::{FuseMountConfig, mount};
-use locusfs::graph::{DynamicGraph, InMemoryProvider, NodeKind, Result};
+use locusfs::graph::{DynamicGraph, Result};
 
 mod watch;
 
@@ -146,28 +146,12 @@ fn usage(program: &str) -> String {
 struct PluginHandles {
     _dbus: locusfs_plugin_dbus::DbusPluginHandle,
     _niri: locusfs_plugin_niri::NiriPluginHandle,
+    _project: locusfs_plugin_project::ProjectPluginHandle,
 }
 
 async fn default_graph() -> Result<(DynamicGraph, PluginHandles)> {
-    let kind = NodeKind::new("node")?;
-    let provider = InMemoryProvider::new(kind.clone());
     let graph = DynamicGraph::new();
-    graph.register_node_provider(provider.clone()).await?;
-    graph
-        .register_node_mutation_provider(kind.clone(), provider.clone())
-        .await?;
-    graph
-        .register_property_provider(kind.clone(), provider.clone())
-        .await?;
-    graph
-        .register_property_mutation_provider(kind.clone(), provider.clone())
-        .await?;
-    graph
-        .register_relation_provider(kind.clone(), provider.clone())
-        .await?;
-    graph
-        .register_relation_mutation_provider(kind, provider)
-        .await?;
+    let project = locusfs_plugin_project::register(&graph).await?;
     let dbus = locusfs_plugin_dbus::register(&graph).await?;
     let niri = locusfs_plugin_niri::register(&graph).await?;
     Ok((
@@ -175,6 +159,7 @@ async fn default_graph() -> Result<(DynamicGraph, PluginHandles)> {
         PluginHandles {
             _dbus: dbus,
             _niri: niri,
+            _project: project,
         },
     ))
 }

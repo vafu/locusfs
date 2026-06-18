@@ -16,7 +16,10 @@ use fuse3::raw::reply::{
 };
 use fuse3::{Errno, FileType, Inode, SetAttr};
 use futures_util::stream::{self, Iter};
-use locusfs_graph::{DynamicGraph, GraphError, NodeId, PropertyKey, RelationName};
+use locusfs_graph::{
+    DynamicGraph, GraphError, GraphWatch, InMemoryProvider, NodeId, NodeKind, PropertyKey,
+    RelationName,
+};
 use tokio::sync::Mutex;
 
 use super::attr::{EntryTimes, TTL, file_attr};
@@ -25,16 +28,17 @@ use super::entry::{
 };
 use super::inode::{InodeTable, SharedInodeTable};
 use super::name::{
-    decode_relation_target_name, node_id_from_kind_and_segment,
-    node_id_from_relation_link_target_path, node_kind_from_segment, os_str_to_str,
-    property_key_from_segment, relation_name_from_segment,
+    node_id_from_kind_and_segment, node_id_from_relation_link_target_path, node_kind_from_segment,
+    os_str_to_str, property_key_from_segment, relation_name_from_segment,
+    relation_target_from_name,
 };
 use super::resolve::{parse_watch_subscription, resolve_watch_path};
 use super::value::{
-    parse_property_write, property_file_string, property_perm, property_spec_or_new_string,
-    slice_for_read,
+    node_dir_perm, parse_property_write, property_file_string, property_perm,
+    property_spec_or_new_string, slice_for_read,
 };
 use super::watch::{FileHandle, SharedWatchRegistry, WatchRegistry};
+use crate::layout::decode_segment;
 use crate::{errno, graph_error_to_errno};
 
 const FOPEN_DIRECT_IO: u32 = 1;
@@ -135,23 +139,17 @@ impl LocusFs {
                 }
             }
             FsEntry::RelationDir(source, relation) => {
-                let target = NodeId::parse(&decode_relation_target_name(name)?)
-                    .map_err(graph_error_to_errno)?;
-                if self
+                let targets = self
                     .graph
                     .targets(&source, &relation)
                     .await
-                    .map_err(graph_error_to_errno)?
-                    .contains(&target)
-                {
-                    Ok(FsEntry::RelationTargetLink {
-                        source,
-                        relation,
-                        target,
-                    })
-                } else {
-                    Err(errno(libc::ENOENT))
-                }
+                    .map_err(graph_error_to_errno)?;
+                let target = relation_target_from_name(name, &source, &targets)?;
+                Ok(FsEntry::RelationTargetLink {
+                    source,
+                    relation,
+                    target,
+                })
             }
             FsEntry::WatchFile
             | FsEntry::PropertyFile(_, _)
@@ -198,15 +196,30 @@ impl LocusFs {
                 {
                     return Err(errno(libc::ENOENT));
                 }
-                (FileType::Directory, 0o755, 0)
+                let access = self
+                    .graph
+                    .kind_access(kind)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                (FileType::Directory, node_dir_perm(access), 0)
             }
             FsEntry::NodeDir(node) => {
                 self.ensure_node_exists(node).await?;
-                (FileType::Directory, 0o755, 0)
+                let access = self
+                    .graph
+                    .node_access(node)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                (FileType::Directory, node_dir_perm(access), 0)
             }
             FsEntry::RelationDir(node, _) => {
                 self.ensure_node_exists(node).await?;
-                (FileType::Directory, 0o755, 0)
+                let access = self
+                    .graph
+                    .node_access(node)
+                    .await
+                    .map_err(graph_error_to_errno)?;
+                (FileType::Directory, node_dir_perm(access), 0)
             }
             FsEntry::PropertyFile(node, key) => {
                 let spec = self
@@ -285,8 +298,52 @@ impl LocusFs {
         let FsEntry::NodeDir(node) = self.entry(parent).await? else {
             return Err(errno(libc::ENOTDIR));
         };
+        self.ensure_node_writable(&node).await?;
         let key = property_key_from_segment(os_str_to_str(name)?)?;
         Ok(FsEntry::PropertyFile(node, key))
+    }
+
+    pub(super) async fn create_kind_dir(
+        &self,
+        name: &OsStr,
+    ) -> std::result::Result<FsEntry, Errno> {
+        let kind = node_kind_from_segment(os_str_to_str(name)?)?;
+        if self
+            .graph
+            .node_kinds()
+            .await
+            .map_err(graph_error_to_errno)?
+            .contains(&kind)
+        {
+            return Err(errno(libc::EEXIST));
+        }
+
+        let provider = InMemoryProvider::new(kind.clone());
+        self.graph
+            .register_node_provider(provider.clone())
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.graph
+            .register_node_mutation_provider(kind.clone(), provider.clone())
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.graph
+            .register_property_provider(kind.clone(), provider.clone())
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.graph
+            .register_property_mutation_provider(kind.clone(), provider.clone())
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.graph
+            .register_relation_provider(kind.clone(), provider.clone())
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.graph
+            .register_relation_mutation_provider(kind.clone(), provider)
+            .await
+            .map_err(graph_error_to_errno)?;
+        Ok(FsEntry::KindDir(kind))
     }
 
     async fn read_property(
@@ -327,6 +384,14 @@ impl LocusFs {
             ttl: TTL,
             attr: self.attr(&entry, ino).await?,
         })
+    }
+}
+
+async fn wake_poll_handles(notify: SharedKernelNotify, handles: Vec<u64>) {
+    for handle in handles {
+        if let Some(notifier) = notify.lock().await.clone() {
+            notifier.wakeup(handle).await;
+        }
     }
 }
 
@@ -417,7 +482,9 @@ impl Filesystem for LocusFs {
         _umask: u32,
     ) -> fuse3::Result<ReplyEntry> {
         let entry = match self.entry(parent).await? {
+            FsEntry::Root => self.create_kind_dir(name).await?,
             FsEntry::KindDir(kind) => {
+                self.ensure_kind_writable(&kind).await?;
                 let node = node_id_from_kind_and_segment(kind, os_str_to_str(name)?)?;
                 self.graph
                     .create_node(&node)
@@ -622,9 +689,16 @@ impl Filesystem for LocusFs {
                 }
             }
             FsEntry::RelationDir(source, relation) => {
+                let targets = self.relation_targets(&source, &relation).await?;
                 let target =
-                    NodeId::parse(&decode_relation_target_name(os_str_to_str(link_name)?)?)
-                        .map_err(graph_error_to_errno)?;
+                    match relation_target_from_name(os_str_to_str(link_name)?, &source, &targets) {
+                        Ok(target) => target,
+                        Err(_) => NodeId::parse(
+                            &decode_segment(os_str_to_str(link_name)?)
+                                .map_err(graph_error_to_errno)?,
+                        )
+                        .map_err(graph_error_to_errno)?,
+                    };
                 if symlink_target != target {
                     return Err(errno(libc::EINVAL));
                 }
@@ -658,6 +732,7 @@ impl Filesystem for LocusFs {
                     return Err(errno(libc::EIO));
                 }
                 if has_property {
+                    self.ensure_node_writable(&node).await?;
                     return self
                         .graph
                         .remove_property(&node, &key)
@@ -674,8 +749,8 @@ impl Filesystem for LocusFs {
                     .map_err(graph_error_to_errno)
             }
             FsEntry::RelationDir(source, relation) => {
-                let target = NodeId::parse(&decode_relation_target_name(os_str_to_str(name)?)?)
-                    .map_err(graph_error_to_errno)?;
+                let targets = self.relation_targets(&source, &relation).await?;
+                let target = relation_target_from_name(os_str_to_str(name)?, &source, &targets)?;
                 self.graph
                     .remove_link(&source, &relation, &target)
                     .await
@@ -688,6 +763,7 @@ impl Filesystem for LocusFs {
     async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> fuse3::Result<()> {
         match self.entry(parent).await? {
             FsEntry::KindDir(kind) => {
+                self.ensure_kind_writable(&kind).await?;
                 let node = node_id_from_kind_and_segment(kind, os_str_to_str(name)?)?;
                 self.graph
                     .remove_node(&node)
@@ -780,10 +856,29 @@ impl LocusFs {
             FsEntry::WatchFile => {
                 let path = parse_watch_subscription(&data)?;
                 let target = resolve_watch_path(&self.graph, &path).await?;
-                self.watch
-                    .lock()
-                    .await
-                    .configure_watch(FileHandle(fh), path, target)?;
+                let graph_watch = if target.dependencies.is_empty() {
+                    Some(
+                        self.graph
+                            .watch((&target.subject).into())
+                            .await
+                            .map_err(graph_error_to_errno)?,
+                    )
+                } else {
+                    None
+                };
+                self.watch.lock().await.configure_watch(
+                    FileHandle(fh),
+                    path,
+                    target,
+                    graph_watch.is_some(),
+                )?;
+                if let Some(graph_watch) = graph_watch {
+                    let task = self.spawn_watch_forwarder(FileHandle(fh), graph_watch);
+                    self.watch
+                        .lock()
+                        .await
+                        .set_watch_task(FileHandle(fh), task)?;
+                }
                 data.len() as u32
             }
             _ => return Err(errno(libc::EISDIR)),
@@ -791,6 +886,25 @@ impl LocusFs {
 
         Ok(ReplyWrite { written })
     }
+
+    fn spawn_watch_forwarder(
+        &self,
+        handle: FileHandle,
+        mut graph_watch: GraphWatch,
+    ) -> tokio::task::JoinHandle<()> {
+        let watch = self.watch.clone();
+        let notify = self.notify.clone();
+        tokio::spawn(async move {
+            while let Some(event) = graph_watch.recv().await {
+                let handles = {
+                    let mut watch = watch.lock().await;
+                    watch.queue_graph_watch_event(handle, event)
+                };
+                wake_poll_handles(notify.clone(), handles).await;
+            }
+        })
+    }
+
     async fn ensure_node_exists(&self, node: &NodeId) -> std::result::Result<(), Errno> {
         if self
             .graph
@@ -801,6 +915,32 @@ impl LocusFs {
             Ok(())
         } else {
             Err(errno(libc::ENOENT))
+        }
+    }
+
+    async fn ensure_kind_writable(&self, kind: &NodeKind) -> std::result::Result<(), Errno> {
+        let access = self
+            .graph
+            .kind_access(kind)
+            .await
+            .map_err(graph_error_to_errno)?;
+        if access.is_writable() {
+            Ok(())
+        } else {
+            Err(errno(libc::EACCES))
+        }
+    }
+
+    async fn ensure_node_writable(&self, node: &NodeId) -> std::result::Result<(), Errno> {
+        let access = self
+            .graph
+            .node_access(node)
+            .await
+            .map_err(graph_error_to_errno)?;
+        if access.is_writable() {
+            Ok(())
+        } else {
+            Err(errno(libc::EACCES))
         }
     }
 

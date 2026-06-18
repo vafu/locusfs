@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use locusfs_graph::{
-    LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyProvider, PropertySpec, Result,
+    LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyProvider, PropertySpec,
+    RelationName, RelationProvider, Result,
 };
 
 use crate::state::{DbusState, SharedDbusState};
@@ -50,5 +51,17 @@ impl PropertyProvider for DbusProvider {
 
     async fn property(&self, subject: &NodeId, key: &PropertyKey) -> Result<LocusValue> {
         self.with_state(|state| state.property(subject, key)).await
+    }
+}
+
+#[async_trait]
+impl RelationProvider for DbusProvider {
+    async fn relations(&self, source: &NodeId) -> Result<Vec<RelationName>> {
+        self.with_state(|state| state.relations(source)).await
+    }
+
+    async fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
+        self.with_state(|state| state.targets(source, relation))
+            .await
     }
 }

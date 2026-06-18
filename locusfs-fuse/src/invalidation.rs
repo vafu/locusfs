@@ -88,6 +88,30 @@ async fn invalidate_change(
             invalidate_known_child(notifier.clone(), inodes.clone(), FsEntry::Root, name).await;
             invalidate_known_inode(notifier.clone(), inodes.clone(), FsEntry::KindDir(kind)).await;
         }
+        GraphChange::NodeAdded { node } => {
+            let had_poll_waiters = notify_node_watchers(
+                notifier.clone(),
+                watch.clone(),
+                node.clone(),
+                WatchEvent::NodeAdded(node.clone()),
+            )
+            .await;
+            if had_poll_waiters {
+                return;
+            }
+            let parent = FsEntry::KindDir(node.kind().clone());
+            let name = match encode_segment(node.local()) {
+                Ok(name) => name,
+                Err(_) => return,
+            };
+            invalidate_known_child(notifier.clone(), inodes.clone(), parent, name).await;
+            invalidate_known_inode(
+                notifier.clone(),
+                inodes.clone(),
+                FsEntry::NodeDir(node.clone()),
+            )
+            .await;
+        }
         GraphChange::NodeChanged { node } => {
             let had_poll_waiters = notify_node_watchers(
                 notifier.clone(),

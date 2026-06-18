@@ -1,35 +1,57 @@
-use futures_util::StreamExt;
-use locusfs_graph::{DynamicGraph, GraphChange, GraphError, NodeKind, Result};
-use tokio::task::JoinHandle;
-use zbus::fdo::DBusProxy;
-use zbus::names::BusName;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::DBUS_SERVICE_KIND;
-use crate::state::{DbusState, SharedDbusState, upower_service_name};
+use futures_util::StreamExt;
+use locusfs_graph::{DynamicGraph, GraphChange, GraphError, Result};
+use tokio::task::JoinHandle;
+use zbus::fdo::{DBusProxy, IntrospectableProxy, ObjectManagerProxy, PropertiesProxy};
+use zbus::names::{BusName, InterfaceName};
+
+use crate::state::{
+    BusKind, ObjectSnapshot, ServiceConfig, SharedDbusState, convert_managed_interfaces,
+    default_service_configs, object_snapshot_from_managed,
+};
+use crate::{DBUS_OBJECT_KIND, DBUS_SERVICE_KIND};
 
 #[derive(Debug, Default)]
 pub struct DbusRuntime;
 
 impl DbusRuntime {
-    pub fn start(graph: DynamicGraph) -> Result<(SharedDbusState, JoinHandle<()>)> {
-        let state = DbusState::shared();
-        let upower_watcher = spawn_upower_watcher(state.clone(), graph);
-        Ok((state, upower_watcher))
+    pub fn start(graph: DynamicGraph) -> Result<(SharedDbusState, Vec<JoinHandle<()>>)> {
+        let configs = default_service_configs();
+        let state = crate::state::DbusState::shared(configs.clone());
+        let watchers = configs
+            .into_iter()
+            .map(|config| spawn_service_watcher(config, state.clone(), graph.clone()))
+            .collect();
+        Ok((state, watchers))
     }
 }
 
-fn spawn_upower_watcher(state: SharedDbusState, graph: DynamicGraph) -> JoinHandle<()> {
+fn spawn_service_watcher(
+    config: ServiceConfig,
+    state: SharedDbusState,
+    graph: DynamicGraph,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(error) = watch_upower(state, graph).await {
-            eprintln!("locusfs-dbus: UPower watcher stopped: {error}");
+        if let Err(error) = watch_service(config.clone(), state, graph).await {
+            eprintln!(
+                "locusfs-dbus: service watcher for {} stopped: {error}",
+                config.name
+            );
         }
     })
 }
 
-async fn watch_upower(state: SharedDbusState, graph: DynamicGraph) -> Result<()> {
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(|error| GraphError::Io(format!("connect to system D-Bus: {error}")))?;
+async fn watch_service(
+    config: ServiceConfig,
+    state: SharedDbusState,
+    graph: DynamicGraph,
+) -> Result<()> {
+    let connection = match config.bus {
+        BusKind::System => zbus::Connection::system()
+            .await
+            .map_err(|error| GraphError::Io(format!("connect to system D-Bus: {error}")))?,
+    };
     let dbus = DBusProxy::new(&connection)
         .await
         .map_err(|error| GraphError::Io(format!("create D-Bus proxy: {error}")))?;
@@ -38,15 +60,24 @@ async fn watch_upower(state: SharedDbusState, graph: DynamicGraph) -> Result<()>
         .await
         .map_err(|error| GraphError::Io(format!("watch NameOwnerChanged: {error}")))?;
 
-    publish_owner(&state, &graph, current_owner(&dbus).await?).await;
+    publish_snapshot(
+        &state,
+        &graph,
+        snapshot_service(&connection, &dbus, &config).await,
+    )
+    .await;
 
     while let Some(signal) = owner_changed.next().await {
         let args = signal
             .args()
             .map_err(|error| GraphError::Io(format!("read NameOwnerChanged args: {error}")))?;
-        if args.name().as_str() == upower_service_name() {
-            let owner = args.new_owner().as_ref().map(ToString::to_string);
-            publish_owner(&state, &graph, owner).await;
+        if args.name().as_str() == config.name {
+            publish_snapshot(
+                &state,
+                &graph,
+                snapshot_service(&connection, &dbus, &config).await,
+            )
+            .await;
         }
     }
 
@@ -55,59 +86,302 @@ async fn watch_upower(state: SharedDbusState, graph: DynamicGraph) -> Result<()>
     ))
 }
 
-async fn current_owner(dbus: &DBusProxy<'_>) -> Result<Option<String>> {
-    let service =
-        BusName::try_from(upower_service_name()).map_err(|error| GraphError::InvalidValue {
-            kind: "D-Bus service",
-            value: upower_service_name().to_string(),
-            reason: Box::leak(error.to_string().into_boxed_str()),
-        })?;
+async fn snapshot_service(
+    connection: &zbus::Connection,
+    dbus: &DBusProxy<'_>,
+    config: &ServiceConfig,
+) -> Result<ServiceRuntimeSnapshot> {
+    let owner = current_owner(dbus, &config.name).await?;
+    let objects = if owner.is_some() {
+        managed_objects(connection, config)
+            .await
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    Ok(ServiceRuntimeSnapshot {
+        local_id: config.local_id.clone(),
+        owner,
+        objects,
+    })
+}
+
+async fn current_owner(dbus: &DBusProxy<'_>, service_name: &str) -> Result<Option<String>> {
+    let service = BusName::try_from(service_name).map_err(|error| GraphError::InvalidValue {
+        kind: "D-Bus service",
+        value: service_name.to_string(),
+        reason: Box::leak(error.to_string().into_boxed_str()),
+    })?;
     match dbus.get_name_owner(service).await {
         Ok(owner) => Ok(Some(owner.to_string())),
         Err(zbus::fdo::Error::NameHasNoOwner(_)) | Err(zbus::fdo::Error::ServiceUnknown(_)) => {
             Ok(None)
         }
-        Err(error) => Err(GraphError::Io(format!("read UPower owner: {error}"))),
+        Err(error) => Err(GraphError::Io(format!(
+            "read D-Bus owner for {service_name}: {error}"
+        ))),
     }
 }
 
-async fn publish_owner(state: &SharedDbusState, graph: &DynamicGraph, owner: Option<String>) {
+async fn managed_objects(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+) -> Result<BTreeMap<String, ObjectSnapshot>> {
+    let objects = match managed_objects_at(connection, config, &config.object_manager_path).await {
+        Ok(objects) => objects,
+        Err(_) if config.object_manager_path != "/" => managed_objects_at(connection, config, "/")
+            .await
+            .unwrap_or_default(),
+        Err(_) => BTreeMap::new(),
+    };
+    if objects.is_empty() {
+        introspected_objects(connection, config).await
+    } else {
+        Ok(objects)
+    }
+}
+
+async fn managed_objects_at(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+    path: &str,
+) -> Result<BTreeMap<String, ObjectSnapshot>> {
+    let proxy = ObjectManagerProxy::builder(connection)
+        .destination(config.name.as_str())
+        .map_err(|error| GraphError::Io(format!("create object manager destination: {error}")))?
+        .path(path)
+        .map_err(|error| GraphError::Io(format!("create object manager path {path}: {error}")))?
+        .build()
+        .await
+        .map_err(|error| {
+            GraphError::Io(format!(
+                "create object manager proxy for {} at {path}: {error}",
+                config.name
+            ))
+        })?;
+
+    let objects = proxy.get_managed_objects().await.map_err(|error| {
+        GraphError::Io(format!(
+            "read managed objects for {} at {path}: {error}",
+            config.name
+        ))
+    })?;
+    Ok(objects
+        .iter()
+        .map(|(path, interfaces)| {
+            let interfaces = convert_managed_interfaces(interfaces);
+            (
+                path.as_str().to_string(),
+                object_snapshot_from_managed(&config.local_id, path, &interfaces),
+            )
+        })
+        .collect())
+}
+
+async fn introspected_objects(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+) -> Result<BTreeMap<String, ObjectSnapshot>> {
+    let mut objects = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![config.object_manager_path.clone()];
+    if config.object_manager_path != "/" {
+        pending.push("/".to_string());
+    }
+
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let xml = match introspect_path(connection, config, &path).await {
+            Ok(xml) => xml,
+            Err(_) => continue,
+        };
+
+        let mut interfaces = BTreeMap::new();
+        for interface in parse_interface_names(&xml) {
+            if is_standard_interface(&interface) {
+                continue;
+            }
+            let properties =
+                match properties_for_interface(connection, config, &path, &interface).await {
+                    Ok(properties) => properties,
+                    Err(_) => continue,
+                };
+            if !properties.is_empty() {
+                interfaces.insert(interface, properties);
+            }
+        }
+
+        if !interfaces.is_empty() {
+            let object = ObjectSnapshot {
+                service_local_id: config.local_id.clone(),
+                path: path.clone(),
+                interfaces,
+            };
+            objects.insert(path.clone(), object);
+        }
+
+        for child in parse_child_node_names(&xml) {
+            pending.push(join_object_path(&path, &child));
+        }
+    }
+
+    Ok(objects)
+}
+
+async fn introspect_path(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+    path: &str,
+) -> Result<String> {
+    let proxy = IntrospectableProxy::builder(connection)
+        .destination(config.name.as_str())
+        .map_err(|error| GraphError::Io(format!("create introspection destination: {error}")))?
+        .path(path)
+        .map_err(|error| GraphError::Io(format!("create introspection path {path}: {error}")))?
+        .build()
+        .await
+        .map_err(|error| {
+            GraphError::Io(format!(
+                "create introspection proxy for {} at {path}: {error}",
+                config.name
+            ))
+        })?;
+    proxy
+        .introspect()
+        .await
+        .map_err(|error| GraphError::Io(format!("introspect {} at {path}: {error}", config.name)))
+}
+
+async fn properties_for_interface(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+    path: &str,
+    interface: &str,
+) -> Result<BTreeMap<String, locusfs_graph::LocusValue>> {
+    let proxy = PropertiesProxy::builder(connection)
+        .destination(config.name.as_str())
+        .map_err(|error| GraphError::Io(format!("create properties destination: {error}")))?
+        .path(path)
+        .map_err(|error| GraphError::Io(format!("create properties path {path}: {error}")))?
+        .build()
+        .await
+        .map_err(|error| {
+            GraphError::Io(format!(
+                "create properties proxy for {} at {path}: {error}",
+                config.name
+            ))
+        })?;
+    let interface_name =
+        InterfaceName::try_from(interface).map_err(|error| GraphError::InvalidValue {
+            kind: "D-Bus interface",
+            value: interface.to_string(),
+            reason: Box::leak(error.to_string().into_boxed_str()),
+        })?;
+    let properties = proxy.get_all(interface_name).await.map_err(|error| {
+        GraphError::Io(format!("read {interface} properties at {path}: {error}"))
+    })?;
+    Ok(properties
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::state::locus_value_from_dbus(value)))
+        .collect())
+}
+
+fn parse_interface_names(xml: &str) -> Vec<String> {
+    parse_named_tags(xml, "interface")
+}
+
+fn parse_child_node_names(xml: &str) -> Vec<String> {
+    parse_named_tags(xml, "node")
+        .into_iter()
+        .filter(|name| !name.starts_with('/'))
+        .collect()
+}
+
+fn parse_named_tags(xml: &str, tag: &str) -> Vec<String> {
+    let needle = format!("<{tag} ");
+    xml.split(&needle)
+        .skip(1)
+        .filter_map(|rest| quoted_attr(rest, "name"))
+        .collect()
+}
+
+fn quoted_attr(tag_body: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let value = tag_body.split_once(&needle)?.1;
+    Some(value.split_once('"')?.0.to_string())
+}
+
+fn is_standard_interface(interface: &str) -> bool {
+    matches!(
+        interface,
+        "org.freedesktop.DBus.Introspectable"
+            | "org.freedesktop.DBus.Peer"
+            | "org.freedesktop.DBus.Properties"
+            | "org.freedesktop.DBus.ObjectManager"
+    )
+}
+
+fn join_object_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+async fn publish_snapshot(
+    state: &SharedDbusState,
+    graph: &DynamicGraph,
+    snapshot: Result<ServiceRuntimeSnapshot>,
+) {
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("locusfs-dbus: failed to read D-Bus service snapshot: {error}");
+            return;
+        }
+    };
+
     let changes = {
         let mut state = state.write().await;
-        match state.set_upower_owner(owner) {
+        match state.set_service_snapshot(&snapshot.local_id, snapshot.owner, snapshot.objects) {
             Ok(changes) => changes,
             Err(error) => {
-                eprintln!("locusfs-dbus: failed to update UPower owner: {error}");
+                eprintln!("locusfs-dbus: failed to update service snapshot: {error}");
                 return;
             }
         }
     };
 
-    if changes.is_empty() {
-        return;
-    }
-
-    emit_change(
-        graph,
-        GraphChange::NodeKindChanged {
-            kind: match NodeKind::new(DBUS_SERVICE_KIND) {
-                Ok(kind) => kind,
-                Err(error) => {
-                    eprintln!("locusfs-dbus: invalid node kind: {error}");
-                    return;
-                }
-            },
-        },
-    );
-    for change in changes {
-        emit_change(graph, change);
+    for change in leading_kind_changes().into_iter().chain(changes) {
+        emit_global_change(graph, change);
     }
 }
 
-fn emit_change(graph: &DynamicGraph, change: GraphChange) {
-    if let Err(error) = graph.emit_change(change) {
+fn leading_kind_changes() -> Vec<GraphChange> {
+    [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND]
+        .into_iter()
+        .filter_map(|kind| {
+            Some(GraphChange::NodeKindChanged {
+                kind: locusfs_graph::NodeKind::new(kind).ok()?,
+            })
+        })
+        .collect()
+}
+
+fn emit_global_change(graph: &DynamicGraph, change: GraphChange) {
+    if let Err(error) = graph.emit_global_change(change) {
         eprintln!("locusfs-dbus: failed to emit graph change: {error}");
     }
+}
+
+#[derive(Debug)]
+struct ServiceRuntimeSnapshot {
+    local_id: String,
+    owner: Option<String>,
+    objects: BTreeMap<String, ObjectSnapshot>,
 }
 
 #[cfg(test)]
@@ -118,21 +392,22 @@ mod test {
 
     use super::current_owner;
     use crate::register;
-    use crate::state::upower_node;
+    use crate::state::service_node;
 
     #[tokio::test]
-    async fn realtime_upower_owner_matches_system_bus_snapshot_when_available() {
-        let expected_owner = match system_upower_owner().await {
+    async fn realtime_default_service_owner_matches_system_bus_snapshot_when_available() {
+        let service_name = "org.freedesktop.UPower";
+        let expected_owner = match system_service_owner(service_name).await {
             Ok(owner) => owner,
             Err(error) => {
-                eprintln!("skipping realtime UPower D-Bus test: {error}");
+                eprintln!("skipping realtime D-Bus service test: {error}");
                 return;
             }
         };
 
         let graph = DynamicGraph::new();
         let _plugin = register(&graph).await.expect("dbus plugin registers");
-        let node = upower_node().expect("upower node id is valid");
+        let node = service_node("upower").expect("service node id is valid");
         let active = PropertyKey::new("active").expect("active property key is valid");
         let expected = LocusValue::Bool(expected_owner.is_some());
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -144,19 +419,19 @@ mod test {
 
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for UPower active state {expected:?}"
+                "timed out waiting for service active state {expected:?}"
             );
             sleep(Duration::from_millis(50)).await;
         }
     }
 
-    async fn system_upower_owner() -> locusfs_graph::Result<Option<String>> {
+    async fn system_service_owner(service_name: &str) -> locusfs_graph::Result<Option<String>> {
         let connection = zbus::Connection::system()
             .await
             .map_err(|error| locusfs_graph::GraphError::Io(error.to_string()))?;
         let dbus = DBusProxy::new(&connection)
             .await
             .map_err(|error| locusfs_graph::GraphError::Io(error.to_string()))?;
-        current_owner(&dbus).await
+        current_owner(&dbus, service_name).await
     }
 }

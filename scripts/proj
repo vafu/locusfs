@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+metadata_file=".project.json"
+default_icon="folder_code"
+default_branch_regex='^[^/]+/(?P<subproj>[^/]+)/(?P<task>.+)$'
+mountpoint="${LOCUSFS_MOUNT:-${LOCUS_MOUNT:-/tmp/rsynapse}}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: proj <command> [args]
+
+commands:
+  init [--force] [path]
+  root [path]
+  metadata [--json] [key] [path]
+  update [path]
+  set-current [path]
+  set_current [path]
+  publish [path]
+  clear [workspace-id]
+EOF
+}
+
+die() {
+  printf 'proj: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+encode_segment() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+absolute_dir() {
+  local path="${1:-.}"
+  [[ -d "$path" ]] || die "not a directory: $path"
+  realpath "$path"
+}
+
+project_root_for_path() {
+  local dir
+  dir="$(absolute_dir "${1:-.}")"
+  while true; do
+    if [[ -f "$dir/$metadata_file" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    [[ "$dir" != "/" ]] || return 1
+    dir="$(dirname "$dir")"
+  done
+}
+
+metadata_json() {
+  local root="$1"
+  jq -c '.' "$root/$metadata_file"
+}
+
+metadata_string_or_empty() {
+  local root="$1"
+  local key="$2"
+  metadata_json "$root" | jq -r --arg key "$key" '.[$key] // empty | select(type == "string")'
+}
+
+project_name() {
+  local root="$1"
+  local name
+  name="$(metadata_string_or_empty "$root" name)"
+  if [[ -n "$name" ]]; then
+    printf '%s\n' "$name"
+  else
+    basename "$root"
+  fi
+}
+
+git_output() {
+  local root="$1"
+  shift
+  git -C "$root" "$@" 2>/dev/null || true
+}
+
+project_node_dir() {
+  local root="$1"
+  printf '%s/project/%s\n' "$mountpoint" "$(encode_segment "$root")"
+}
+
+ensure_mount() {
+  [[ -d "$mountpoint" ]] || die "mountpoint not found: $mountpoint"
+}
+
+ensure_project_kind() {
+  ensure_mount
+  if [[ ! -d "$mountpoint/project" ]]; then
+    mkdir "$mountpoint/project"
+  fi
+}
+
+ensure_project_node() {
+  local root="$1"
+  ensure_project_kind
+  local node
+  node="$(project_node_dir "$root")"
+  if [[ ! -d "$node" ]]; then
+    mkdir "$node"
+  fi
+}
+
+write_prop() {
+  local node="$1"
+  local key="$2"
+  local value="$3"
+  printf '%s\n' "$value" > "$node/$(encode_segment "$key")"
+}
+
+remove_prop() {
+  local node="$1"
+  local key="$2"
+  rm -f "$node/$(encode_segment "$key")"
+}
+
+json_property_value() {
+  jq -rn --argjson value "$1" '
+    if ($value | type) == "string" then $value else ($value | tojson) end
+  '
+}
+
+branch_fields() {
+  local branch="$1"
+  local regex="$2"
+  local jq_regex
+  jq_regex="${regex//(?P</(?<}"
+  jq -cn --arg branch "$branch" --arg regex "$jq_regex" '
+    ($branch | capture($regex)? // {}) |
+    {subproj: (.subproj // null), task: (.task // null)}
+  '
+}
+
+selected_workspace_id() {
+  local link="$mountpoint/context/selected/workspace"
+  [[ -e "$link" || -L "$link" ]] || return 1
+  basename "$(readlink "$link")"
+}
+
+cmd_init() {
+  local force=false
+  if [[ "${1:-}" == "--force" ]]; then
+    force=true
+    shift
+  fi
+  local root
+  root="$(absolute_dir "${1:-.}")"
+  local file="$root/$metadata_file"
+  if [[ -e "$file" && "$force" != true ]]; then
+    die "$file already exists"
+  fi
+  jq -n --arg name "$(basename "$root")" --arg icon "$default_icon" \
+    '{name: $name, icon: $icon}' > "$file"
+  printf '%s\n' "$file"
+}
+
+cmd_root() {
+  project_root_for_path "${1:-.}" || die "project root not found"
+}
+
+cmd_metadata() {
+  local json=false
+  if [[ "${1:-}" == "--json" ]]; then
+    json=true
+    shift
+  fi
+  local key="${1:-}"
+  local path="${2:-.}"
+  if [[ "$json" == true ]]; then
+    path="${1:-.}"
+  elif [[ -z "$key" ]]; then
+    die "metadata key is required"
+  fi
+  local root
+  root="$(project_root_for_path "$path")" || die "project root not found"
+  if [[ "$json" == true ]]; then
+    build_snapshot "$root" | jq '.'
+  else
+    metadata_json "$root" | jq -r --arg key "$key" '.[$key] // empty'
+  fi
+}
+
+build_snapshot() {
+  local root="$1"
+  local metadata branch worktree worktree_name regex fields
+  metadata="$(metadata_json "$root")"
+  branch="$(git_output "$root" branch --show-current)"
+  worktree="$(git_output "$root" rev-parse --show-toplevel)"
+  worktree_name=""
+  [[ -n "$worktree" ]] && worktree_name="$(basename "$worktree")"
+  regex="$(jq -r --arg default "$default_branch_regex" '.branch_regex // $default' <<<"$metadata")"
+  fields="$(branch_fields "$branch" "$regex")"
+  jq -cn \
+    --arg subject "project:$root" \
+    --arg path "$root" \
+    --arg name "$(project_name "$root")" \
+    --arg branch "$branch" \
+    --arg worktree "$worktree_name" \
+    --arg worktree_path "$worktree" \
+    --argjson metadata "$metadata" \
+    --argjson fields "$fields" '
+      {
+        subject: $subject,
+        path: $path,
+        name: $name,
+        icon: ($metadata.icon // null),
+        branch: (if $branch == "" then null else $branch end),
+        worktree: (if $worktree == "" then null else $worktree end),
+        "worktree-path": (if $worktree_path == "" then null else $worktree_path end),
+        subproj: $fields.subproj,
+        task: $fields.task,
+        metadata: $metadata
+      }
+    '
+}
+
+cmd_update() {
+  local root
+  root="$(project_root_for_path "${1:-.}")" || return 0
+  local node metadata branch worktree worktree_name regex fields icon display_icon
+  ensure_project_node "$root"
+  node="$(project_node_dir "$root")"
+  metadata="$(metadata_json "$root")"
+  branch="$(git_output "$root" branch --show-current)"
+  worktree="$(git_output "$root" rev-parse --show-toplevel)"
+  worktree_name=""
+  [[ -n "$worktree" ]] && worktree_name="$(basename "$worktree")"
+  regex="$(jq -r --arg default "$default_branch_regex" '.branch_regex // $default' <<<"$metadata")"
+  fields="$(branch_fields "$branch" "$regex")"
+  icon="$(jq -r --arg default "$default_icon" '.icon // $default' <<<"$metadata")"
+  display_icon="$icon"
+
+  write_prop "$node" kind project
+  write_prop "$node" path "$root"
+  write_prop "$node" name "$(project_name "$root")"
+  write_prop "$node" icon "$icon"
+  write_prop "$node" display-icon "$display_icon"
+  [[ -n "$branch" ]] && write_prop "$node" branch "$branch" || remove_prop "$node" branch
+  if [[ -n "$worktree" ]]; then
+    write_prop "$node" worktree "$worktree_name"
+    write_prop "$node" worktree-path "$worktree"
+  else
+    remove_prop "$node" worktree
+    remove_prop "$node" worktree-path
+  fi
+  local subproj task
+  subproj="$(jq -r '.subproj // empty' <<<"$fields")"
+  task="$(jq -r '.task // empty' <<<"$fields")"
+  [[ -n "$subproj" ]] && write_prop "$node" subproj "$subproj" || remove_prop "$node" subproj
+  [[ -n "$task" ]] && write_prop "$node" task "$task" || remove_prop "$node" task
+
+  while IFS= read -r item; do
+    local key value value_json
+    key="$(jq -r '.key' <<<"$item")"
+    value_json="$(jq -c '.value' <<<"$item")"
+    if [[ "$value_json" == "null" ]]; then
+      remove_prop "$node" "$key"
+    else
+      value="$(json_property_value "$value_json")"
+      write_prop "$node" "$key" "$value"
+    fi
+  done < <(jq -c '
+    to_entries[]
+    | select((.key | IN(
+        "kind", "path", "name", "icon", "branch", "worktree", "worktree-path",
+        "subproj", "task", "display-main", "display-secondary", "display-icon",
+        "branch_regex", "notebook_scope"
+      )) | not)
+  ' <<<"$metadata")
+}
+
+cmd_set_current() {
+  local root workspace rel target
+  root="$(project_root_for_path "${1:-.}")" || return 0
+  cmd_update "$root"
+  workspace="$(selected_workspace_id)" || return 0
+  rel="$mountpoint/workspace/$workspace/project"
+  target="../../project/$(encode_segment "$root")"
+  rm -f "$rel"
+  ln -s "$target" "$rel"
+}
+
+cmd_clear() {
+  local workspace="${1:-}"
+  if [[ -z "$workspace" ]]; then
+    workspace="$(selected_workspace_id)" || return 0
+  fi
+  rm -f "$mountpoint/workspace/$workspace/project"
+}
+
+main() {
+  need jq
+  local command="${1:-}"
+  [[ -n "$command" ]] || { usage; exit 2; }
+  shift || true
+  case "$command" in
+    init) cmd_init "$@" ;;
+    root) cmd_root "$@" ;;
+    metadata) cmd_metadata "$@" ;;
+    update) cmd_update "$@" ;;
+    set-current | set_current | publish) cmd_set_current "$@" ;;
+    clear) cmd_clear "$@" ;;
+    -h | --help | help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

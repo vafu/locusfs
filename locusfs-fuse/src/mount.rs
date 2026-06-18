@@ -49,7 +49,7 @@ impl FuseMount {
 }
 
 pub async fn mount(config: FuseMountConfig, graph: DynamicGraph) -> Result<FuseMount> {
-    let changes = graph.subscribe_changes();
+    let changes = graph.subscribe_global_changes();
     let invalidation_graph = graph.clone();
     let inodes = InodeTable::shared();
     let watch = WatchRegistry::shared();

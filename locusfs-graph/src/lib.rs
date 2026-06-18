@@ -11,9 +11,9 @@ pub mod value;
 pub use error::{GraphError, Result};
 pub use graph::{
     DynamicGraph, GraphChange, GraphChangeReceiver, GraphChangeStreamError,
-    GraphChangeSubscription, InMemoryProvider, NodeMutationProvider, NodeProvider,
-    PropertyMutationProvider, PropertyProvider, RelationMutationProvider, RelationProvider,
-    TracedProvider,
+    GraphChangeSubscription, GraphWatch, GraphWatchEvent, GraphWatchTarget, InMemoryProvider,
+    NodeAccess, NodeMutationProvider, NodeProvider, PropertyMutationProvider, PropertyProvider,
+    RelationMutationProvider, RelationProvider, TracedProvider, WatchProvider,
 };
 pub use identity::{NodeId, NodeKind, PathName, PropertyKey, RelationName};
 pub use value::{LocusValue, PropertySpec, ValueKind};

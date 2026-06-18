@@ -160,6 +160,52 @@ fn focus_events_emit_selected_window_property_changes() {
 }
 
 #[test]
+fn active_window_then_focus_event_does_not_emit_duplicate_selected_changes() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+    state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(7, 42, "Terminal"), window(8, 42, "Browser")],
+        })
+        .unwrap();
+
+    let active_window_changes = state
+        .apply_event(Event::WorkspaceActiveWindowChanged {
+            workspace_id: 42,
+            active_window_id: Some(8),
+        })
+        .unwrap();
+    assert!(
+        active_window_changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("selected"),
+        })
+    );
+    assert!(
+        active_window_changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "8"),
+            key: property("selected"),
+        })
+    );
+
+    let focus_changes = state
+        .apply_event(Event::WindowFocusChanged { id: Some(8) })
+        .unwrap();
+    assert!(
+        !focus_changes.iter().any(|change| matches!(
+            change,
+            locusfs_graph::GraphChange::PropertyChanged { node, key }
+                if node.kind().as_str() == "window" && key.as_str() == "selected"
+        )),
+        "focus event should not repeat selected property changes after active-window event"
+    );
+}
+
+#[test]
 fn workspace_activation_updates_selected_workspace_property() {
     let mut state = state_with_output("DP-1");
     state
@@ -202,6 +248,51 @@ fn workspace_activation_updates_selected_workspace_property() {
             key: property("selected"),
         })
     );
+}
+
+#[test]
+fn window_opened_emits_node_added() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+
+    let changes = state
+        .apply_event(Event::WindowOpenedOrChanged {
+            window: window(7, 42, "Terminal"),
+        })
+        .unwrap();
+
+    assert!(changes.contains(&locusfs_graph::GraphChange::NodeAdded {
+        node: node("window", "7"),
+    }));
+}
+
+#[test]
+fn windows_changed_emits_node_removed_for_missing_old_window() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+    state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(7, 42, "Terminal"), window(8, 42, "Browser")],
+        })
+        .unwrap();
+
+    let changes = state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(8, 42, "Browser")],
+        })
+        .unwrap();
+
+    assert!(changes.contains(&locusfs_graph::GraphChange::NodeRemoved {
+        node: node("window", "7"),
+    }));
 }
 
 fn state_with_output(name: &str) -> NiriState {

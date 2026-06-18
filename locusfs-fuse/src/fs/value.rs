@@ -1,6 +1,6 @@
 use fuse3::Errno;
 use locusfs_graph::{
-    DynamicGraph, GraphError, LocusValue, NodeId, PropertyKey, PropertySpec, ValueKind,
+    DynamicGraph, GraphError, LocusValue, NodeAccess, NodeId, PropertyKey, PropertySpec, ValueKind,
 };
 
 use crate::graph_error_to_errno;
@@ -33,6 +33,15 @@ pub(super) fn property_perm(spec: &PropertySpec) -> u16 {
         (true, true) => 0o644,
         (true, false) => 0o444,
         (false, true) => 0o222,
+        (false, false) => 0o000,
+    }
+}
+
+pub(super) fn node_dir_perm(access: NodeAccess) -> u16 {
+    match (access.is_readable(), access.is_writable()) {
+        (true, true) => 0o755,
+        (true, false) => 0o555,
+        (false, true) => 0o333,
         (false, false) => 0o000,
     }
 }

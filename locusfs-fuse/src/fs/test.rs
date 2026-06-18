@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use locusfs_graph::{
-    DynamicGraph, GraphError, LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey,
-    PropertyProvider, PropertySpec, RelationName, Result,
+    DynamicGraph, GraphError, GraphWatchEvent, InMemoryProvider, LocusValue, NodeId, NodeKind,
+    NodeProvider, PropertyKey, PropertyProvider, PropertySpec, RelationName, Result,
 };
 
 use super::watch;
@@ -145,6 +145,7 @@ fn watch_registry_marks_configured_watch_pending_for_subject_change() {
                 subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
                 dependencies: Vec::new(),
             },
+            false,
         )
         .unwrap();
 
@@ -171,6 +172,7 @@ fn watch_registry_reports_node_change_event_for_node_subject() {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
             },
+            false,
         )
         .unwrap();
 
@@ -182,6 +184,62 @@ fn watch_registry_reports_node_change_event_for_node_subject() {
 
     let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
     assert_eq!(event, "node changed node:57\n");
+}
+
+#[test]
+fn watch_registry_reports_node_add_event_for_kind_subject() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Kind(test_kind()),
+                dependencies: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+
+    assert!(
+        registry
+            .notify_node_change(&node, WatchEvent::NodeAdded(node.clone()))
+            .is_empty()
+    );
+
+    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
+    assert_eq!(event, "node added node:57\n");
+}
+
+#[test]
+fn watch_registry_reports_node_remove_event_for_kind_subject() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Kind(test_kind()),
+                dependencies: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+
+    assert!(
+        registry
+            .notify_node_change(&node, WatchEvent::NodeRemoved(node.clone()))
+            .is_empty()
+    );
+
+    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
+    assert_eq!(event, "node removed node:57\n");
 }
 
 #[test]
@@ -198,6 +256,7 @@ fn watch_registry_reports_node_removed_event_for_node_subject() {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
             },
+            false,
         )
         .unwrap();
 
@@ -209,6 +268,21 @@ fn watch_registry_reports_node_removed_event_for_node_subject() {
 
     let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
     assert_eq!(event, "node removed node:57\n");
+}
+
+#[tokio::test]
+async fn watch_path_can_target_kind_directory() {
+    let kind = test_kind();
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(InMemoryProvider::new(kind.clone()))
+        .await
+        .unwrap();
+
+    let target = resolve_watch_path(&graph, "/node").await.unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Kind(kind));
+    assert!(target.dependencies.is_empty());
 }
 
 #[test]
@@ -228,10 +302,11 @@ fn watch_registry_fans_out_shared_subjects_to_multiple_open_files() {
             first,
             "/context/selected/window/title".to_string(),
             target.clone(),
+            false,
         )
         .unwrap();
     registry
-        .configure_watch(second, "/node/57/title".to_string(), target)
+        .configure_watch(second, "/node/57/title".to_string(), target, false)
         .unwrap();
 
     registry.notify_property_change(&node, &key);
@@ -258,6 +333,7 @@ fn watch_registry_replaces_stale_meta_watch_poll_handles() {
                 subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
                 dependencies: Vec::new(),
             },
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -284,10 +360,67 @@ fn watch_registry_replaces_stale_meta_watch_poll_handles() {
     assert_eq!(registry.notify_property_change(&node, &key), vec![21]);
 }
 
+#[tokio::test]
+async fn graph_watch_forwarding_suppresses_duplicate_global_watch_events() {
+    let node = test_node("57");
+    let key = PropertyKey::new("title").unwrap();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57/title".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
+                dependencies: Vec::new(),
+            },
+            true,
+        )
+        .unwrap();
+    registry
+        .set_watch_task(handle, tokio::spawn(async {}))
+        .unwrap();
+
+    assert!(registry.notify_property_change(&node, &key).is_empty());
+    assert!(!registry.has_unread_change(handle));
+    assert!(
+        registry
+            .dependent_watch_paths(&watch::WatchKey::Property(node.clone(), key.clone()))
+            .is_empty()
+    );
+
+    assert_eq!(
+        registry
+            .poll(
+                handle,
+                Some(22),
+                fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        registry.queue_graph_watch_event(handle, GraphWatchEvent::Change),
+        vec![22]
+    );
+    assert_eq!(registry.read_watch(handle).unwrap(), b"change\n");
+    assert!(!registry.has_unread_change(handle));
+}
+
 #[test]
 fn read_slicing_respects_offset_and_size() {
     assert_eq!(slice_for_read(b"abcdef", 2, 3), b"cde");
     assert_eq!(slice_for_read(b"abcdef", 9, 3), b"");
+}
+
+#[test]
+fn node_directory_permissions_follow_provider_access() {
+    assert_eq!(node_dir_perm(locusfs_graph::NodeAccess::read_only()), 0o555);
+    assert_eq!(
+        node_dir_perm(locusfs_graph::NodeAccess::read_write()),
+        0o755
+    );
 }
 
 #[test]
@@ -357,6 +490,132 @@ async fn node_directory_lists_properties_without_relation_provider() {
     assert!(names.contains(&".".to_string()));
     assert!(names.contains(&"..".to_string()));
     assert!(names.contains(&key.to_string()));
+}
+
+#[tokio::test]
+async fn root_mkdir_creates_writable_in_memory_kind() {
+    let graph = DynamicGraph::new();
+    let fs = LocusFs::new(graph.clone());
+    let entry = fs
+        .create_kind_dir(std::ffi::OsStr::new("project"))
+        .await
+        .unwrap();
+    let kind = NodeKind::new("project").unwrap();
+    let node = NodeId::new(kind.clone(), "locusfs").unwrap();
+    let key = PropertyKey::new("name").unwrap();
+
+    assert_eq!(entry, FsEntry::KindDir(kind.clone()));
+    assert!(graph.node_kinds().await.unwrap().contains(&kind));
+    graph.create_node(&node).await.unwrap();
+    graph
+        .set_property(&node, &key, LocusValue::String("locusfs".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.property(&node, &key).await.unwrap(),
+        LocusValue::String("locusfs".to_string())
+    );
+}
+
+#[tokio::test]
+async fn relation_directory_uses_compact_unique_target_names() {
+    let service_kind = NodeKind::new("dbus-service").unwrap();
+    let object_kind = NodeKind::new("dbus-object").unwrap();
+    let service_provider = InMemoryProvider::new(service_kind.clone());
+    let object_provider = InMemoryProvider::new(object_kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(service_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(service_kind.clone(), service_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_provider(service_kind.clone(), service_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_mutation_provider(service_kind, service_provider)
+        .await
+        .unwrap();
+    graph
+        .register_node_provider(object_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(object_kind, object_provider)
+        .await
+        .unwrap();
+
+    let service = NodeId::new(NodeKind::new("dbus-service").unwrap(), "upower").unwrap();
+    let battery = NodeId::new(
+        NodeKind::new("dbus-object").unwrap(),
+        "upower:devices/battery_BAT1",
+    )
+    .unwrap();
+    let relation = RelationName::new("object").unwrap();
+    graph.create_node(&service).await.unwrap();
+    graph.create_node(&battery).await.unwrap();
+    graph.set_link(&service, &relation, &battery).await.unwrap();
+    let fs = LocusFs::new(graph);
+
+    let entries = fs
+        .dir_entries(&FsEntry::RelationDir(service.clone(), relation.clone()), 7)
+        .await
+        .unwrap();
+    let names = entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"battery_BAT1".to_string()));
+}
+
+#[tokio::test]
+async fn relation_directory_keeps_path_when_target_basenames_collide() {
+    let kind = test_kind();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_mutation_provider(kind, provider)
+        .await
+        .unwrap();
+    let source = test_node("source");
+    let first = test_node("devices/battery");
+    let second = test_node("other/battery");
+    let relation = RelationName::new("object").unwrap();
+    graph.create_node(&source).await.unwrap();
+    graph.create_node(&first).await.unwrap();
+    graph.create_node(&second).await.unwrap();
+    graph.set_link(&source, &relation, &first).await.unwrap();
+    graph.set_link(&source, &relation, &second).await.unwrap();
+    let fs = LocusFs::new(graph);
+
+    let entries = fs
+        .dir_entries(&FsEntry::RelationDir(source.clone(), relation.clone()), 7)
+        .await
+        .unwrap();
+    let names = entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"devices%2Fbattery".to_string()));
+    assert!(names.contains(&"other%2Fbattery".to_string()));
 }
 
 fn test_kind() -> NodeKind {

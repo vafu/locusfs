@@ -5,6 +5,9 @@ pub enum GraphChange {
     NodeKindChanged {
         kind: NodeKind,
     },
+    NodeAdded {
+        node: NodeId,
+    },
     NodeChanged {
         node: NodeId,
     },

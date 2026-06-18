@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    NodeMutationProvider, NodeProvider, PropertyMutationProvider, PropertyProvider,
+    NodeAccess, NodeMutationProvider, NodeProvider, PropertyMutationProvider, PropertyProvider,
     RelationMutationProvider, RelationProvider,
 };
 
@@ -83,6 +83,10 @@ impl InMemoryProvider {
 impl NodeProvider for InMemoryProvider {
     fn kind(&self) -> &NodeKind {
         &self.kind
+    }
+
+    fn access(&self) -> NodeAccess {
+        NodeAccess::read_write()
     }
 
     async fn contains_node(&self, node: &NodeId) -> Result<bool> {

@@ -113,7 +113,8 @@ impl LocusFs {
                 }
             }
             FsEntry::RelationDir(source, relation) => {
-                for target in self.relation_targets(source, relation).await? {
+                let targets = self.relation_targets(source, relation).await?;
+                for target in &targets {
                     let child = FsEntry::RelationTargetLink {
                         source: source.clone(),
                         relation: relation.clone(),
@@ -123,7 +124,8 @@ impl LocusFs {
                     entries.push(DirEntry::new(
                         child_ino,
                         FileType::Symlink,
-                        encode_relation_target_name(&target).map_err(graph_error_to_errno)?,
+                        encode_relation_target_name(source, &targets, target)
+                            .map_err(graph_error_to_errno)?,
                     ));
                 }
             }

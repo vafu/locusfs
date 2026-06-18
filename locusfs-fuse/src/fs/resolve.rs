@@ -1,9 +1,9 @@
 use fuse3::Errno;
-use locusfs_graph::{DynamicGraph, GraphError, NodeId, RelationName};
+use locusfs_graph::{DynamicGraph, GraphError, NodeId, NodeKind, RelationName};
 
 use super::name::{
-    decode_relation_target_name, node_id_from_kind_and_segment, node_kind_from_segment,
-    property_key_from_segment, relation_name_from_segment,
+    node_id_from_kind_and_segment, node_kind_from_segment, property_key_from_segment,
+    relation_name_from_segment, relation_target_from_name,
 };
 use super::watch::{WatchKey, WatchSubjectKey, WatchTarget};
 use crate::{errno, graph_error_to_errno};
@@ -31,11 +31,15 @@ pub(crate) async fn resolve_watch_path(
     let Some(kind_segment) = next_segment(&segments, &mut index) else {
         return Err(errno(libc::EINVAL));
     };
+    let kind = node_kind_from_segment(kind_segment)?;
     let Some(local_segment) = next_segment(&segments, &mut index) else {
-        return Err(errno(libc::EINVAL));
+        ensure_kind_exists(graph, &kind).await?;
+        return Ok(WatchTarget {
+            subject: WatchSubjectKey::Kind(kind),
+            dependencies: Vec::new(),
+        });
     };
 
-    let kind = node_kind_from_segment(kind_segment)?;
     let mut node = node_id_from_kind_and_segment(kind, local_segment)?;
     ensure_node_exists(graph, &node).await?;
 
@@ -80,12 +84,7 @@ pub(crate) async fn resolve_watch_path(
                     dependencies,
                 });
             };
-            let target = NodeId::parse(&decode_relation_target_name(target_segment)?)
-                .map_err(graph_error_to_errno)?;
-            if !targets.contains(&target) {
-                return Err(errno(libc::ENOENT));
-            }
-            target
+            relation_target_from_name(target_segment, &node, &targets)?
         };
         node = target;
     }
@@ -100,6 +99,22 @@ fn next_segment<'a>(segments: &'a [&'a str], index: &mut usize) -> Option<&'a st
     let segment = segments.get(*index).copied();
     *index += usize::from(segment.is_some());
     segment
+}
+
+async fn ensure_kind_exists(
+    graph: &DynamicGraph,
+    kind: &NodeKind,
+) -> std::result::Result<(), Errno> {
+    if graph
+        .node_kinds()
+        .await
+        .map_err(graph_error_to_errno)?
+        .contains(kind)
+    {
+        Ok(())
+    } else {
+        Err(errno(libc::ENOENT))
+    }
 }
 
 async fn ensure_node_exists(graph: &DynamicGraph, node: &NodeId) -> std::result::Result<(), Errno> {

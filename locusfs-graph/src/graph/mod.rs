@@ -1,22 +1,29 @@
+mod access;
 mod change;
 mod dynamic;
 mod memory;
 mod trace;
+mod watch;
 
 use async_trait::async_trait;
 
 use crate::{LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName, Result};
 
+pub use access::NodeAccess;
 pub use change::GraphChange;
 pub use dynamic::{
     DynamicGraph, GraphChangeReceiver, GraphChangeStreamError, GraphChangeSubscription,
 };
 pub use memory::InMemoryProvider;
 pub use trace::TracedProvider;
+pub use watch::{GraphWatch, GraphWatchEvent, GraphWatchTarget, WatchProvider};
 
 #[async_trait]
 pub trait NodeProvider: Send + Sync + 'static {
     fn kind(&self) -> &NodeKind;
+    fn access(&self) -> NodeAccess {
+        NodeAccess::read_only()
+    }
     async fn contains_node(&self, node: &NodeId) -> Result<bool>;
     async fn nodes(&self) -> Result<Vec<NodeId>>;
 }

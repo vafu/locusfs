@@ -6,6 +6,7 @@ members = [
     "locusfs-fuse",
     "plugins/dbus",
     "plugins/niri",
+    "plugins/project",
 ]
 resolver = "3"
 

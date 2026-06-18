@@ -19,7 +19,7 @@ pub(crate) use watch::{SharedWatchRegistry, WatchEvent, WatchKey, WatchRegistry}
 #[cfg(test)]
 use entry::{direct_relation_link_target, nested_relation_link_target};
 #[cfg(test)]
-use value::slice_for_read;
+use value::{node_dir_perm, slice_for_read};
 
 #[cfg(test)]
 mod test;

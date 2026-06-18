@@ -45,7 +45,7 @@ async fn spawn_event_stream(state: SharedNiriState, graph: DynamicGraph) -> Resu
                     match state.apply_event(event) {
                         Ok(changes) => {
                             for change in changes {
-                                if let Err(error) = graph.emit_change(change) {
+                                if let Err(error) = graph.emit_global_change(change) {
                                     eprintln!("locusfs-niri: failed to emit graph change: {error}");
                                 }
                             }

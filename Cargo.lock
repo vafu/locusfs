@@ -421,6 +421,7 @@ dependencies = [
  "locusfs-graph",
  "locusfs-plugin-dbus",
  "locusfs-plugin-niri",
+ "locusfs-plugin-project",
  "tokio",
  "tracing-subscriber",
 ]
@@ -482,6 +483,13 @@ dependencies = [
  "niri-ipc",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "locusfs-plugin-project"
+version = "0.1.0"
+dependencies = [
+ "locusfs-graph",
 ]
 
 [[package]]

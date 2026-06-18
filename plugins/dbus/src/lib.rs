@@ -1,8 +1,4 @@
 //! D-Bus graph provider for `locusfs`.
-//!
-//! The first version is intentionally hardcoded to expose UPower service
-//! ownership. A config-backed service list can replace `WATCHED_SERVICES`
-//! without changing the provider traits.
 
 mod provider;
 mod runtime;
@@ -16,24 +12,30 @@ use tokio::task::JoinHandle;
 use crate::runtime::DbusRuntime;
 
 pub const DBUS_SERVICE_KIND: &str = "dbus-service";
+pub const DBUS_OBJECT_KIND: &str = "dbus-object";
 
 const PROVIDER_NAME: &str = "dbus";
 
 /// Registers read-only D-Bus service providers on the graph.
 #[derive(Debug)]
 pub struct DbusPluginHandle {
-    _upower_watcher: JoinHandle<()>,
+    _watchers: Vec<JoinHandle<()>>,
 }
 
 pub async fn register(graph: &DynamicGraph) -> Result<DbusPluginHandle> {
-    let kind = NodeKind::new(DBUS_SERVICE_KIND)?;
-    let (state, upower_watcher) = DbusRuntime::start(graph.clone())?;
-    let provider = DbusProvider::new(kind.clone(), state);
-    let provider = TracedProvider::new(PROVIDER_NAME, provider);
+    let (state, watchers) = DbusRuntime::start(graph.clone())?;
+    for kind_name in [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND] {
+        let kind = NodeKind::new(kind_name)?;
+        let provider = DbusProvider::new(kind.clone(), state.clone());
+        let provider = TracedProvider::new(PROVIDER_NAME, provider);
 
-    graph.register_node_provider(provider.clone()).await?;
-    graph.register_property_provider(kind, provider).await?;
+        graph.register_node_provider(provider.clone()).await?;
+        graph
+            .register_property_provider(kind.clone(), provider.clone())
+            .await?;
+        graph.register_relation_provider(kind, provider).await?;
+    }
     Ok(DbusPluginHandle {
-        _upower_watcher: upower_watcher,
+        _watchers: watchers,
     })
 }
