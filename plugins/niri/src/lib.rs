@@ -1,14 +1,20 @@
 //! Niri graph provider for `locusfs`.
 
+pub mod config;
 mod ipc;
 mod provider;
 mod state;
 
 pub use provider::NiriProvider;
 
-use locusfs_graph::{DynamicGraph, NodeKind, Result, TracedProvider};
+use async_trait::async_trait;
+use locusfs_graph::{DynamicGraph, GraphError, NodeKind, Result, TracedProvider};
+use locusfs_plugin_api::{
+    LocusFsPlugin, PluginContext, PluginHandle, PluginManifest, enter_runtime,
+};
 use tokio::task::JoinHandle;
 
+use crate::config::NiriConfig;
 use crate::ipc::IpcNiriClient;
 
 pub const WINDOW_KIND: &str = "window";
@@ -18,14 +24,55 @@ pub const CONTEXT_KIND: &str = "context";
 
 const PROVIDER_KINDS: &[&str] = &[WINDOW_KIND, WORKSPACE_KIND, OUTPUT_KIND, CONTEXT_KIND];
 
+#[derive(Debug, Default)]
+pub struct NiriPlugin;
+
 /// Registers read-only Niri providers on the graph.
 #[derive(Debug)]
 pub struct NiriPluginHandle {
-    _event_stream: JoinHandle<()>,
+    event_stream: Option<JoinHandle<()>>,
+}
+
+impl Drop for NiriPluginHandle {
+    fn drop(&mut self) {
+        if let Some(event_stream) = &self.event_stream {
+            event_stream.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl PluginHandle for NiriPluginHandle {
+    async fn shutdown(mut self: Box<Self>) {
+        if let Some(event_stream) = self.event_stream.take() {
+            event_stream.abort();
+            let _ = event_stream.await;
+        }
+    }
 }
 
 pub async fn register(graph: &DynamicGraph) -> Result<NiriPluginHandle> {
-    let (state, event_stream) = IpcNiriClient::start(graph.clone()).await?;
+    register_with_config(graph, NiriConfig::default()).await
+}
+
+pub async fn register_with_config(
+    graph: &DynamicGraph,
+    _config: NiriConfig,
+) -> Result<NiriPluginHandle> {
+    let runtime = tokio::runtime::Handle::current();
+    register_with_config_and_runtime(graph, _config, runtime).await
+}
+
+async fn register_with_config_and_runtime(
+    graph: &DynamicGraph,
+    _config: NiriConfig,
+    runtime: tokio::runtime::Handle,
+) -> Result<NiriPluginHandle> {
+    let (state, event_stream) = enter_runtime(
+        runtime.clone(),
+        IpcNiriClient::start(graph.clone(), runtime),
+    )
+    .await?;
 
     for kind in PROVIDER_KINDS {
         let kind = NodeKind::new(*kind)?;
@@ -39,6 +86,42 @@ pub async fn register(graph: &DynamicGraph) -> Result<NiriPluginHandle> {
     }
 
     Ok(NiriPluginHandle {
-        _event_stream: event_stream,
+        event_stream: Some(event_stream),
     })
+}
+
+#[async_trait]
+impl LocusFsPlugin for NiriPlugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: "niri",
+            name: "Niri",
+            version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+
+    async fn register(
+        &self,
+        context: PluginContext,
+        config: toml::Value,
+    ) -> Result<Box<dyn PluginHandle>> {
+        let config = NiriConfig::from_value(config)?;
+        Ok(Box::new(
+            register_with_config_and_runtime(&context.graph, config, context.runtime).await?,
+        ))
+    }
+}
+
+#[allow(improper_ctypes_definitions)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _locusfs_plugin_init() -> *mut dyn LocusFsPlugin {
+    Box::into_raw(Box::new(NiriPlugin))
+}
+
+fn config_error(error: toml::de::Error) -> GraphError {
+    GraphError::InvalidValue {
+        kind: "niri plugin config",
+        value: error.to_string(),
+        reason: "invalid TOML shape",
+    }
 }

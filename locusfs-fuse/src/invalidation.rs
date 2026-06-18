@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use locusfs_graph::{DynamicGraph, GraphChange, GraphChangeReceiver};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -89,16 +91,13 @@ async fn invalidate_change(
             invalidate_known_inode(notifier.clone(), inodes.clone(), FsEntry::KindDir(kind)).await;
         }
         GraphChange::NodeAdded { node } => {
-            let had_poll_waiters = notify_node_watchers(
+            notify_node_watchers(
                 notifier.clone(),
                 watch.clone(),
                 node.clone(),
                 WatchEvent::NodeAdded(node.clone()),
             )
             .await;
-            if had_poll_waiters {
-                return;
-            }
             let parent = FsEntry::KindDir(node.kind().clone());
             let name = match encode_segment(node.local()) {
                 Ok(name) => name,
@@ -113,16 +112,13 @@ async fn invalidate_change(
             .await;
         }
         GraphChange::NodeChanged { node } => {
-            let had_poll_waiters = notify_node_watchers(
+            notify_node_watchers(
                 notifier.clone(),
                 watch.clone(),
                 node.clone(),
                 WatchEvent::NodeChanged(node.clone()),
             )
             .await;
-            if had_poll_waiters {
-                return;
-            }
             let parent = FsEntry::KindDir(node.kind().clone());
             let name = match encode_segment(node.local()) {
                 Ok(name) => name,
@@ -137,16 +133,13 @@ async fn invalidate_change(
             .await;
         }
         GraphChange::NodeRemoved { node } => {
-            let had_poll_waiters = notify_node_watchers(
+            notify_node_watchers(
                 notifier.clone(),
                 watch.clone(),
                 node.clone(),
                 WatchEvent::NodeRemoved(node.clone()),
             )
             .await;
-            if had_poll_waiters {
-                return;
-            }
             let parent = FsEntry::KindDir(node.kind().clone());
             let name = match encode_segment(node.local()) {
                 Ok(name) => name,
@@ -161,59 +154,142 @@ async fn invalidate_change(
             .await;
         }
         GraphChange::PropertyChanged { node, key } => {
-            let name = match encode_segment(key.as_str()) {
-                Ok(name) => name,
-                Err(_) => return,
-            };
-            let parent = FsEntry::NodeDir(node.clone());
-            let had_poll_waiters = notify_property_watchers(
-                notifier.clone(),
-                watch.clone(),
-                node.clone(),
-                key.clone(),
+            invalidate_property_change(
+                notifier,
+                inodes,
+                watch,
+                node,
+                key,
+                WatchEvent::PropertyChanged,
             )
             .await;
-            if had_poll_waiters {
-                return;
-            }
-            invalidate_known_child(
-                notifier.clone(),
-                inodes.clone(),
-                parent.clone(),
-                name.clone(),
+        }
+        GraphChange::PropertyAdded { node, key } => {
+            invalidate_property_change(
+                notifier,
+                inodes,
+                watch,
+                node,
+                key,
+                WatchEvent::PropertyAdded,
             )
             .await;
-            invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
-            invalidate_known_inode(
-                notifier.clone(),
-                inodes.clone(),
-                FsEntry::PropertyFile(node.clone(), key.clone()),
+        }
+        GraphChange::PropertyRemoved { node, key } => {
+            invalidate_property_change(
+                notifier,
+                inodes,
+                watch,
+                node,
+                key,
+                WatchEvent::PropertyRemoved,
             )
             .await;
         }
         GraphChange::RelationChanged { source, relation } => {
-            let affected_watch = retarget_relation_watchers(
-                notifier.clone(),
-                graph.clone(),
-                watch.clone(),
-                source.clone(),
-                relation.clone(),
+            invalidate_relation_change(
+                notifier,
+                graph,
+                inodes,
+                watch,
+                source,
+                relation,
+                WatchEvent::RelationChanged,
             )
             .await;
-            if affected_watch {
-                return;
-            }
-
-            let parent = FsEntry::NodeDir(source.clone());
-            let name = match encode_segment(relation.as_str()) {
-                Ok(name) => name,
-                Err(_) => return,
-            };
-            invalidate_known_child(notifier.clone(), inodes.clone(), parent.clone(), name).await;
-            invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
-            invalidate_matching_relation_inodes(notifier, inodes, source, relation).await;
+        }
+        GraphChange::RelationAdded { source, relation } => {
+            invalidate_relation_change(
+                notifier,
+                graph,
+                inodes,
+                watch,
+                source,
+                relation,
+                WatchEvent::RelationAdded,
+            )
+            .await;
+        }
+        GraphChange::RelationRemoved { source, relation } => {
+            invalidate_relation_change(
+                notifier,
+                graph,
+                inodes,
+                watch,
+                source,
+                relation,
+                WatchEvent::RelationRemoved,
+            )
+            .await;
         }
     }
+}
+
+async fn invalidate_property_change(
+    notifier: SharedKernelNotify,
+    inodes: SharedInodeTable,
+    watch: SharedWatchRegistry,
+    node: locusfs_graph::NodeId,
+    key: locusfs_graph::PropertyKey,
+    event: fn(locusfs_graph::NodeId, locusfs_graph::PropertyKey) -> WatchEvent,
+) {
+    let name = match encode_segment(key.as_str()) {
+        Ok(name) => name,
+        Err(_) => return,
+    };
+    let parent = FsEntry::NodeDir(node.clone());
+    notify_property_watchers(
+        notifier.clone(),
+        watch.clone(),
+        node.clone(),
+        key.clone(),
+        event(node.clone(), key.clone()),
+    )
+    .await;
+    invalidate_known_child(
+        notifier.clone(),
+        inodes.clone(),
+        parent.clone(),
+        name.clone(),
+    )
+    .await;
+    invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
+    invalidate_known_inode(
+        notifier.clone(),
+        inodes.clone(),
+        FsEntry::PropertyFile(node.clone(), key.clone()),
+    )
+    .await;
+}
+
+async fn invalidate_relation_change(
+    notifier: SharedKernelNotify,
+    graph: DynamicGraph,
+    inodes: SharedInodeTable,
+    watch: SharedWatchRegistry,
+    source: locusfs_graph::NodeId,
+    relation: locusfs_graph::RelationName,
+    event: fn(locusfs_graph::NodeId, locusfs_graph::RelationName) -> WatchEvent,
+) {
+    let watch_event = event(source.clone(), relation.clone());
+    retarget_relation_watchers(
+        notifier.clone(),
+        graph.clone(),
+        watch.clone(),
+        source.clone(),
+        relation.clone(),
+        watch_event.clone(),
+    )
+    .await;
+
+    let parent = FsEntry::NodeDir(source.clone());
+    let name = match encode_segment(relation.as_str()) {
+        Ok(name) => name,
+        Err(_) => return,
+    };
+    invalidate_known_child(notifier.clone(), inodes.clone(), parent.clone(), name).await;
+    invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
+    invalidate_matching_relation_inodes(notifier, inodes, source, relation).await;
 }
 
 async fn resync_known_state(
@@ -267,10 +343,11 @@ async fn notify_property_watchers(
     watch: SharedWatchRegistry,
     node: locusfs_graph::NodeId,
     key: locusfs_graph::PropertyKey,
+    event: WatchEvent,
 ) -> bool {
     let handles = {
         let mut watch = watch.lock().await;
-        watch.notify_property_change(&node, &key)
+        watch.notify_property_event(&node, &key, event)
     };
 
     notify_poll_handles(notifier, handles).await
@@ -296,19 +373,35 @@ async fn retarget_relation_watchers(
     watch: SharedWatchRegistry,
     source: locusfs_graph::NodeId,
     relation: locusfs_graph::RelationName,
+    event: WatchEvent,
 ) -> bool {
-    let key = WatchKey::Relation(source, relation);
+    let key = WatchKey::Relation(source.clone(), relation.clone());
     let paths = {
         let watch = watch.lock().await;
         watch.dependent_watch_paths(&key)
     };
+    let retargeted_handles = paths
+        .iter()
+        .map(|(handle, _)| *handle)
+        .collect::<HashSet<_>>();
 
-    let mut had_poll_waiters = !paths.is_empty();
+    let handles = {
+        let mut watch = watch.lock().await;
+        watch.notify_relation_event_excluding(
+            &source,
+            &relation,
+            event.clone(),
+            &retargeted_handles,
+        )
+    };
+    let mut had_poll_waiters = notify_poll_handles(notifier.clone(), handles).await;
+
+    had_poll_waiters |= !paths.is_empty();
     for (handle, path) in paths {
         let result = resolve_watch_path(&graph, &path).await;
         let handles = {
             let mut watch = watch.lock().await;
-            watch.apply_retarget_result(handle, path, result)
+            watch.apply_retarget_result(handle, path, result, event.clone())
         };
         had_poll_waiters |= notify_poll_handles(notifier.clone(), handles).await;
     }

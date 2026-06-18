@@ -28,6 +28,7 @@ pub struct ServiceConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusKind {
     System,
+    Session,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,11 +227,8 @@ impl DbusState {
     }
 }
 
-pub fn default_service_configs() -> Vec<ServiceConfig> {
-    vec![ServiceConfig::system("org.freedesktop.UPower")]
-}
-
 impl ServiceConfig {
+    #[cfg(test)]
     pub fn system(name: impl Into<String>) -> Self {
         let name = name.into();
         let local_id = service_local_id(&name);
@@ -248,6 +246,7 @@ impl BusKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Session => "session",
         }
     }
 }
@@ -490,8 +489,6 @@ fn object_display_path<'a>(config: &ServiceConfig, path: &'a str) -> &'a str {
         .and_then(|path| path.strip_prefix('/'))
     {
         stripped
-    } else if let Some(stripped) = path.strip_prefix('/') {
-        stripped
     } else {
         path
     }
@@ -511,6 +508,7 @@ fn object_full_path(config: &ServiceConfig, local_path: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn service_local_id(name: &str) -> String {
     name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase()
 }

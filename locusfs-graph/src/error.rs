@@ -23,6 +23,8 @@ pub enum GraphError {
     InvalidEncoding { segment: String },
     #[error("{kind} not found: {name}")]
     NotFound { kind: &'static str, name: String },
+    #[error("{kind} already exists: {name}")]
+    AlreadyExists { kind: &'static str, name: String },
     #[error("unsupported graph operation: {operation}")]
     Unsupported { operation: &'static str },
     #[error("internal graph failure: {reason}")]

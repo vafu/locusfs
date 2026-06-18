@@ -7,7 +7,9 @@ use crate::{NodeId, NodeKind, PropertyKey, Result};
 pub enum GraphWatchTarget {
     Kind(NodeKind),
     Node(NodeId),
+    NodeChild(NodeId, String),
     Property(NodeId, PropertyKey),
+    Relation(NodeId, crate::RelationName),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,6 +18,12 @@ pub enum GraphWatchEvent {
     NodeAdded(NodeId),
     NodeChanged(NodeId),
     NodeRemoved(NodeId),
+    PropertyAdded(NodeId, PropertyKey),
+    PropertyChanged(NodeId, PropertyKey),
+    PropertyRemoved(NodeId, PropertyKey),
+    RelationAdded(NodeId, crate::RelationName),
+    RelationChanged(NodeId, crate::RelationName),
+    RelationRemoved(NodeId, crate::RelationName),
 }
 
 pub struct GraphWatch {

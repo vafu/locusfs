@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::info;
 
 /// Reads a locusfs path into memory.
@@ -166,15 +166,39 @@ impl Watch {
         Ok(value)
     }
 
+    /// Reads the current value, retrying missing paths until `duration` elapses.
+    pub async fn read_timeout(&self, duration: Duration) -> io::Result<Vec<u8>> {
+        let value = timeout(duration, read_retrying(&self.data_path))
+            .await
+            .map_err(|_| timed_out("read watched path"))??;
+        info!("{} >>> {}", self.logical_path, format_watch_value(&value));
+        Ok(value)
+    }
+
     /// Reads the current UTF-8 value from the watched data path.
     pub async fn read_to_string(&self) -> io::Result<String> {
         bytes_to_string(self.read().await?)
+    }
+
+    /// Reads the current UTF-8 value, retrying missing paths until `duration` elapses.
+    pub async fn read_to_string_timeout(&self, duration: Duration) -> io::Result<String> {
+        bytes_to_string(self.read_timeout(duration).await?)
     }
 
     /// Waits for a change and then reads the current value.
     pub async fn wait_and_read(&mut self) -> io::Result<Vec<u8>> {
         self.wait().await?;
         self.read().await
+    }
+
+    /// Waits for a change and then reads the current value within `duration`.
+    pub async fn wait_and_read_timeout(&mut self, duration: Duration) -> io::Result<Vec<u8>> {
+        timeout(duration, async {
+            self.wait().await?;
+            self.read().await
+        })
+        .await
+        .map_err(|_| timed_out("wait for watch event and read watched path"))?
     }
 }
 
@@ -221,6 +245,10 @@ fn drain_watch_events(fd: &OwnedFd) -> io::Result<Vec<u8>> {
 
 fn format_watch_value(value: &[u8]) -> String {
     String::from_utf8_lossy(value).escape_debug().to_string()
+}
+
+fn timed_out(operation: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, format!("{operation} timed out"))
 }
 
 async fn read_retrying(path: &Path) -> io::Result<Vec<u8>> {

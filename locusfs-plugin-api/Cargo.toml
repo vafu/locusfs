@@ -1,0 +1,10 @@
+[package]
+name = "locusfs-plugin-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+locusfs-graph = { path = "../locusfs-graph" }
+tokio = { workspace = true, features = ["rt"] }
+toml = { workspace = true }

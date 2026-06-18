@@ -1,11 +1,12 @@
 use fuse3::Errno;
-use locusfs_graph::{DynamicGraph, GraphError, NodeId, NodeKind, RelationName};
+use locusfs_graph::{DynamicGraph, GraphError, GraphWatchTarget, NodeId, NodeKind, RelationName};
 
 use super::name::{
     node_id_from_kind_and_segment, node_kind_from_segment, property_key_from_segment,
     relation_name_from_segment, relation_target_from_name,
 };
-use super::watch::{WatchKey, WatchSubjectKey, WatchTarget};
+use super::watch::{WatchKey, WatchTarget};
+use crate::layout::decode_segment;
 use crate::{errno, graph_error_to_errno};
 
 pub(super) fn parse_watch_subscription(data: &[u8]) -> std::result::Result<String, Errno> {
@@ -35,7 +36,7 @@ pub(crate) async fn resolve_watch_path(
     let Some(local_segment) = next_segment(&segments, &mut index) else {
         ensure_kind_exists(graph, &kind).await?;
         return Ok(WatchTarget {
-            subject: WatchSubjectKey::Kind(kind),
+            subject: GraphWatchTarget::Kind(kind),
             dependencies: Vec::new(),
         });
     };
@@ -61,13 +62,23 @@ pub(crate) async fn resolve_watch_path(
             }
             let key = property_key_from_segment(segment)?;
             return Ok(WatchTarget {
-                subject: WatchSubjectKey::Property(node, key),
+                subject: GraphWatchTarget::Property(node, key),
                 dependencies,
             });
         }
 
         if !has_relation {
-            return Err(errno(libc::ENOENT));
+            push_unique(
+                &mut dependencies,
+                WatchKey::Relation(node.clone(), relation.clone()),
+            );
+            return Ok(WatchTarget {
+                subject: GraphWatchTarget::NodeChild(
+                    node,
+                    decode_segment(segment).map_err(graph_error_to_errno)?,
+                ),
+                dependencies,
+            });
         }
 
         push_unique(
@@ -80,7 +91,7 @@ pub(crate) async fn resolve_watch_path(
         } else {
             let Some(target_segment) = next_segment(&segments, &mut index) else {
                 return Ok(WatchTarget {
-                    subject: WatchSubjectKey::Node(node),
+                    subject: GraphWatchTarget::Relation(node, relation),
                     dependencies,
                 });
             };
@@ -90,7 +101,7 @@ pub(crate) async fn resolve_watch_path(
     }
 
     Ok(WatchTarget {
-        subject: WatchSubjectKey::Node(node),
+        subject: GraphWatchTarget::Node(node),
         dependencies,
     })
 }

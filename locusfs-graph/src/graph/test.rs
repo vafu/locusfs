@@ -1,7 +1,7 @@
 use crate::{
     DynamicGraph, GraphChange, GraphError, GraphWatchEvent, GraphWatchTarget, InMemoryProvider,
-    LocusValue, NodeAccess, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyProvider,
-    PropertySpec, RelationName, Result, TracedProvider, ValueKind,
+    LocusValue, NodeAccess, NodeId, NodeKind, NodeMutationProvider, NodeProvider, PropertyKey,
+    PropertyProvider, PropertySpec, RelationName, Result, TracedProvider, ValueKind,
 };
 
 use async_trait::async_trait;
@@ -221,7 +221,15 @@ async fn graph_mutations_emit_semantic_changes() {
         .set_property(&source, &key, LocusValue::String("value".to_string()))
         .await
         .unwrap();
+    graph
+        .set_property(&source, &key, LocusValue::String("updated".to_string()))
+        .await
+        .unwrap();
     graph.set_link(&source, &relation, &target).await.unwrap();
+    graph
+        .remove_link(&source, &relation, &target)
+        .await
+        .unwrap();
 
     let mut emitted = Vec::new();
     while let Ok(change) = changes.try_recv() {
@@ -230,11 +238,19 @@ async fn graph_mutations_emit_semantic_changes() {
     assert!(emitted.contains(&GraphChange::NodeAdded {
         node: source.clone()
     }));
+    assert!(emitted.contains(&GraphChange::PropertyAdded {
+        node: source.clone(),
+        key: key.clone()
+    }));
     assert!(emitted.contains(&GraphChange::PropertyChanged {
         node: source.clone(),
-        key
+        key: key.clone()
     }));
-    assert!(emitted.contains(&GraphChange::RelationChanged { source, relation }));
+    assert!(emitted.contains(&GraphChange::RelationAdded {
+        source: source.clone(),
+        relation: relation.clone()
+    }));
+    assert!(emitted.contains(&GraphChange::RelationRemoved { source, relation }));
 }
 
 #[tokio::test]
@@ -291,7 +307,7 @@ async fn graph_watch_fallback_filters_property_events() {
     })
     .await
     .unwrap();
-    assert_eq!(event, GraphWatchEvent::Change);
+    assert_eq!(event, GraphWatchEvent::PropertyAdded(node, watched));
     assert!(watch.try_recv().is_none());
 }
 
@@ -325,8 +341,44 @@ async fn graph_watch_fallback_property_watch_ignores_broad_node_changes() {
     })
     .await
     .unwrap();
-    assert_eq!(event, GraphWatchEvent::Change);
+    assert_eq!(event, GraphWatchEvent::PropertyAdded(node, watched));
     assert!(watch.try_recv().is_none());
+}
+
+#[tokio::test]
+async fn graph_watch_fallback_maps_node_child_relation_lifecycle() {
+    let source_kind = NodeKind::new("workspace").unwrap();
+    let target_kind = NodeKind::new("project").unwrap();
+    let graph = DynamicGraph::new();
+    register_in_memory_provider(&graph, source_kind.clone()).await;
+    register_in_memory_provider(&graph, target_kind.clone()).await;
+
+    let source = NodeId::new(source_kind, "1").unwrap();
+    let target = NodeId::new(target_kind, "locusfs").unwrap();
+    let relation = RelationName::new("project").unwrap();
+    graph.create_node(&source).await.unwrap();
+    graph.create_node(&target).await.unwrap();
+    let mut watch = graph
+        .watch(GraphWatchTarget::NodeChild(
+            source.clone(),
+            relation.as_str().to_string(),
+        ))
+        .await
+        .unwrap();
+
+    graph.set_link(&source, &relation, &target).await.unwrap();
+
+    let event = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(event) = watch.try_recv() {
+                break event;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(event, GraphWatchEvent::RelationAdded(source, relation));
 }
 
 #[tokio::test]
@@ -377,6 +429,43 @@ async fn removing_node_removes_cross_provider_inbound_links() {
 
     graph.remove_node(&target).await.unwrap();
 
+    assert!(matches!(
+        graph.targets(&source, &relation).await.unwrap_err(),
+        GraphError::NotFound { .. }
+    ));
+}
+
+#[tokio::test]
+async fn removing_node_removes_overlay_outbound_links() {
+    let source_kind = NodeKind::new("workspace").unwrap();
+    let target_kind = NodeKind::new("project").unwrap();
+    let graph = DynamicGraph::new();
+    let source_provider = MutableNodeOnlyProvider::new(source_kind.clone());
+    let source = NodeId::new(source_kind.clone(), "1").unwrap();
+    let target = NodeId::new(target_kind.clone(), "locusfs").unwrap();
+    let relation = RelationName::new("project").unwrap();
+
+    graph
+        .register_node_provider(source_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(source_kind, source_provider)
+        .await
+        .unwrap();
+    register_in_memory_provider(&graph, target_kind).await;
+
+    graph.create_node(&source).await.unwrap();
+    graph.create_node(&target).await.unwrap();
+    graph.set_link(&source, &relation, &target).await.unwrap();
+    assert_eq!(
+        graph.targets(&source, &relation).await.unwrap(),
+        vec![target.clone()]
+    );
+
+    graph.remove_node(&source).await.unwrap();
+
+    assert!(!graph.contains_node(&source).await.unwrap());
     assert!(matches!(
         graph.targets(&source, &relation).await.unwrap_err(),
         GraphError::NotFound { .. }
@@ -440,6 +529,85 @@ impl NodeProvider for StaticNodeProvider {
 
     async fn nodes(&self) -> Result<Vec<NodeId>> {
         Ok(vec![self.node.clone()])
+    }
+}
+
+#[tokio::test]
+async fn duplicate_provider_registration_is_rejected() {
+    let kind = NodeKind::new("workspace").unwrap();
+    let first = NodeId::new(kind.clone(), "1").unwrap();
+    let second = NodeId::new(kind.clone(), "2").unwrap();
+    let graph = DynamicGraph::new();
+
+    graph
+        .register_node_provider(StaticNodeProvider {
+            kind: kind.clone(),
+            node: first,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        graph
+            .register_node_provider(StaticNodeProvider { kind, node: second })
+            .await
+            .unwrap_err(),
+        GraphError::AlreadyExists { .. }
+    ));
+}
+
+#[derive(Clone)]
+struct MutableNodeOnlyProvider {
+    kind: NodeKind,
+    nodes: std::sync::Arc<tokio::sync::RwLock<Vec<NodeId>>>,
+}
+
+impl MutableNodeOnlyProvider {
+    fn new(kind: NodeKind) -> Self {
+        Self {
+            kind,
+            nodes: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeProvider for MutableNodeOnlyProvider {
+    fn kind(&self) -> &NodeKind {
+        &self.kind
+    }
+
+    async fn contains_node(&self, node: &NodeId) -> Result<bool> {
+        Ok(self
+            .nodes
+            .read()
+            .await
+            .iter()
+            .any(|candidate| candidate == node))
+    }
+
+    async fn nodes(&self) -> Result<Vec<NodeId>> {
+        Ok(self.nodes.read().await.clone())
+    }
+}
+
+#[async_trait]
+impl NodeMutationProvider for MutableNodeOnlyProvider {
+    async fn create_node(&self, node: &NodeId) -> Result<()> {
+        let mut nodes = self.nodes.write().await;
+        if !nodes.iter().any(|candidate| candidate == node) {
+            nodes.push(node.clone());
+            nodes.sort();
+        }
+        Ok(())
+    }
+
+    async fn remove_node(&self, node: &NodeId) -> Result<()> {
+        self.nodes
+            .write()
+            .await
+            .retain(|candidate| candidate != node);
+        Ok(())
     }
 }
 

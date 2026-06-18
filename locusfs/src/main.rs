@@ -3,10 +3,14 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use locusfs::fuse::{FuseMountConfig, mount};
-use locusfs::graph::{DynamicGraph, Result};
+use locusfs::config::Config;
+use locusfs::fuse::{FuseMount, FuseMountConfig, mount};
+use locusfs::graph::DynamicGraph;
+use locusfs::plugin::PluginManager;
 
 mod watch;
+
+type AppError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -19,7 +23,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn run() -> std::result::Result<(), AppError> {
     init_tracing();
     let command = parse_command()?;
 
@@ -27,20 +31,22 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return watch::watch_path(&path).await.map_err(Into::into);
     }
 
-    let Command::Mount { mountpoint } = command else {
+    let Command::Mount { mountpoint, config } = command else {
         unreachable!("all commands are handled above");
     };
     let created_mountpoint = prepare_mountpoint(&mountpoint).await?;
     tokio::fs::create_dir_all(&mountpoint).await?;
 
-    let (graph, _plugins) = default_graph().await?;
+    let config = Config::load(config).await?;
+    let (graph, mut plugins) = default_graph(&config).await?;
     let mount = mount(FuseMountConfig::new(&mountpoint), graph).await?;
 
     eprintln!("locusfs mounted at {}", mountpoint.display());
     eprintln!("press Ctrl-C to unmount");
 
     let shutdown_result = wait_for_shutdown().await;
-    let unmount_result = mount.unmount().await;
+    plugins.shutdown().await;
+    let unmount_result = unmount_with_fallback(mount, &mountpoint).await;
     if created_mountpoint {
         remove_mountpoint_dir(&mountpoint).await?;
     }
@@ -49,6 +55,21 @@ async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     unmount_result?;
 
     Ok(())
+}
+
+async fn unmount_with_fallback(
+    mount: FuseMount,
+    mountpoint: &PathBuf,
+) -> std::result::Result<(), AppError> {
+    match mount.unmount().await {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("Device or resource busy") => {
+            eprintln!("locusfs: normal unmount failed ({error}); trying lazy unmount");
+            unmount_stale_mountpoint(mountpoint).await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn prepare_mountpoint(mountpoint: &PathBuf) -> io::Result<bool> {
@@ -106,8 +127,13 @@ fn init_tracing() {
 }
 
 enum Command {
-    Mount { mountpoint: PathBuf },
-    Watch { path: PathBuf },
+    Mount {
+        mountpoint: PathBuf,
+        config: Option<PathBuf>,
+    },
+    Watch {
+        path: PathBuf,
+    },
 }
 
 fn parse_command() -> std::result::Result<Command, String> {
@@ -129,42 +155,43 @@ fn parse_command() -> std::result::Result<Command, String> {
         });
     }
 
-    if args.next().is_some() {
-        return Err(usage(&program.to_string_lossy()));
+    let mut config = None;
+    let mut mountpoint = None;
+    let mut current = Some(first);
+    while let Some(arg) = current.take().or_else(|| args.next()) {
+        if arg == "--config" {
+            let Some(path) = args.next() else {
+                return Err(usage(&program.to_string_lossy()));
+            };
+            if config.replace(PathBuf::from(path)).is_some() {
+                return Err(usage(&program.to_string_lossy()));
+            }
+            continue;
+        }
+        if mountpoint.replace(PathBuf::from(arg)).is_some() {
+            return Err(usage(&program.to_string_lossy()));
+        }
     }
 
-    Ok(Command::Mount {
-        mountpoint: PathBuf::from(first),
-    })
+    let Some(mountpoint) = mountpoint else {
+        return Err(usage(&program.to_string_lossy()));
+    };
+    Ok(Command::Mount { mountpoint, config })
 }
 
 fn usage(program: &str) -> String {
-    format!("usage: {program} <mountpoint>\n       {program} --watch <path>")
+    format!("usage: {program} [--config <path>] <mountpoint>\n       {program} --watch <path>")
 }
 
-#[derive(Debug)]
-struct PluginHandles {
-    _dbus: locusfs_plugin_dbus::DbusPluginHandle,
-    _niri: locusfs_plugin_niri::NiriPluginHandle,
-    _project: locusfs_plugin_project::ProjectPluginHandle,
-}
-
-async fn default_graph() -> Result<(DynamicGraph, PluginHandles)> {
+async fn default_graph(
+    config: &Config,
+) -> std::result::Result<(DynamicGraph, PluginManager), AppError> {
     let graph = DynamicGraph::new();
-    let project = locusfs_plugin_project::register(&graph).await?;
-    let dbus = locusfs_plugin_dbus::register(&graph).await?;
-    let niri = locusfs_plugin_niri::register(&graph).await?;
-    Ok((
-        graph,
-        PluginHandles {
-            _dbus: dbus,
-            _niri: niri,
-            _project: project,
-        },
-    ))
+    let plugins = PluginManager::load_enabled(config, graph.clone()).await?;
+    Ok((graph, plugins))
 }
 
-async fn wait_for_shutdown() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_shutdown() -> std::result::Result<(), AppError> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

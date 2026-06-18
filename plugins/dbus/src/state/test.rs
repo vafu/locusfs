@@ -114,6 +114,55 @@ fn service_snapshot_exposes_objects_and_relations() {
 }
 
 #[test]
+fn object_node_ids_round_trip_for_paths_outside_object_manager() {
+    let mut state = test_state();
+    let object = object_snapshot(
+        "power",
+        "/org/other/Device0",
+        BTreeMap::from([(
+            "org.example.Device".to_string(),
+            BTreeMap::from([(
+                "Name".to_string(),
+                LocusValue::String("outside".to_string()),
+            )]),
+        )]),
+    );
+    state
+        .set_service_snapshot(
+            "power",
+            Some(":1.42".to_string()),
+            BTreeMap::from([(object.path.clone(), object.clone())]),
+        )
+        .expect("snapshot update succeeds");
+
+    let object_node = NodeId::new(
+        NodeKind::new(DBUS_OBJECT_KIND).unwrap(),
+        "power:/org/other/Device0",
+    )
+    .unwrap();
+
+    assert_eq!(
+        state
+            .nodes(&NodeKind::new(DBUS_OBJECT_KIND).unwrap())
+            .unwrap(),
+        vec![object_node.clone()]
+    );
+    assert!(state.contains_node(&object_node).unwrap());
+    assert_eq!(
+        state
+            .property(&object_node, &PropertyKey::new("path").unwrap())
+            .unwrap(),
+        LocusValue::String("/org/other/Device0".to_string())
+    );
+    assert_eq!(
+        state
+            .property(&object_node, &PropertyKey::new("Name").unwrap())
+            .unwrap(),
+        LocusValue::String("outside".to_string())
+    );
+}
+
+#[test]
 fn rejects_unconfigured_service_nodes() {
     let state = test_state();
     let node = NodeId::new(

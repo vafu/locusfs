@@ -130,10 +130,9 @@ impl DynamicGraph {
         P: NodeProvider,
     {
         let kind = provider.kind().clone();
-        self.write_providers()
-            .await
-            .nodes
-            .insert(kind, Arc::new(provider));
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.nodes, "node provider", &kind)?;
+        providers.nodes.insert(kind, Arc::new(provider));
         Ok(())
     }
 
@@ -145,10 +144,9 @@ impl DynamicGraph {
     where
         P: NodeMutationProvider,
     {
-        self.write_providers()
-            .await
-            .node_mutations
-            .insert(kind, Arc::new(provider));
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.node_mutations, "node mutation provider", &kind)?;
+        providers.node_mutations.insert(kind, Arc::new(provider));
         Ok(())
     }
 
@@ -156,10 +154,9 @@ impl DynamicGraph {
     where
         P: PropertyProvider,
     {
-        self.write_providers()
-            .await
-            .properties
-            .insert(kind, Arc::new(provider));
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.properties, "property provider", &kind)?;
+        providers.properties.insert(kind, Arc::new(provider));
         Ok(())
     }
 
@@ -171,8 +168,13 @@ impl DynamicGraph {
     where
         P: PropertyMutationProvider,
     {
-        self.write_providers()
-            .await
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(
+            &providers.property_mutations,
+            "property mutation provider",
+            &kind,
+        )?;
+        providers
             .property_mutations
             .insert(kind, Arc::new(provider));
         Ok(())
@@ -182,10 +184,9 @@ impl DynamicGraph {
     where
         P: RelationProvider,
     {
-        self.write_providers()
-            .await
-            .relations
-            .insert(kind, Arc::new(provider));
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.relations, "relation provider", &kind)?;
+        providers.relations.insert(kind, Arc::new(provider));
         Ok(())
     }
 
@@ -197,8 +198,13 @@ impl DynamicGraph {
     where
         P: RelationMutationProvider,
     {
-        self.write_providers()
-            .await
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(
+            &providers.relation_mutations,
+            "relation mutation provider",
+            &kind,
+        )?;
+        providers
             .relation_mutations
             .insert(kind, Arc::new(provider));
         Ok(())
@@ -208,10 +214,9 @@ impl DynamicGraph {
     where
         P: WatchProvider,
     {
-        self.write_providers()
-            .await
-            .watches
-            .insert(kind, Arc::new(provider));
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.watches, "watch provider", &kind)?;
+        providers.watches.insert(kind, Arc::new(provider));
         Ok(())
     }
 
@@ -228,7 +233,10 @@ impl DynamicGraph {
     ) -> Option<Arc<dyn WatchProvider>> {
         let kind = match target {
             GraphWatchTarget::Kind(kind) => kind,
-            GraphWatchTarget::Node(node) | GraphWatchTarget::Property(node, _) => node.kind(),
+            GraphWatchTarget::Node(node)
+            | GraphWatchTarget::NodeChild(node, _)
+            | GraphWatchTarget::Property(node, _)
+            | GraphWatchTarget::Relation(node, _) => node.kind(),
         };
         self.read_providers().await.watches.get(kind).cloned()
     }
@@ -350,6 +358,9 @@ impl DynamicGraph {
                 name: node.to_string(),
             });
         }
+        for change in self.remove_overlay_outbound_links(node).await {
+            self.emit_global_change(change)?;
+        }
         self.remove_inbound_links(node).await?;
         self.node_mutation_provider_for_node(node)
             .await?
@@ -427,14 +438,23 @@ impl DynamicGraph {
         key: &PropertyKey,
         value: LocusValue,
     ) -> Result<()> {
+        let existed = self.property_spec(subject, key).await.is_ok();
         self.property_mutation_provider_for_node(subject)
             .await?
             .set_property(subject, key, value)
             .await?;
-        self.emit_global_change(GraphChange::PropertyChanged {
-            node: subject.clone(),
-            key: key.clone(),
-        })
+        let change = if existed {
+            GraphChange::PropertyChanged {
+                node: subject.clone(),
+                key: key.clone(),
+            }
+        } else {
+            GraphChange::PropertyAdded {
+                node: subject.clone(),
+                key: key.clone(),
+            }
+        };
+        self.emit_global_change(change)
     }
 
     pub async fn remove_property(&self, subject: &NodeId, key: &PropertyKey) -> Result<()> {
@@ -442,7 +462,7 @@ impl DynamicGraph {
             .await?
             .remove_property(subject, key)
             .await?;
-        self.emit_global_change(GraphChange::PropertyChanged {
+        self.emit_global_change(GraphChange::PropertyRemoved {
             node: subject.clone(),
             key: key.clone(),
         })
@@ -505,6 +525,7 @@ impl DynamicGraph {
                 name: target.to_string(),
             });
         }
+        let before = self.targets(source, relation).await.unwrap_or_default();
         match self.relation_mutation_provider_for_node(source).await {
             Ok(provider) => match provider.set_link(source, relation, target).await {
                 Ok(()) => {}
@@ -518,10 +539,13 @@ impl DynamicGraph {
             }
             Err(error) => return Err(error),
         }
-        self.emit_global_change(GraphChange::RelationChanged {
-            source: source.clone(),
-            relation: relation.clone(),
-        })
+        let after = self.targets(source, relation).await.unwrap_or_default();
+        self.emit_global_change(relation_lifecycle_change(
+            source.clone(),
+            relation.clone(),
+            before,
+            after,
+        ))
     }
 
     pub async fn remove_link(
@@ -530,27 +554,34 @@ impl DynamicGraph {
         relation: &RelationName,
         target: &NodeId,
     ) -> Result<()> {
+        let before = self.targets(source, relation).await.unwrap_or_default();
         if self.remove_overlay_link(source, relation, target).await {
-            self.emit_global_change(GraphChange::RelationChanged {
-                source: source.clone(),
-                relation: relation.clone(),
-            })?;
+            let after = self.targets(source, relation).await.unwrap_or_default();
+            self.emit_global_change(relation_lifecycle_change(
+                source.clone(),
+                relation.clone(),
+                before,
+                after,
+            ))?;
             return Ok(());
         }
         self.relation_mutation_provider_for_node(source)
             .await?
             .remove_link(source, relation, target)
             .await?;
-        self.emit_global_change(GraphChange::RelationChanged {
-            source: source.clone(),
-            relation: relation.clone(),
-        })
+        let after = self.targets(source, relation).await.unwrap_or_default();
+        self.emit_global_change(relation_lifecycle_change(
+            source.clone(),
+            relation.clone(),
+            before,
+            after,
+        ))
     }
 
     async fn remove_inbound_links(&self, target: &NodeId) -> Result<()> {
         let overlay_changes = self.remove_overlay_inbound_links(target).await;
-        for (source, relation) in overlay_changes {
-            self.emit_global_change(GraphChange::RelationChanged { source, relation })?;
+        for change in overlay_changes {
+            self.emit_global_change(change)?;
         }
 
         let (node_providers, relation_providers, relation_mutations) = {
@@ -588,10 +619,18 @@ impl DynamicGraph {
                             .await
                         {
                             Ok(()) => {
-                                self.emit_global_change(GraphChange::RelationChanged {
-                                    source: source.clone(),
-                                    relation: relation.clone(),
-                                })?;
+                                let after =
+                                    match relation_provider.targets(&source, &relation).await {
+                                        Ok(targets) => targets,
+                                        Err(GraphError::NotFound { .. }) => Vec::new(),
+                                        Err(error) => return Err(error),
+                                    };
+                                self.emit_global_change(relation_lifecycle_change(
+                                    source.clone(),
+                                    relation.clone(),
+                                    targets,
+                                    after,
+                                ))?;
                             }
                             Err(GraphError::NotFound { .. }) => {}
                             Err(error) => return Err(error),
@@ -658,7 +697,7 @@ impl DynamicGraph {
         removed
     }
 
-    async fn remove_overlay_inbound_links(&self, target: &NodeId) -> Vec<(NodeId, RelationName)> {
+    async fn remove_overlay_inbound_links(&self, target: &NodeId) -> Vec<GraphChange> {
         let mut overlay = self.overlay.write().await;
         let mut changed = Vec::new();
         let mut empty_sources = Vec::new();
@@ -666,7 +705,17 @@ impl DynamicGraph {
             let mut empty_relations = Vec::new();
             for (relation, targets) in relations.iter_mut() {
                 if targets.remove(target) {
-                    changed.push((source.clone(), relation.clone()));
+                    if targets.is_empty() {
+                        changed.push(GraphChange::RelationRemoved {
+                            source: source.clone(),
+                            relation: relation.clone(),
+                        });
+                    } else {
+                        changed.push(GraphChange::RelationChanged {
+                            source: source.clone(),
+                            relation: relation.clone(),
+                        });
+                    }
                 }
                 if targets.is_empty() {
                     empty_relations.push(relation.clone());
@@ -683,6 +732,23 @@ impl DynamicGraph {
             overlay.links.remove(&source);
         }
         changed
+    }
+
+    async fn remove_overlay_outbound_links(&self, source: &NodeId) -> Vec<GraphChange> {
+        let mut overlay = self.overlay.write().await;
+        overlay
+            .links
+            .remove(source)
+            .map(|relations| {
+                relations
+                    .into_keys()
+                    .map(|relation| GraphChange::RelationRemoved {
+                        source: source.clone(),
+                        relation,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -739,16 +805,151 @@ fn watch_event_for_change(
         {
             Some(GraphWatchEvent::NodeRemoved(node))
         }
+        (GraphWatchTarget::Node(watched), GraphChange::PropertyAdded { node, key })
+            if &node == watched =>
+        {
+            Some(GraphWatchEvent::PropertyAdded(node, key))
+        }
+        (GraphWatchTarget::Node(watched), GraphChange::PropertyChanged { node, key })
+            if &node == watched =>
+        {
+            Some(GraphWatchEvent::PropertyChanged(node, key))
+        }
+        (GraphWatchTarget::Node(watched), GraphChange::PropertyRemoved { node, key })
+            if &node == watched =>
+        {
+            Some(GraphWatchEvent::PropertyRemoved(node, key))
+        }
+        (GraphWatchTarget::Node(watched), GraphChange::RelationAdded { source, relation })
+            if &source == watched =>
+        {
+            Some(GraphWatchEvent::RelationAdded(source, relation))
+        }
+        (GraphWatchTarget::Node(watched), GraphChange::RelationChanged { source, relation })
+            if &source == watched =>
+        {
+            Some(GraphWatchEvent::RelationChanged(source, relation))
+        }
+        (GraphWatchTarget::Node(watched), GraphChange::RelationRemoved { source, relation })
+            if &source == watched =>
+        {
+            Some(GraphWatchEvent::RelationRemoved(source, relation))
+        }
+        (GraphWatchTarget::NodeChild(watched, name), GraphChange::PropertyAdded { node, key })
+            if &node == watched && key.as_str() == name =>
+        {
+            Some(GraphWatchEvent::PropertyAdded(node, key))
+        }
+        (
+            GraphWatchTarget::NodeChild(watched, name),
+            GraphChange::PropertyChanged { node, key },
+        ) if &node == watched && key.as_str() == name => {
+            Some(GraphWatchEvent::PropertyChanged(node, key))
+        }
+        (
+            GraphWatchTarget::NodeChild(watched, name),
+            GraphChange::PropertyRemoved { node, key },
+        ) if &node == watched && key.as_str() == name => {
+            Some(GraphWatchEvent::PropertyRemoved(node, key))
+        }
+        (
+            GraphWatchTarget::NodeChild(watched, name),
+            GraphChange::RelationAdded { source, relation },
+        ) if &source == watched && relation.as_str() == name => {
+            Some(GraphWatchEvent::RelationAdded(source, relation))
+        }
+        (
+            GraphWatchTarget::NodeChild(watched, name),
+            GraphChange::RelationChanged { source, relation },
+        ) if &source == watched && relation.as_str() == name => {
+            Some(GraphWatchEvent::RelationChanged(source, relation))
+        }
+        (
+            GraphWatchTarget::NodeChild(watched, name),
+            GraphChange::RelationRemoved { source, relation },
+        ) if &source == watched && relation.as_str() == name => {
+            Some(GraphWatchEvent::RelationRemoved(source, relation))
+        }
+        (GraphWatchTarget::NodeChild(watched, _), GraphChange::NodeRemoved { node })
+            if &node == watched =>
+        {
+            Some(GraphWatchEvent::Change)
+        }
         (
             GraphWatchTarget::Property(watched, key),
             GraphChange::PropertyChanged { node, key: changed },
-        ) if &node == watched && &changed == key => Some(GraphWatchEvent::Change),
+        ) if &node == watched && &changed == key => {
+            Some(GraphWatchEvent::PropertyChanged(node, changed))
+        }
+        (
+            GraphWatchTarget::Property(watched, key),
+            GraphChange::PropertyAdded { node, key: changed },
+        ) if &node == watched && &changed == key => {
+            Some(GraphWatchEvent::PropertyAdded(node, changed))
+        }
+        (
+            GraphWatchTarget::Property(watched, key),
+            GraphChange::PropertyRemoved { node, key: changed },
+        ) if &node == watched && &changed == key => {
+            Some(GraphWatchEvent::PropertyRemoved(node, changed))
+        }
         (GraphWatchTarget::Property(watched, _), GraphChange::NodeRemoved { node })
             if &node == watched =>
         {
             Some(GraphWatchEvent::Change)
         }
+        (
+            GraphWatchTarget::Relation(watched, watched_relation),
+            GraphChange::RelationAdded { source, relation },
+        ) if &source == watched && &relation == watched_relation => {
+            Some(GraphWatchEvent::RelationAdded(source, relation))
+        }
+        (
+            GraphWatchTarget::Relation(watched, watched_relation),
+            GraphChange::RelationChanged { source, relation },
+        ) if &source == watched && &relation == watched_relation => {
+            Some(GraphWatchEvent::RelationChanged(source, relation))
+        }
+        (
+            GraphWatchTarget::Relation(watched, watched_relation),
+            GraphChange::RelationRemoved { source, relation },
+        ) if &source == watched && &relation == watched_relation => {
+            Some(GraphWatchEvent::RelationRemoved(source, relation))
+        }
+        (GraphWatchTarget::Relation(watched, _), GraphChange::NodeRemoved { node })
+            if &node == watched =>
+        {
+            Some(GraphWatchEvent::Change)
+        }
         _ => None,
+    }
+}
+
+fn relation_lifecycle_change(
+    source: NodeId,
+    relation: RelationName,
+    before: Vec<NodeId>,
+    after: Vec<NodeId>,
+) -> GraphChange {
+    match (before.is_empty(), after.is_empty()) {
+        (true, false) => GraphChange::RelationAdded { source, relation },
+        (false, true) => GraphChange::RelationRemoved { source, relation },
+        _ => GraphChange::RelationChanged { source, relation },
+    }
+}
+
+fn ensure_provider_slot_empty<T>(
+    providers: &BTreeMap<NodeKind, T>,
+    capability: &'static str,
+    kind: &NodeKind,
+) -> Result<()> {
+    if providers.contains_key(kind) {
+        Err(GraphError::AlreadyExists {
+            kind: capability,
+            name: kind.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 

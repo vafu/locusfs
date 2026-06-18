@@ -1,92 +1,94 @@
-//! D-Bus graph provider for `locusfs`.
+//! PipeWire graph provider for `locusfs`.
 
 pub mod config;
 mod provider;
 mod runtime;
 mod state;
 
-pub use provider::DbusProvider;
+pub use provider::PipeWireProvider;
 
 use async_trait::async_trait;
 use locusfs_graph::{DynamicGraph, GraphError, NodeKind, Result, TracedProvider};
 use locusfs_plugin_api::{LocusFsPlugin, PluginContext, PluginHandle, PluginManifest};
 use tokio::task::JoinHandle;
 
-use crate::config::DbusConfig;
-use crate::runtime::DbusRuntime;
+use crate::config::PipeWireConfig;
+use crate::runtime::PipeWireRuntime;
 
-pub const DBUS_SERVICE_KIND: &str = "dbus-service";
-pub const DBUS_OBJECT_KIND: &str = "dbus-object";
+pub const PIPEWIRE_KIND: &str = "pipewire";
+pub const PIPEWIRE_SINK_KIND: &str = "pipewire-sink";
+pub const PIPEWIRE_SOURCE_KIND: &str = "pipewire-source";
 
-const PROVIDER_NAME: &str = "dbus";
+const PROVIDER_NAME: &str = "pipewire";
+const PROVIDER_KINDS: &[&str] = &[PIPEWIRE_KIND, PIPEWIRE_SINK_KIND, PIPEWIRE_SOURCE_KIND];
 
 #[derive(Debug, Default)]
-pub struct DbusPlugin;
+pub struct PipeWirePlugin;
 
-/// Registers read-only D-Bus service providers on the graph.
 #[derive(Debug)]
-pub struct DbusPluginHandle {
-    _watchers: Vec<JoinHandle<()>>,
+pub struct PipeWirePluginHandle {
+    event_stream: Option<JoinHandle<()>>,
 }
 
-impl Drop for DbusPluginHandle {
+impl Drop for PipeWirePluginHandle {
     fn drop(&mut self) {
-        for watcher in &self._watchers {
-            watcher.abort();
+        if let Some(event_stream) = &self.event_stream {
+            event_stream.abort();
         }
     }
 }
 
 #[async_trait]
-impl PluginHandle for DbusPluginHandle {
+impl PluginHandle for PipeWirePluginHandle {
     async fn shutdown(mut self: Box<Self>) {
-        for watcher in self._watchers.drain(..) {
-            watcher.abort();
-            let _ = watcher.await;
+        if let Some(event_stream) = self.event_stream.take() {
+            event_stream.abort();
+            let _ = event_stream.await;
         }
     }
 }
 
-pub async fn register(graph: &DynamicGraph) -> Result<DbusPluginHandle> {
-    register_with_config(graph, DbusConfig::default()).await
+pub async fn register(graph: &DynamicGraph) -> Result<PipeWirePluginHandle> {
+    register_with_config(graph, PipeWireConfig::default()).await
 }
 
 pub async fn register_with_config(
     graph: &DynamicGraph,
-    config: DbusConfig,
-) -> Result<DbusPluginHandle> {
+    config: PipeWireConfig,
+) -> Result<PipeWirePluginHandle> {
     let runtime = tokio::runtime::Handle::current();
     register_with_config_and_runtime(graph, config, runtime).await
 }
 
 async fn register_with_config_and_runtime(
     graph: &DynamicGraph,
-    config: DbusConfig,
+    config: PipeWireConfig,
     runtime: tokio::runtime::Handle,
-) -> Result<DbusPluginHandle> {
-    let (state, watchers) = DbusRuntime::start(graph.clone(), config, runtime)?;
-    for kind_name in [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND] {
-        let kind = NodeKind::new(kind_name)?;
-        let provider = DbusProvider::new(kind.clone(), state.clone());
-        let provider = TracedProvider::new(PROVIDER_NAME, provider);
+) -> Result<PipeWirePluginHandle> {
+    let (state, event_stream) = PipeWireRuntime::start(graph.clone(), config, runtime);
 
+    for kind in PROVIDER_KINDS {
+        let kind = NodeKind::new(*kind)?;
+        let provider = PipeWireProvider::new(kind.clone(), state.clone());
+        let provider = TracedProvider::new(PROVIDER_NAME, provider);
         graph.register_node_provider(provider.clone()).await?;
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
         graph.register_relation_provider(kind, provider).await?;
     }
-    Ok(DbusPluginHandle {
-        _watchers: watchers,
+
+    Ok(PipeWirePluginHandle {
+        event_stream: Some(event_stream),
     })
 }
 
 #[async_trait]
-impl LocusFsPlugin for DbusPlugin {
+impl LocusFsPlugin for PipeWirePlugin {
     fn manifest(&self) -> PluginManifest {
         PluginManifest {
-            id: "dbus",
-            name: "D-Bus",
+            id: "pipewire",
+            name: "PipeWire",
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -96,7 +98,7 @@ impl LocusFsPlugin for DbusPlugin {
         context: PluginContext,
         config: toml::Value,
     ) -> Result<Box<dyn PluginHandle>> {
-        let config = DbusConfig::from_value(config)?;
+        let config = PipeWireConfig::from_value(config)?;
         Ok(Box::new(
             register_with_config_and_runtime(&context.graph, config, context.runtime).await?,
         ))
@@ -106,12 +108,12 @@ impl LocusFsPlugin for DbusPlugin {
 #[allow(improper_ctypes_definitions)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _locusfs_plugin_init() -> *mut dyn LocusFsPlugin {
-    Box::into_raw(Box::new(DbusPlugin))
+    Box::into_raw(Box::new(PipeWirePlugin))
 }
 
 fn config_error(error: toml::de::Error) -> GraphError {
     GraphError::InvalidValue {
-        kind: "dbus plugin config",
+        kind: "pipewire plugin config",
         value: error.to_string(),
         reason: "invalid TOML shape",
     }

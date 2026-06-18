@@ -18,7 +18,23 @@ pub enum GraphChange {
         node: NodeId,
         key: PropertyKey,
     },
+    PropertyAdded {
+        node: NodeId,
+        key: PropertyKey,
+    },
+    PropertyRemoved {
+        node: NodeId,
+        key: PropertyKey,
+    },
     RelationChanged {
+        source: NodeId,
+        relation: RelationName,
+    },
+    RelationAdded {
+        source: NodeId,
+        relation: RelationName,
+    },
+    RelationRemoved {
         source: NodeId,
         relation: RelationName,
     },

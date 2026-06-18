@@ -18,6 +18,7 @@ pub enum FuseError {
 pub(crate) fn graph_error_to_errno(error: GraphError) -> Errno {
     match error {
         GraphError::NotFound { .. } => errno(libc::ENOENT),
+        GraphError::AlreadyExists { .. } => errno(libc::EEXIST),
         GraphError::InvalidIdentifier { .. }
         | GraphError::InvalidPathSegment { .. }
         | GraphError::InvalidEncoding { .. }

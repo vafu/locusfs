@@ -4,12 +4,15 @@ use std::io;
 use std::sync::Arc;
 
 use locusfs_graph::{DynamicGraph, GraphError, Result};
+use locusfs_plugin_api::enter_runtime;
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{Event, Output, Reply, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 
 use crate::state::NiriState;
 
@@ -19,49 +22,90 @@ pub type SharedNiriState = Arc<RwLock<NiriState>>;
 pub struct IpcNiriClient;
 
 impl IpcNiriClient {
-    pub async fn start(graph: DynamicGraph) -> Result<(SharedNiriState, JoinHandle<()>)> {
+    pub async fn start(
+        graph: DynamicGraph,
+        runtime: Handle,
+    ) -> Result<(SharedNiriState, JoinHandle<()>)> {
         let mut socket = AsyncNiriSocket::connect().await?;
         let outputs = request_outputs(&mut socket).await?;
         let state = Arc::new(RwLock::new(NiriState::new(outputs)));
-        let event_stream = spawn_event_stream(state.clone(), graph).await?;
+        let event_stream = spawn_event_stream(state.clone(), graph, runtime).await?;
 
         Ok((state, event_stream))
     }
 }
 
-async fn spawn_event_stream(state: SharedNiriState, graph: DynamicGraph) -> Result<JoinHandle<()>> {
+async fn spawn_event_stream(
+    state: SharedNiriState,
+    graph: DynamicGraph,
+    runtime: Handle,
+) -> Result<JoinHandle<()>> {
+    let socket = connect_event_stream().await?;
+
+    let task_runtime = runtime.clone();
+    Ok(runtime.spawn(enter_runtime(task_runtime, async move {
+        let mut socket = socket;
+        loop {
+            read_event_stream(&mut socket, &state, &graph).await;
+            sleep_retry().await;
+            loop {
+                match connect_event_stream().await {
+                    Ok(next_socket) => {
+                        socket = next_socket;
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("locusfs-niri: failed to reconnect event stream: {error}");
+                        sleep_retry().await;
+                    }
+                }
+            }
+        }
+    })))
+}
+
+async fn connect_event_stream() -> Result<AsyncNiriSocket> {
     let mut socket = AsyncNiriSocket::connect().await?;
     match socket.send(Request::EventStream).await? {
         Response::Handled => {}
         response => return Err(unexpected_response("event stream", response)),
     }
     socket.shutdown_write().await?;
+    Ok(socket)
+}
 
-    Ok(tokio::spawn(async move {
-        loop {
-            match socket.read_event().await {
-                Ok(event) => {
-                    let mut state = state.write().await;
-                    match state.apply_event(event) {
-                        Ok(changes) => {
-                            for change in changes {
-                                if let Err(error) = graph.emit_global_change(change) {
-                                    eprintln!("locusfs-niri: failed to emit graph change: {error}");
-                                }
+async fn read_event_stream(
+    socket: &mut AsyncNiriSocket,
+    state: &SharedNiriState,
+    graph: &DynamicGraph,
+) {
+    loop {
+        match socket.read_event().await {
+            Ok(event) => {
+                let mut state = state.write().await;
+                match state.apply_event(event) {
+                    Ok(changes) => {
+                        for change in changes {
+                            if let Err(error) = graph.emit_global_change(change) {
+                                eprintln!("locusfs-niri: failed to emit graph change: {error}");
                             }
                         }
-                        Err(error) => {
-                            eprintln!("locusfs-niri: failed to apply event: {error}");
-                        }
+                    }
+                    Err(error) => {
+                        eprintln!("locusfs-niri: failed to apply event: {error}");
                     }
                 }
-                Err(error) => {
-                    eprintln!("locusfs-niri: failed to read event stream: {error}");
-                    break;
-                }
+            }
+            Err(error) => {
+                eprintln!("locusfs-niri: failed to read event stream: {error}");
+                break;
             }
         }
-    }))
+    }
+}
+
+async fn sleep_retry() {
+    sleep(Duration::from_secs(1)).await;
 }
 
 async fn request_outputs(socket: &mut AsyncNiriSocket) -> Result<HashMap<String, Output>> {

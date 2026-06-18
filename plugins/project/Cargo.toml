@@ -3,5 +3,12 @@ name = "locusfs-plugin-project"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
+async-trait = { workspace = true }
 locusfs-graph = { path = "../../locusfs-graph" }
+locusfs-plugin-api = { path = "../../locusfs-plugin-api" }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }

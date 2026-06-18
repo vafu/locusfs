@@ -115,6 +115,11 @@ impl InodeTable {
         }
     }
 
+    #[cfg(test)]
+    pub fn times_len(&self) -> usize {
+        self.times.len()
+    }
+
     fn insert(&mut self, ino: u64, entry: FsEntry) {
         self.by_entry.insert(entry.clone(), ino);
         self.by_ino.insert(ino, InodeEntry { entry, lookups: 0 });
@@ -123,6 +128,7 @@ impl InodeTable {
     fn remove_inode(&mut self, ino: u64) {
         if let Some(record) = self.by_ino.remove(&ino) {
             self.by_entry.remove(&record.entry);
+            self.times.remove(&record.entry);
         }
     }
 }

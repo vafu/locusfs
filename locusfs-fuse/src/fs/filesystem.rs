@@ -859,7 +859,7 @@ impl LocusFs {
                 let graph_watch = if target.dependencies.is_empty() {
                     Some(
                         self.graph
-                            .watch((&target.subject).into())
+                            .watch(target.subject.clone())
                             .await
                             .map_err(graph_error_to_errno)?,
                     )

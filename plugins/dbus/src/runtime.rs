@@ -2,13 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt;
 use locusfs_graph::{DynamicGraph, GraphChange, GraphError, Result};
+use locusfs_plugin_api::enter_runtime;
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 use zbus::fdo::{DBusProxy, IntrospectableProxy, ObjectManagerProxy, PropertiesProxy};
 use zbus::names::{BusName, InterfaceName};
 
 use crate::state::{
     BusKind, ObjectSnapshot, ServiceConfig, SharedDbusState, convert_managed_interfaces,
-    default_service_configs, object_snapshot_from_managed,
+    object_snapshot_from_managed,
 };
 use crate::{DBUS_OBJECT_KIND, DBUS_SERVICE_KIND};
 
@@ -16,12 +19,18 @@ use crate::{DBUS_OBJECT_KIND, DBUS_SERVICE_KIND};
 pub struct DbusRuntime;
 
 impl DbusRuntime {
-    pub fn start(graph: DynamicGraph) -> Result<(SharedDbusState, Vec<JoinHandle<()>>)> {
-        let configs = default_service_configs();
+    pub fn start(
+        graph: DynamicGraph,
+        config: crate::config::DbusConfig,
+        runtime: Handle,
+    ) -> Result<(SharedDbusState, Vec<JoinHandle<()>>)> {
+        let configs = config.into_runtime_services()?;
         let state = crate::state::DbusState::shared(configs.clone());
         let watchers = configs
             .into_iter()
-            .map(|config| spawn_service_watcher(config, state.clone(), graph.clone()))
+            .map(|config| {
+                spawn_service_watcher(config, state.clone(), graph.clone(), runtime.clone())
+            })
             .collect();
         Ok((state, watchers))
     }
@@ -31,15 +40,20 @@ fn spawn_service_watcher(
     config: ServiceConfig,
     state: SharedDbusState,
     graph: DynamicGraph,
+    runtime: Handle,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = watch_service(config.clone(), state, graph).await {
-            eprintln!(
-                "locusfs-dbus: service watcher for {} stopped: {error}",
-                config.name
-            );
+    let task_runtime = runtime.clone();
+    runtime.spawn(enter_runtime(task_runtime, async move {
+        loop {
+            if let Err(error) = watch_service(config.clone(), state.clone(), graph.clone()).await {
+                eprintln!(
+                    "locusfs-dbus: service watcher for {} stopped: {error}",
+                    config.name
+                );
+            }
+            sleep_retry().await;
         }
-    })
+    }))
 }
 
 async fn watch_service(
@@ -51,6 +65,9 @@ async fn watch_service(
         BusKind::System => zbus::Connection::system()
             .await
             .map_err(|error| GraphError::Io(format!("connect to system D-Bus: {error}")))?,
+        BusKind::Session => zbus::Connection::session()
+            .await
+            .map_err(|error| GraphError::Io(format!("connect to session D-Bus: {error}")))?,
     };
     let dbus = DBusProxy::new(&connection)
         .await
@@ -93,9 +110,7 @@ async fn snapshot_service(
 ) -> Result<ServiceRuntimeSnapshot> {
     let owner = current_owner(dbus, &config.name).await?;
     let objects = if owner.is_some() {
-        managed_objects(connection, config)
-            .await
-            .unwrap_or_default()
+        managed_objects(connection, config).await?
     } else {
         BTreeMap::new()
     };
@@ -127,18 +142,36 @@ async fn managed_objects(
     connection: &zbus::Connection,
     config: &ServiceConfig,
 ) -> Result<BTreeMap<String, ObjectSnapshot>> {
-    let objects = match managed_objects_at(connection, config, &config.object_manager_path).await {
-        Ok(objects) => objects,
-        Err(_) if config.object_manager_path != "/" => managed_objects_at(connection, config, "/")
-            .await
-            .unwrap_or_default(),
-        Err(_) => BTreeMap::new(),
-    };
-    if objects.is_empty() {
-        introspected_objects(connection, config).await
-    } else {
-        Ok(objects)
+    let mut errors = Vec::new();
+    match managed_objects_at(connection, config, &config.object_manager_path).await {
+        Ok(objects) if !objects.is_empty() => return Ok(objects),
+        Ok(_) => {}
+        Err(error) => errors.push(error.to_string()),
     }
+
+    if config.object_manager_path != "/" {
+        match managed_objects_at(connection, config, "/").await {
+            Ok(objects) if !objects.is_empty() => return Ok(objects),
+            Ok(_) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    match introspected_objects(connection, config).await {
+        Ok(objects) => Ok(objects),
+        Err(error) => {
+            errors.push(error.to_string());
+            Err(GraphError::Io(format!(
+                "snapshot D-Bus objects for {} failed: {}",
+                config.name,
+                errors.join("; ")
+            )))
+        }
+    }
+}
+
+async fn sleep_retry() {
+    sleep(Duration::from_secs(1)).await;
 }
 
 async fn managed_objects_at(
@@ -391,7 +424,8 @@ mod test {
     use zbus::fdo::DBusProxy;
 
     use super::current_owner;
-    use crate::register;
+    use crate::config::{DbusConfig, ServiceConfig};
+    use crate::register_with_config;
     use crate::state::service_node;
 
     #[tokio::test]
@@ -406,7 +440,19 @@ mod test {
         };
 
         let graph = DynamicGraph::new();
-        let _plugin = register(&graph).await.expect("dbus plugin registers");
+        let _plugin = register_with_config(
+            &graph,
+            DbusConfig {
+                services: vec![ServiceConfig {
+                    name: service_name.to_string(),
+                    bus: crate::config::BusKind::System,
+                    local_id: Some("upower".to_string()),
+                    object_manager_path: None,
+                }],
+            },
+        )
+        .await
+        .expect("dbus plugin registers");
         let node = service_node("upower").expect("service node id is valid");
         let active = PropertyKey::new("active").expect("active property key is valid");
         let expected = LocusValue::Bool(expected_owner.is_some());
