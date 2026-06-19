@@ -564,8 +564,10 @@ impl Filesystem for LocusFs {
                 slice_for_read(&data, offset, size).to_vec()
             }
             FsEntry::WatchFile => {
-                let data = self.watch.lock().await.read_watch(FileHandle(fh))?;
-                slice_for_read(&data, 0, size).to_vec()
+                self.watch
+                    .lock()
+                    .await
+                    .read_watch_chunk(FileHandle(fh), offset, size)?
             }
             FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => {
                 return Err(errno(libc::EINVAL));
@@ -641,6 +643,9 @@ impl Filesystem for LocusFs {
         set_attr: SetAttr,
     ) -> fuse3::Result<ReplyAttr> {
         if matches!(set_attr.size, Some(0)) {
+            if let FsEntry::PropertyFile(node, key) = self.entry(inode).await? {
+                self.truncate_property(&node, &key).await?;
+            }
             self.attr_reply(inode).await
         } else {
             Err(errno(libc::ENOSYS))
@@ -824,6 +829,27 @@ impl Filesystem for LocusFs {
 }
 
 impl LocusFs {
+    pub(super) async fn truncate_property(
+        &self,
+        node: &NodeId,
+        key: &PropertyKey,
+    ) -> std::result::Result<(), Errno> {
+        let spec = property_spec_or_new_string(&self.graph, node, key).await?;
+        if !spec.is_writable() {
+            return Err(errno(libc::EACCES));
+        }
+        let value =
+            parse_property_write(spec.kind(), String::new()).map_err(graph_error_to_errno)?;
+        self.graph
+            .set_property(node, key, value)
+            .await
+            .map_err(graph_error_to_errno)?;
+        self.touch_entry(&FsEntry::PropertyFile(node.clone(), key.clone()))
+            .await;
+        self.touch_entry(&FsEntry::NodeDir(node.clone())).await;
+        Ok(())
+    }
+
     async fn write_owned(
         &self,
         inode: Inode,
@@ -837,7 +863,8 @@ impl LocusFs {
 
         let written = match self.entry(inode).await? {
             FsEntry::PropertyFile(node, key) => {
-                let input = String::from_utf8(data.clone()).map_err(|_| errno(libc::EINVAL))?;
+                let written = data.len() as u32;
+                let input = String::from_utf8(data).map_err(|_| errno(libc::EINVAL))?;
                 let spec = property_spec_or_new_string(&self.graph, &node, &key).await?;
                 if !spec.is_writable() {
                     return Err(errno(libc::EACCES));
@@ -851,7 +878,7 @@ impl LocusFs {
                 self.touch_entry(&FsEntry::PropertyFile(node.clone(), key.clone()))
                     .await;
                 self.touch_entry(&FsEntry::NodeDir(node)).await;
-                data.len() as u32
+                written
             }
             FsEntry::WatchFile => {
                 let path = parse_watch_subscription(&data)?;

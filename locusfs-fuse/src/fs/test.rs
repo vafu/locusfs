@@ -473,6 +473,41 @@ fn concrete_property_watch_still_reports_property_changes() {
 }
 
 #[test]
+fn watch_registry_buffers_partial_event_reads() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
+            },
+            false,
+        )
+        .unwrap();
+    registry.notify_node_change(&node, WatchChange::NodeChanged(node.clone()));
+
+    assert_eq!(registry.read_watch_chunk(handle, 0, 5).unwrap(), b"node ");
+    assert!(registry.has_unread_change(handle));
+    assert_eq!(
+        registry.read_watch_chunk(handle, 5, 8).unwrap(),
+        b"changed "
+    );
+    assert_eq!(
+        registry.read_watch_chunk(handle, 13, 64).unwrap(),
+        b"node:57\n"
+    );
+    assert!(!registry.has_unread_change(handle));
+    assert!(registry.read_watch(handle).unwrap().is_empty());
+}
+
+#[test]
 fn watch_registry_reports_node_change_event_for_node_subject() {
     let node = test_node("57");
     let mut registry = WatchRegistry::new();
@@ -968,6 +1003,45 @@ async fn graph_watch_forwarding_suppresses_duplicate_global_watch_events() {
 fn read_slicing_respects_offset_and_size() {
     assert_eq!(slice_for_read(b"abcdef", 2, 3), b"cde");
     assert_eq!(slice_for_read(b"abcdef", 9, 3), b"");
+}
+
+#[tokio::test]
+async fn truncate_property_updates_graph_value() {
+    let kind = test_kind();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_mutation_provider(kind, provider)
+        .await
+        .unwrap();
+
+    let node = test_node("57");
+    let key = PropertyKey::new("title").unwrap();
+    graph.create_node(&node).await.unwrap();
+    graph
+        .set_property(&node, &key, LocusValue::String("value".to_string()))
+        .await
+        .unwrap();
+
+    let fs = LocusFs::new(graph.clone());
+    fs.truncate_property(&node, &key).await.unwrap();
+
+    assert_eq!(
+        graph.property(&node, &key).await.unwrap(),
+        LocusValue::String(String::new())
+    );
 }
 
 #[test]

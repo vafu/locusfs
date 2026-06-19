@@ -125,6 +125,7 @@ struct WatchHandle {
     dependencies: Vec<WatchKey>,
     mode: WatchMode,
     uses_graph_watch: bool,
+    pending_read: Option<Vec<u8>>,
     watch_task: Option<JoinHandle<()>>,
     pending_events: VecDeque<WatchMessage>,
     poll_handles: Vec<PollHandle>,
@@ -222,6 +223,7 @@ impl WatchRegistry {
         watch.dependencies = target.dependencies.clone();
         watch.mode = target.mode;
         watch.uses_graph_watch = uses_graph_watch;
+        watch.pending_read = None;
         watch.pending_events.clear();
         self.attach_watch(handle, &target.subject, &target.dependencies);
         Ok(())
@@ -242,18 +244,49 @@ impl WatchRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn read_watch(&mut self, handle: FileHandle) -> std::result::Result<Vec<u8>, Errno> {
+        self.read_watch_chunk(handle, 0, u32::MAX)
+    }
+
+    pub fn read_watch_chunk(
+        &mut self,
+        handle: FileHandle,
+        offset: u64,
+        size: u32,
+    ) -> std::result::Result<Vec<u8>, Errno> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Err(errno(libc::EINVAL));
         };
-        if let Some(message) = watch.pending_events.pop_front() {
+        if offset == 0 {
+            watch.pending_read = None;
+        }
+        if watch.pending_read.is_none() {
+            if offset != 0 {
+                return Ok(Vec::new());
+            }
+            let Some(message) = watch.pending_events.pop_front() else {
+                return Ok(Vec::new());
+            };
             let value = watch_message_bytes(message, watch.resolved_subject.as_ref());
             let path = watch.original_path.as_deref().unwrap_or("<unconfigured>");
             info!("{} >>> {}", path, format_watch_value(&value));
-            Ok(value)
-        } else {
-            Ok(Vec::new())
+            watch.pending_read = Some(value);
         }
+
+        let Some(value) = watch.pending_read.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(value.len());
+        let requested = usize::try_from(size).unwrap_or(usize::MAX);
+        let end = start.saturating_add(requested).min(value.len());
+        let chunk = value[start..end].to_vec();
+        if end >= value.len() {
+            watch.pending_read = None;
+        }
+        Ok(chunk)
     }
 
     pub fn poll(
@@ -706,7 +739,9 @@ impl WatchRegistry {
                 .property_watches
                 .get(key)
                 .is_some_and(|state| state.generation > *seen_generation),
-            OpenFileState::Watch(watch) => !watch.pending_events.is_empty(),
+            OpenFileState::Watch(watch) => {
+                watch.pending_read.is_some() || !watch.pending_events.is_empty()
+            }
         }
     }
 
