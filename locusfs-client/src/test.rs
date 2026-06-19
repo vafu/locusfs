@@ -27,6 +27,17 @@ fn logical_path_rejects_paths_outside_mount() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
+#[test]
+fn logical_path_rejects_parent_dir_escape() {
+    let error = logical_watch_path(
+        Path::new("/tmp/locusfs-run"),
+        Path::new("/tmp/locusfs-run/../outside"),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 #[tokio::test]
 async fn read_timeout_bounds_missing_path_retry() {
     let (watch_file, _peer) = std::os::unix::net::UnixStream::pair().unwrap();

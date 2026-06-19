@@ -2,12 +2,14 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::info;
+
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reads a locusfs path into memory.
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
@@ -77,13 +79,13 @@ pub fn absolute_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 /// Finds the nearest locusfs mount root by walking upward until `/watch` exists.
 pub async fn find_mount_root(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let path = path.as_ref();
-    let ancestors = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
-    for ancestor in ancestors {
-        if tokio::fs::metadata(ancestor.join("watch"))
+    for ancestor in path.ancestors() {
+        let watch = ancestor.join("watch");
+        if tokio::fs::metadata(watch)
             .await
             .is_ok_and(|metadata| metadata.is_file())
         {
-            return Ok(ancestor);
+            return Ok(ancestor.to_path_buf());
         }
     }
     Err(io::Error::new(
@@ -105,6 +107,17 @@ pub fn logical_watch_path(
             format!("{} is not under {}", path.display(), mount_root.display()),
         )
     })?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path escapes mount root: {}", path.display()),
+        ));
+    }
     let relative = relative.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -197,7 +210,9 @@ impl Watch {
 
     /// Reads the current value from the watched data path.
     pub async fn read(&self) -> io::Result<Vec<u8>> {
-        let value = read_retrying(&self.data_path).await?;
+        let value = timeout(DEFAULT_READ_TIMEOUT, read_retrying(&self.data_path))
+            .await
+            .map_err(|_| timed_out("read watched path"))??;
         info!("{} >>> {}", self.logical_path, format_watch_value(&value));
         Ok(value)
     }
@@ -231,7 +246,9 @@ impl Watch {
     pub async fn wait_and_read_timeout(&mut self, duration: Duration) -> io::Result<Vec<u8>> {
         timeout(duration, async {
             self.wait().await?;
-            self.read().await
+            let value = read_retrying(&self.data_path).await?;
+            info!("{} >>> {}", self.logical_path, format_watch_value(&value));
+            Ok(value)
         })
         .await
         .map_err(|_| timed_out("wait for watch event and read watched path"))?

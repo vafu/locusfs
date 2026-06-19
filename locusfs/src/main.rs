@@ -7,7 +7,9 @@ use locusfs::config::Config;
 use locusfs::fuse::{FuseMount, FuseMountConfig, mount};
 use locusfs::graph::DynamicGraph;
 use locusfs::plugin::PluginManager;
+use tracing_subscriber::prelude::*;
 
+mod perfetto;
 mod watch;
 
 type AppError = Box<dyn std::error::Error + Send + Sync>;
@@ -24,7 +26,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> std::result::Result<(), AppError> {
-    init_tracing();
+    let _perfetto_trace = init_tracing();
     let command = parse_command()?;
 
     if let Command::Watch { path } = command {
@@ -34,12 +36,34 @@ async fn run() -> std::result::Result<(), AppError> {
     let Command::Mount { mountpoint, config } = command else {
         unreachable!("all commands are handled above");
     };
-    let created_mountpoint = prepare_mountpoint(&mountpoint).await?;
-    tokio::fs::create_dir_all(&mountpoint).await?;
+    let mountpoint_state = prepare_mountpoint(&mountpoint).await?;
+    if let Err(error) = tokio::fs::create_dir_all(&mountpoint).await {
+        cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
+        return Err(error.into());
+    }
 
-    let config = Config::load(config).await?;
-    let (graph, mut plugins) = default_graph(&config).await?;
-    let mount = mount(FuseMountConfig::new(&mountpoint), graph).await?;
+    let config = match Config::load(config).await {
+        Ok(config) => config,
+        Err(error) => {
+            cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
+            return Err(error.into());
+        }
+    };
+    let (graph, mut plugins) = match default_graph(&config).await {
+        Ok(result) => result,
+        Err(error) => {
+            cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
+            return Err(error);
+        }
+    };
+    let mount = match mount(FuseMountConfig::new(&mountpoint), graph).await {
+        Ok(mount) => mount,
+        Err(error) => {
+            plugins.shutdown().await;
+            cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
+            return Err(error.into());
+        }
+    };
 
     eprintln!("locusfs mounted at {}", mountpoint.display());
     eprintln!("press Ctrl-C to unmount");
@@ -47,9 +71,7 @@ async fn run() -> std::result::Result<(), AppError> {
     let shutdown_result = wait_for_shutdown().await;
     plugins.shutdown().await;
     let unmount_result = unmount_with_fallback(mount, &mountpoint).await;
-    if created_mountpoint {
-        remove_mountpoint_dir(&mountpoint).await?;
-    }
+    cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
 
     shutdown_result?;
     unmount_result?;
@@ -72,15 +94,29 @@ async fn unmount_with_fallback(
     }
 }
 
-async fn prepare_mountpoint(mountpoint: &PathBuf) -> io::Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountpointState {
+    Created,
+    Existing,
+}
+
+async fn prepare_mountpoint(mountpoint: &PathBuf) -> io::Result<MountpointState> {
     match tokio::fs::try_exists(mountpoint).await {
-        Ok(exists) => Ok(!exists),
+        Ok(true) => Ok(MountpointState::Existing),
+        Ok(false) => Ok(MountpointState::Created),
         Err(error) if is_disconnected_fuse_mount(&error) => {
             unmount_stale_mountpoint(mountpoint).await?;
-            Ok(true)
+            Ok(MountpointState::Existing)
         }
         Err(error) => Err(error),
     }
+}
+
+async fn cleanup_mountpoint(mountpoint: &PathBuf, state: MountpointState) -> io::Result<()> {
+    if matches!(state, MountpointState::Created) {
+        remove_mountpoint_dir(mountpoint).await?;
+    }
+    Ok(())
 }
 
 fn is_disconnected_fuse_mount(error: &io::Error) -> bool {
@@ -118,12 +154,52 @@ async fn remove_mountpoint_dir(mountpoint: &PathBuf) -> io::Result<()> {
     }
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(true)
-        .with_thread_names(true)
-        .try_init();
+fn init_tracing() -> Option<perfetto::PerfettoTraceSession> {
+    let perfetto_config = perfetto::PerfettoTraceConfig::from_env();
+    if perfetto_config.is_some() {
+        tracing_perfetto_sdk::init_in_process();
+    }
+
+    let perfetto_layer = perfetto_config
+        .as_ref()
+        .map(|_| tracing_perfetto_sdk::PerfettoLayer::new());
+    let plugin_track_layer = perfetto_config
+        .as_ref()
+        .map(|_| perfetto::PluginTrackLayer::new());
+
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_names(true),
+        )
+        .with(perfetto_layer)
+        .with(plugin_track_layer);
+
+    if let Err(error) = subscriber.try_init() {
+        if perfetto_config.is_some() {
+            eprintln!("locusfs: Perfetto tracing disabled because tracing setup failed: {error}");
+        }
+        return None;
+    }
+
+    perfetto_config.and_then(|config| {
+        let output = config.output().clone();
+        match perfetto::PerfettoTraceSession::start(config) {
+            Ok(session) => {
+                eprintln!("locusfs: recording Perfetto trace to {}", output.display());
+                Some(session)
+            }
+            Err(error) => {
+                eprintln!(
+                    "locusfs: failed to start Perfetto trace {}: {error}",
+                    output.display()
+                );
+                None
+            }
+        }
+    })
 }
 
 enum Command {

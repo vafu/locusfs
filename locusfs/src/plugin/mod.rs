@@ -10,6 +10,7 @@ use crate::config::{Config, PluginConfig, expand_tilde};
 use libloading::{Library, Symbol};
 use locusfs_graph::DynamicGraph;
 use locusfs_plugin_api::{LocusFsPlugin, PluginContext, PluginHandle};
+use tracing::{Instrument, info_span};
 
 type PluginResult<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 #[allow(improper_ctypes_definitions)]
@@ -21,6 +22,7 @@ pub struct PluginManager {
 }
 
 struct LoadedPlugin {
+    id: String,
     handle: Option<Box<dyn PluginHandle>>,
     _plugin: Box<dyn LocusFsPlugin>,
     _library: Library,
@@ -33,7 +35,17 @@ impl PluginManager {
             if !plugin_config.enabled {
                 continue;
             }
-            loaded.push(load_plugin(id, plugin_config, config, graph.clone()).await?);
+            let plugin = match load_plugin(id, plugin_config, config, graph.clone())
+                .instrument(info_span!("plugin.load", plugin = %id))
+                .await
+            {
+                Ok(plugin) => plugin,
+                Err(error) => {
+                    shutdown_loaded(&mut loaded).await;
+                    return Err(error);
+                }
+            };
+            loaded.push(plugin);
         }
         Ok(Self { _loaded: loaded })
     }
@@ -43,9 +55,17 @@ impl PluginManager {
     }
 
     pub async fn shutdown(&mut self) {
-        for plugin in &mut self._loaded {
-            plugin.shutdown().await;
-        }
+        shutdown_loaded(&mut self._loaded).await;
+    }
+}
+
+async fn shutdown_loaded(loaded: &mut [LoadedPlugin]) {
+    for plugin in loaded {
+        let id = plugin.id.clone();
+        plugin
+            .shutdown()
+            .instrument(info_span!("plugin.shutdown", plugin = %id))
+            .await;
     }
 }
 
@@ -78,9 +98,10 @@ async fn load_plugin(
 
     let merged_config = merge_toml(plugin.default_config(), plugin_config.config.clone());
     let handle = plugin
-        .register(PluginContext::new(graph), merged_config)
+        .register(PluginContext::try_new(graph)?, merged_config)
         .await?;
     Ok(LoadedPlugin {
+        id: id.to_string(),
         handle: Some(handle),
         _plugin: plugin,
         _library: library,
