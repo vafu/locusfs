@@ -341,6 +341,12 @@ impl DynamicGraph {
     }
 
     pub async fn create_node(&self, node: &NodeId) -> Result<()> {
+        if self.contains_node(node).await? {
+            return Err(GraphError::AlreadyExists {
+                kind: "node",
+                name: node.to_string(),
+            });
+        }
         self.node_mutation_provider_for_node(node)
             .await?
             .create_node(node)
@@ -438,7 +444,11 @@ impl DynamicGraph {
         key: &PropertyKey,
         value: LocusValue,
     ) -> Result<()> {
-        let existed = self.property_spec(subject, key).await.is_ok();
+        let existed = match self.property_spec(subject, key).await {
+            Ok(_) => true,
+            Err(GraphError::NotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
         self.property_mutation_provider_for_node(subject)
             .await?
             .set_property(subject, key, value)
@@ -540,12 +550,12 @@ impl DynamicGraph {
             Err(error) => return Err(error),
         }
         let after = self.targets(source, relation).await.unwrap_or_default();
-        self.emit_global_change(relation_lifecycle_change(
-            source.clone(),
-            relation.clone(),
-            before,
-            after,
-        ))
+        if let Some(change) =
+            relation_lifecycle_change(source.clone(), relation.clone(), before, after)
+        {
+            self.emit_global_change(change)?;
+        }
+        Ok(())
     }
 
     pub async fn remove_link(
@@ -557,12 +567,11 @@ impl DynamicGraph {
         let before = self.targets(source, relation).await.unwrap_or_default();
         if self.remove_overlay_link(source, relation, target).await {
             let after = self.targets(source, relation).await.unwrap_or_default();
-            self.emit_global_change(relation_lifecycle_change(
-                source.clone(),
-                relation.clone(),
-                before,
-                after,
-            ))?;
+            if let Some(change) =
+                relation_lifecycle_change(source.clone(), relation.clone(), before, after)
+            {
+                self.emit_global_change(change)?;
+            }
             return Ok(());
         }
         self.relation_mutation_provider_for_node(source)
@@ -570,12 +579,12 @@ impl DynamicGraph {
             .remove_link(source, relation, target)
             .await?;
         let after = self.targets(source, relation).await.unwrap_or_default();
-        self.emit_global_change(relation_lifecycle_change(
-            source.clone(),
-            relation.clone(),
-            before,
-            after,
-        ))
+        if let Some(change) =
+            relation_lifecycle_change(source.clone(), relation.clone(), before, after)
+        {
+            self.emit_global_change(change)?;
+        }
+        Ok(())
     }
 
     async fn remove_inbound_links(&self, target: &NodeId) -> Result<()> {
@@ -625,12 +634,14 @@ impl DynamicGraph {
                                         Err(GraphError::NotFound { .. }) => Vec::new(),
                                         Err(error) => return Err(error),
                                     };
-                                self.emit_global_change(relation_lifecycle_change(
+                                if let Some(change) = relation_lifecycle_change(
                                     source.clone(),
                                     relation.clone(),
                                     targets,
                                     after,
-                                ))?;
+                                ) {
+                                    self.emit_global_change(change)?;
+                                }
                             }
                             Err(GraphError::NotFound { .. }) => {}
                             Err(error) => return Err(error),
@@ -930,11 +941,14 @@ fn relation_lifecycle_change(
     relation: RelationName,
     before: Vec<NodeId>,
     after: Vec<NodeId>,
-) -> GraphChange {
+) -> Option<GraphChange> {
+    if before == after {
+        return None;
+    }
     match (before.is_empty(), after.is_empty()) {
-        (true, false) => GraphChange::RelationAdded { source, relation },
-        (false, true) => GraphChange::RelationRemoved { source, relation },
-        _ => GraphChange::RelationChanged { source, relation },
+        (true, false) => Some(GraphChange::RelationAdded { source, relation }),
+        (false, true) => Some(GraphChange::RelationRemoved { source, relation }),
+        _ => Some(GraphChange::RelationChanged { source, relation }),
     }
 }
 

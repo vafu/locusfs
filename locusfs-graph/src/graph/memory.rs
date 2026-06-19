@@ -106,8 +106,15 @@ impl NodeMutationProvider for InMemoryProvider {
     async fn create_node(&self, node: &NodeId) -> Result<()> {
         self.ensure_kind(node)?;
         let mut state = self.write_state().await;
-        state.nodes.entry(node.clone()).or_default();
-        Ok(())
+        if state.nodes.contains_key(node) {
+            Err(GraphError::AlreadyExists {
+                kind: "node",
+                name: node.to_string(),
+            })
+        } else {
+            state.nodes.insert(node.clone(), Node::default());
+            Ok(())
+        }
     }
 
     async fn remove_node(&self, node: &NodeId) -> Result<()> {

@@ -30,3 +30,18 @@ fn node_ids_parse_kind_and_local_id() {
     assert_eq!(id.local(), "1");
     assert_eq!(id.to_string(), "workspace:1");
 }
+
+#[test]
+fn node_kinds_reject_node_id_separator() {
+    assert!(matches!(
+        NodeKind::new("bad:kind").unwrap_err(),
+        GraphError::InvalidIdentifier { .. }
+    ));
+}
+
+#[test]
+fn node_ids_round_trip_when_local_contains_separator() {
+    let id = NodeId::new(NodeKind::new("workspace").unwrap(), "group:1").unwrap();
+
+    assert_eq!(NodeId::parse(&id.to_string()).unwrap(), id);
+}

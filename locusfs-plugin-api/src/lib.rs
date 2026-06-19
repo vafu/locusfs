@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use locusfs_graph::{DynamicGraph, Result};
+use locusfs_graph::{DynamicGraph, GraphError, Result};
 use tokio::runtime::Handle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,10 +23,18 @@ pub struct PluginContext {
 
 impl PluginContext {
     pub fn new(graph: DynamicGraph) -> Self {
-        Self {
-            graph,
-            runtime: Handle::current(),
-        }
+        Self::from_runtime(graph, Handle::current())
+    }
+
+    pub fn try_new(graph: DynamicGraph) -> Result<Self> {
+        let runtime = Handle::try_current().map_err(|_| GraphError::Internal {
+            reason: "plugin context requires a Tokio runtime",
+        })?;
+        Ok(Self::from_runtime(graph, runtime))
+    }
+
+    pub fn from_runtime(graph: DynamicGraph, runtime: Handle) -> Self {
+        Self { graph, runtime }
     }
 }
 

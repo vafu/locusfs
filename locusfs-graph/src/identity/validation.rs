@@ -17,5 +17,13 @@ pub(crate) fn validate_identifier(kind: &'static str, value: &str) -> Result<()>
         return Err(GraphError::invalid_identifier(kind, value, "contains NUL"));
     }
 
+    if kind == "node kind" && value.contains(':') {
+        return Err(GraphError::invalid_identifier(
+            kind,
+            value,
+            "contains node id separator",
+        ));
+    }
+
     Ok(())
 }

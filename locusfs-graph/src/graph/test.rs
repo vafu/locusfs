@@ -73,6 +73,23 @@ async fn nodes_are_created_explicitly() {
 }
 
 #[tokio::test]
+async fn duplicate_node_creation_is_rejected_without_change_event() {
+    let kind = NodeKind::new("node").unwrap();
+    let graph = in_memory_graph(kind.clone()).await;
+    let node = NodeId::new(kind, "57").unwrap();
+    let mut changes = graph.subscribe_global_changes();
+
+    graph.create_node(&node).await.unwrap();
+    while changes.try_recv().is_ok() {}
+
+    assert!(matches!(
+        graph.create_node(&node).await.unwrap_err(),
+        GraphError::AlreadyExists { .. }
+    ));
+    assert!(changes.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn properties_round_trip_through_graph_contract() {
     let kind = NodeKind::new("node").unwrap();
     let graph = in_memory_graph(kind.clone()).await;
@@ -105,6 +122,41 @@ async fn properties_round_trip_through_graph_contract() {
     assert!(matches!(
         graph.property(&node, &key).await.unwrap_err(),
         GraphError::NotFound { .. }
+    ));
+}
+
+#[tokio::test]
+async fn set_property_propagates_property_spec_errors() {
+    let kind = NodeKind::new("node").unwrap();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    let node = NodeId::new(kind.clone(), "57").unwrap();
+    let key = PropertyKey::new("title").unwrap();
+
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_provider(kind.clone(), FailingPropertyProvider)
+        .await
+        .unwrap();
+    graph
+        .register_property_mutation_provider(kind, provider)
+        .await
+        .unwrap();
+    graph.create_node(&node).await.unwrap();
+
+    assert!(matches!(
+        graph
+            .set_property(&node, &key, LocusValue::String("value".to_string()))
+            .await
+            .unwrap_err(),
+        GraphError::Internal { .. }
     ));
 }
 
@@ -251,6 +303,25 @@ async fn graph_mutations_emit_semantic_changes() {
         relation: relation.clone()
     }));
     assert!(emitted.contains(&GraphChange::RelationRemoved { source, relation }));
+}
+
+#[tokio::test]
+async fn duplicate_link_does_not_emit_relation_change() {
+    let kind = NodeKind::new("node").unwrap();
+    let graph = in_memory_graph(kind.clone()).await;
+    let source = NodeId::new(kind.clone(), "57").unwrap();
+    let target = NodeId::new(kind, "6").unwrap();
+    let relation = RelationName::new("linked-to").unwrap();
+    let mut changes = graph.subscribe_global_changes();
+
+    graph.create_node(&source).await.unwrap();
+    graph.create_node(&target).await.unwrap();
+    graph.set_link(&source, &relation, &target).await.unwrap();
+    while changes.try_recv().is_ok() {}
+
+    graph.set_link(&source, &relation, &target).await.unwrap();
+
+    assert!(changes.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -615,6 +686,29 @@ struct StaticPropertyProvider {
     node: NodeId,
     key: PropertyKey,
     value: LocusValue,
+}
+
+struct FailingPropertyProvider;
+
+#[async_trait]
+impl PropertyProvider for FailingPropertyProvider {
+    async fn property_spec(&self, _subject: &NodeId, _key: &PropertyKey) -> Result<PropertySpec> {
+        Err(GraphError::Internal {
+            reason: "property provider failed",
+        })
+    }
+
+    async fn properties(&self, _subject: &NodeId) -> Result<Vec<PropertySpec>> {
+        Err(GraphError::Internal {
+            reason: "property provider failed",
+        })
+    }
+
+    async fn property(&self, _subject: &NodeId, _key: &PropertyKey) -> Result<LocusValue> {
+        Err(GraphError::Internal {
+            reason: "property provider failed",
+        })
+    }
 }
 
 #[async_trait]
