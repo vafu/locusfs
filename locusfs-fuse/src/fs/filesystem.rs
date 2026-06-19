@@ -37,7 +37,7 @@ use super::value::{
     node_dir_perm, parse_property_write, property_file_string, property_perm,
     property_spec_or_new_string, slice_for_read,
 };
-use super::watch::{FileHandle, SharedWatchRegistry, WatchRegistry};
+use super::watch::{FileHandle, SharedWatchRegistry, WatchMode, WatchRegistry};
 use crate::layout::decode_segment;
 use crate::{errno, graph_error_to_errno};
 
@@ -856,7 +856,9 @@ impl LocusFs {
             FsEntry::WatchFile => {
                 let path = parse_watch_subscription(&data)?;
                 let target = resolve_watch_path(&self.graph, &path).await?;
-                let graph_watch = if target.dependencies.is_empty() {
+                let graph_watch = if target.dependencies.is_empty()
+                    && matches!(target.mode, WatchMode::Changes)
+                {
                     Some(
                         self.graph
                             .watch(target.subject.clone())

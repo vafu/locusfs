@@ -4,6 +4,7 @@ use locusfs_graph::{
     NodeProvider, PropertyKey, PropertyProvider, PropertySpec, RelationName, Result,
 };
 
+use super::resolve::resolve_watch_path;
 use super::watch;
 use super::*;
 
@@ -133,7 +134,7 @@ fn watch_registry_tracks_unread_node_changes_for_open_properties() {
     assert!(!registry.has_unread_change(handle));
     assert!(
         registry
-            .notify_node_change(&node, WatchEvent::NodeChanged(node.clone()))
+            .notify_node_change(&node, WatchChange::NodeChanged(node.clone()))
             .is_empty()
     );
     assert!(registry.has_unread_change(handle));
@@ -157,6 +158,8 @@ fn watch_registry_marks_configured_watch_pending_for_subject_change() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -185,6 +188,8 @@ fn watch_registry_reports_node_child_property_lifecycle_for_node_subject() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -195,7 +200,7 @@ fn watch_registry_reports_node_child_property_lifecycle_for_node_subject() {
             .notify_property_event(
                 &node,
                 &key,
-                WatchEvent::PropertyAdded(node.clone(), key.clone())
+                WatchChange::PropertyAdded(node.clone(), key.clone())
             )
             .is_empty()
     );
@@ -205,7 +210,7 @@ fn watch_registry_reports_node_child_property_lifecycle_for_node_subject() {
 }
 
 #[test]
-fn watch_registry_reports_relation_lifecycle_for_concrete_child_subject() {
+fn dependent_watch_suppresses_relation_lifecycle_events() {
     let node = test_node("57");
     let relation = RelationName::new("project").unwrap();
     let mut registry = WatchRegistry::new();
@@ -221,6 +226,8 @@ fn watch_registry_reports_relation_lifecycle_for_concrete_child_subject() {
                     relation.as_str().to_string(),
                 ),
                 dependencies: vec![watch::WatchKey::Relation(node.clone(), relation.clone())],
+                ready: false,
+                mode: watch::WatchMode::State,
             },
             false,
         )
@@ -231,13 +238,11 @@ fn watch_registry_reports_relation_lifecycle_for_concrete_child_subject() {
             .notify_relation_event(
                 &node,
                 &relation,
-                WatchEvent::RelationAdded(node.clone(), relation.clone())
+                WatchChange::RelationAdded(node.clone(), relation.clone())
             )
             .is_empty()
     );
-
-    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
-    assert_eq!(event, "relation added node:57 project\n");
+    assert!(!registry.has_unread_change(handle));
 }
 
 #[test]
@@ -255,6 +260,8 @@ fn watch_registry_can_suppress_relation_fanout_for_retargeted_watchers() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -269,6 +276,8 @@ fn watch_registry_can_suppress_relation_fanout_for_retargeted_watchers() {
                     relation.as_str().to_string(),
                 ),
                 dependencies: vec![watch::WatchKey::Relation(node.clone(), relation.clone())],
+                ready: false,
+                mode: watch::WatchMode::State,
             },
             false,
         )
@@ -278,7 +287,7 @@ fn watch_registry_can_suppress_relation_fanout_for_retargeted_watchers() {
     registry.notify_relation_event_excluding(
         &node,
         &relation,
-        WatchEvent::RelationAdded(node.clone(), relation.clone()),
+        WatchChange::RelationAdded(node.clone(), relation.clone()),
         &excluded,
     );
 
@@ -286,6 +295,181 @@ fn watch_registry_can_suppress_relation_fanout_for_retargeted_watchers() {
     assert!(!registry.has_unread_change(child_handle));
     let event = String::from_utf8(registry.read_watch(node_handle).unwrap()).unwrap();
     assert_eq!(event, "relation added project\n");
+}
+
+#[test]
+fn retargeted_symlink_watch_recovers_after_transient_missing_target() {
+    let source = test_node("selected");
+    let relation = RelationName::new("workspace").unwrap();
+    let old_target = test_node("3");
+    let new_target = test_node("5");
+    let selected = PropertyKey::new("selected").unwrap();
+    let dependency = watch::WatchKey::Relation(source.clone(), relation.clone());
+    let path = "/context/selected/workspace".to_string();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            path.clone(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(old_target),
+                dependencies: vec![dependency.clone()],
+                ready: true,
+                mode: watch::WatchMode::State,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.dependent_watch_paths(&dependency),
+        vec![(handle, path.clone())]
+    );
+    registry.apply_retarget_result(handle, path.clone(), Err(crate::errno(libc::ENOENT)), None);
+    assert!(registry.has_unread_change(handle));
+    assert_eq!(registry.read_watch(handle).unwrap(), b"unset\n");
+    assert_eq!(
+        registry.dependent_watch_paths(&dependency),
+        vec![(handle, path.clone())]
+    );
+
+    registry
+        .apply_retarget_result(
+            handle,
+            path,
+            Ok(watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(new_target.clone()),
+                dependencies: vec![dependency],
+                ready: true,
+                mode: watch::WatchMode::State,
+            }),
+            Some(watch::WatchState::Set(watch::WatchValue::Path(
+                "/node/5".to_string(),
+            ))),
+        )
+        .is_empty();
+    assert_eq!(registry.read_watch(handle).unwrap(), b"set /node/5\n");
+
+    assert!(
+        registry
+            .notify_property_event(
+                &new_target,
+                &selected,
+                WatchChange::PropertyChanged(new_target.clone(), selected.clone()),
+            )
+            .is_empty()
+    );
+    assert!(!registry.has_unread_change(handle));
+}
+
+#[test]
+fn retargeted_symlink_watch_coalesces_transient_unset_before_read() {
+    let source = test_node("selected");
+    let relation = RelationName::new("workspace").unwrap();
+    let old_target = test_node("3");
+    let new_target = test_node("5");
+    let dependency = watch::WatchKey::Relation(source.clone(), relation.clone());
+    let path = "/context/selected/workspace".to_string();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            path.clone(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(old_target),
+                dependencies: vec![dependency.clone()],
+                ready: true,
+                mode: watch::WatchMode::State,
+            },
+            false,
+        )
+        .unwrap();
+
+    registry.apply_retarget_result(handle, path.clone(), Err(crate::errno(libc::ENOENT)), None);
+    registry.apply_retarget_result(
+        handle,
+        path,
+        Ok(watch::WatchTarget {
+            subject: watch::WatchSubjectKey::Node(new_target),
+            dependencies: vec![dependency],
+            ready: true,
+            mode: watch::WatchMode::State,
+        }),
+        Some(watch::WatchState::Set(watch::WatchValue::Path(
+            "/node/5".to_string(),
+        ))),
+    );
+
+    assert_eq!(registry.read_watch(handle).unwrap(), b"set /node/5\n");
+    assert!(!registry.has_unread_change(handle));
+}
+
+#[test]
+fn node_watch_reports_relation_lifecycle_for_child_subject() {
+    let node = test_node("57");
+    let relation = RelationName::new("project").unwrap();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
+            },
+            false,
+        )
+        .unwrap();
+
+    registry.notify_relation_event(
+        &node,
+        &relation,
+        WatchChange::RelationAdded(node.clone(), relation.clone()),
+    );
+
+    let event = String::from_utf8(registry.read_watch(handle).unwrap()).unwrap();
+    assert_eq!(event, "relation added project\n");
+}
+
+#[test]
+fn concrete_property_watch_still_reports_property_changes() {
+    let new_target = test_node("5");
+    let selected = PropertyKey::new("selected").unwrap();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/workspace/5/selected".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Property(new_target.clone(), selected.clone()),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
+            },
+            false,
+        )
+        .unwrap();
+
+    registry.notify_property_event(
+        &new_target,
+        &selected,
+        WatchChange::PropertyChanged(new_target.clone(), selected.clone()),
+    );
+
+    assert_eq!(
+        registry.read_watch(handle).unwrap(),
+        b"property changed node:5 selected\n"
+    );
 }
 
 #[test]
@@ -301,6 +485,8 @@ fn watch_registry_reports_node_change_event_for_node_subject() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -308,7 +494,7 @@ fn watch_registry_reports_node_change_event_for_node_subject() {
 
     assert!(
         registry
-            .notify_node_change(&node, WatchEvent::NodeChanged(node.clone()))
+            .notify_node_change(&node, WatchChange::NodeChanged(node.clone()))
             .is_empty()
     );
 
@@ -329,6 +515,8 @@ fn watch_registry_reports_node_add_event_for_kind_subject() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Kind(test_kind()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -336,7 +524,7 @@ fn watch_registry_reports_node_add_event_for_kind_subject() {
 
     assert!(
         registry
-            .notify_node_change(&node, WatchEvent::NodeAdded(node.clone()))
+            .notify_node_change(&node, WatchChange::NodeAdded(node.clone()))
             .is_empty()
     );
 
@@ -357,6 +545,8 @@ fn watch_registry_reports_node_remove_event_for_kind_subject() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Kind(test_kind()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -364,7 +554,7 @@ fn watch_registry_reports_node_remove_event_for_kind_subject() {
 
     assert!(
         registry
-            .notify_node_change(&node, WatchEvent::NodeRemoved(node.clone()))
+            .notify_node_change(&node, WatchChange::NodeRemoved(node.clone()))
             .is_empty()
     );
 
@@ -385,6 +575,8 @@ fn watch_registry_reports_node_removed_event_for_node_subject() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -392,7 +584,7 @@ fn watch_registry_reports_node_removed_event_for_node_subject() {
 
     assert!(
         registry
-            .notify_node_change(&node, WatchEvent::NodeRemoved(node.clone()))
+            .notify_node_change(&node, WatchChange::NodeRemoved(node.clone()))
             .is_empty()
     );
 
@@ -413,13 +605,15 @@ fn watch_registry_bounds_pending_events() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Node(node.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
         .unwrap();
 
     for _ in 0..300 {
-        registry.notify_node_change(&node, WatchEvent::NodeChanged(node.clone()));
+        registry.notify_node_change(&node, WatchChange::NodeChanged(node.clone()));
     }
 
     assert_eq!(registry.pending_event_count(handle), Some(256));
@@ -438,6 +632,164 @@ async fn watch_path_can_target_kind_directory() {
 
     assert_eq!(target.subject, watch::WatchSubjectKey::Kind(kind));
     assert!(target.dependencies.is_empty());
+    assert_eq!(target.mode, watch::WatchMode::Changes);
+}
+
+#[tokio::test]
+async fn exact_property_watch_resolves_to_state_value() {
+    let kind = test_kind();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_provider(kind.clone(), provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_property_mutation_provider(kind, provider)
+        .await
+        .unwrap();
+
+    let node = test_node("57");
+    let key = PropertyKey::new("selected").unwrap();
+    graph.create_node(&node).await.unwrap();
+    graph
+        .set_property(&node, &key, LocusValue::Bool(true))
+        .await
+        .unwrap();
+
+    let (target, state) = resolve_watch_state(&graph, "/node/57/selected")
+        .await
+        .unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Property(node, key));
+    assert_eq!(target.mode, watch::WatchMode::State);
+    assert_eq!(
+        state,
+        watch::WatchState::Set(watch::WatchValue::Property("true".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn exact_relation_watch_resolves_to_state_path() {
+    let context_kind = NodeKind::new("context").unwrap();
+    let workspace_kind = NodeKind::new("workspace").unwrap();
+    let context_provider = InMemoryProvider::new(context_kind.clone());
+    let workspace_provider = InMemoryProvider::new(workspace_kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(context_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(context_kind.clone(), context_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_provider(context_kind.clone(), context_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_relation_mutation_provider(context_kind.clone(), context_provider)
+        .await
+        .unwrap();
+    graph
+        .register_node_provider(workspace_provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(workspace_kind.clone(), workspace_provider)
+        .await
+        .unwrap();
+
+    let context = NodeId::new(context_kind, "selected").unwrap();
+    let workspace = NodeId::new(workspace_kind, "3").unwrap();
+    let relation = RelationName::new("workspace").unwrap();
+    graph.create_node(&context).await.unwrap();
+    graph.create_node(&workspace).await.unwrap();
+    graph
+        .set_link(&context, &relation, &workspace)
+        .await
+        .unwrap();
+
+    let (target, state) = resolve_watch_state(&graph, "/context/selected/workspace")
+        .await
+        .unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Node(workspace));
+    assert_eq!(
+        target.dependencies,
+        vec![watch::WatchKey::Relation(context, relation)]
+    );
+    assert_eq!(target.mode, watch::WatchMode::State);
+    assert_eq!(
+        state,
+        watch::WatchState::Set(watch::WatchValue::Path("/workspace/3".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn trailing_node_path_watch_resolves_to_changes() {
+    let kind = test_kind();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind, provider)
+        .await
+        .unwrap();
+
+    let node = test_node("57");
+    graph.create_node(&node).await.unwrap();
+
+    let target = resolve_watch_path(&graph, "/node/57/").await.unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Node(node));
+    assert_eq!(target.mode, watch::WatchMode::Changes);
+}
+
+#[test]
+fn state_watch_messages_coalesce_to_latest_value() {
+    let node = test_node("57");
+    let key = PropertyKey::new("selected").unwrap();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57/selected".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Property(node, key),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::State,
+            },
+            false,
+        )
+        .unwrap();
+
+    registry.queue_watch_state(
+        handle,
+        watch::WatchState::Set(watch::WatchValue::Property("false".to_string())),
+    );
+    registry.queue_watch_state(
+        handle,
+        watch::WatchState::Set(watch::WatchValue::Property("true".to_string())),
+    );
+
+    assert_eq!(registry.read_watch(handle).unwrap(), b"set true\n");
+    assert!(!registry.has_unread_change(handle));
 }
 
 #[test]
@@ -451,6 +803,8 @@ fn watch_registry_fans_out_shared_subjects_to_multiple_open_files() {
     let target = watch::WatchTarget {
         subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
         dependencies: Vec::new(),
+        ready: true,
+        mode: watch::WatchMode::Changes,
     };
     registry
         .configure_watch(
@@ -513,6 +867,7 @@ async fn watch_path_can_target_missing_node_child_under_existing_node() {
         target.dependencies,
         vec![watch::WatchKey::Relation(node, relation)]
     );
+    assert!(!target.ready);
 }
 
 #[test]
@@ -529,6 +884,8 @@ fn watch_registry_replaces_stale_meta_watch_poll_handles() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             false,
         )
@@ -571,6 +928,8 @@ async fn graph_watch_forwarding_suppresses_duplicate_global_watch_events() {
             watch::WatchTarget {
                 subject: watch::WatchSubjectKey::Property(node.clone(), key.clone()),
                 dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
             },
             true,
         )

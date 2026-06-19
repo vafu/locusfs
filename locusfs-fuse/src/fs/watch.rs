@@ -10,6 +10,7 @@ use tracing::info;
 
 use super::entry::FsEntry;
 use crate::errno;
+use crate::layout::encode_segment;
 
 pub type SharedWatchRegistry = Arc<Mutex<WatchRegistry>>;
 pub type PollHandle = u64;
@@ -26,7 +27,65 @@ pub enum WatchKey {
 }
 
 pub type WatchSubjectKey = GraphWatchTarget;
-pub type WatchEvent = GraphWatchEvent;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchChange {
+    Change,
+    NodeAdded(NodeId),
+    NodeChanged(NodeId),
+    NodeRemoved(NodeId),
+    PropertyAdded(NodeId, PropertyKey),
+    PropertyChanged(NodeId, PropertyKey),
+    PropertyRemoved(NodeId, PropertyKey),
+    RelationAdded(NodeId, RelationName),
+    RelationChanged(NodeId, RelationName),
+    RelationRemoved(NodeId, RelationName),
+}
+
+impl From<GraphWatchEvent> for WatchChange {
+    fn from(event: GraphWatchEvent) -> Self {
+        match event {
+            GraphWatchEvent::Change => Self::Change,
+            GraphWatchEvent::NodeAdded(node) => Self::NodeAdded(node),
+            GraphWatchEvent::NodeChanged(node) => Self::NodeChanged(node),
+            GraphWatchEvent::NodeRemoved(node) => Self::NodeRemoved(node),
+            GraphWatchEvent::PropertyAdded(node, key) => Self::PropertyAdded(node, key),
+            GraphWatchEvent::PropertyChanged(node, key) => Self::PropertyChanged(node, key),
+            GraphWatchEvent::PropertyRemoved(node, key) => Self::PropertyRemoved(node, key),
+            GraphWatchEvent::RelationAdded(node, relation) => Self::RelationAdded(node, relation),
+            GraphWatchEvent::RelationChanged(node, relation) => {
+                Self::RelationChanged(node, relation)
+            }
+            GraphWatchEvent::RelationRemoved(node, relation) => {
+                Self::RelationRemoved(node, relation)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchMessage {
+    State(WatchState),
+    Change(WatchChange),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchState {
+    Unset,
+    Set(WatchValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchValue {
+    Path(String),
+    Property(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchMode {
+    State,
+    Changes,
+}
 
 const MAX_PENDING_WATCH_EVENTS: usize = 256;
 
@@ -34,6 +93,8 @@ const MAX_PENDING_WATCH_EVENTS: usize = 256;
 pub struct WatchTarget {
     pub subject: WatchSubjectKey,
     pub dependencies: Vec<WatchKey>,
+    pub ready: bool,
+    pub mode: WatchMode,
 }
 
 #[derive(Debug)]
@@ -62,10 +123,17 @@ struct WatchHandle {
     original_path: Option<String>,
     resolved_subject: Option<WatchSubjectKey>,
     dependencies: Vec<WatchKey>,
+    mode: WatchMode,
     uses_graph_watch: bool,
     watch_task: Option<JoinHandle<()>>,
-    pending_events: VecDeque<WatchEvent>,
+    pending_events: VecDeque<WatchMessage>,
     poll_handles: Vec<PollHandle>,
+}
+
+impl Default for WatchMode {
+    fn default() -> Self {
+        Self::Changes
+    }
 }
 
 #[derive(Debug, Default)]
@@ -152,11 +220,10 @@ impl WatchRegistry {
         watch.original_path = Some(path);
         watch.resolved_subject = Some(target.subject.clone());
         watch.dependencies = target.dependencies.clone();
+        watch.mode = target.mode;
         watch.uses_graph_watch = uses_graph_watch;
         watch.pending_events.clear();
-        if !uses_graph_watch {
-            self.attach_watch(handle, &target.subject, &target.dependencies);
-        }
+        self.attach_watch(handle, &target.subject, &target.dependencies);
         Ok(())
     }
 
@@ -179,8 +246,8 @@ impl WatchRegistry {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Err(errno(libc::EINVAL));
         };
-        if let Some(event) = watch.pending_events.pop_front() {
-            let value = watch_event_bytes(event, watch.resolved_subject.as_ref());
+        if let Some(message) = watch.pending_events.pop_front() {
+            let value = watch_message_bytes(message, watch.resolved_subject.as_ref());
             let path = watch.original_path.as_deref().unwrap_or("<unconfigured>");
             info!("{} >>> {}", path, format_watch_value(&value));
             Ok(value)
@@ -248,7 +315,7 @@ impl WatchRegistry {
         self.notify_property_event(
             node,
             key,
-            WatchEvent::PropertyChanged(node.clone(), key.clone()),
+            WatchChange::PropertyChanged(node.clone(), key.clone()),
         )
     }
 
@@ -256,7 +323,7 @@ impl WatchRegistry {
         &mut self,
         node: &NodeId,
         key: &PropertyKey,
-        event: WatchEvent,
+        event: WatchChange,
     ) -> Vec<PollHandle> {
         let watch_key = WatchKey::Property(node.clone(), key.clone());
         let mut handles = self.notify_property_poll_change(&watch_key);
@@ -277,7 +344,7 @@ impl WatchRegistry {
         &mut self,
         source: &NodeId,
         relation: &RelationName,
-        event: WatchEvent,
+        event: WatchChange,
     ) -> Vec<PollHandle> {
         self.notify_relation_event_excluding(source, relation, event, &HashSet::new())
     }
@@ -286,7 +353,7 @@ impl WatchRegistry {
         &mut self,
         source: &NodeId,
         relation: &RelationName,
-        event: WatchEvent,
+        event: WatchChange,
         excluded_watchers: &HashSet<FileHandle>,
     ) -> Vec<PollHandle> {
         let watch_key = WatchKey::Relation(source.clone(), relation.clone());
@@ -309,7 +376,7 @@ impl WatchRegistry {
         handles
     }
 
-    pub fn notify_node_change(&mut self, node: &NodeId, event: WatchEvent) -> Vec<PollHandle> {
+    pub fn notify_node_change(&mut self, node: &NodeId, event: WatchChange) -> Vec<PollHandle> {
         let mut handles = Vec::new();
         let keys = self
             .property_watches
@@ -339,7 +406,7 @@ impl WatchRegistry {
             handles.extend(self.notify_subject_change(&subject, event.clone()));
         }
 
-        if matches!(event, GraphWatchEvent::NodeRemoved(_)) {
+        if matches!(event, WatchChange::NodeRemoved(_)) {
             let child_subjects = self
                 .subjects
                 .keys()
@@ -352,7 +419,7 @@ impl WatchRegistry {
                 .cloned()
                 .collect::<Vec<_>>();
             for subject in child_subjects {
-                handles.extend(self.notify_subject_change(&subject, GraphWatchEvent::Change));
+                handles.extend(self.notify_subject_change(&subject, WatchChange::Change));
             }
         }
 
@@ -378,7 +445,7 @@ impl WatchRegistry {
             })
             .collect::<Vec<_>>();
         for watcher in watchers {
-            handles.extend(self.queue_watch_event(watcher, GraphWatchEvent::Change, false));
+            handles.extend(self.queue_watch_change(watcher, WatchChange::Change, false));
         }
         handles
     }
@@ -388,7 +455,7 @@ impl WatchRegistry {
         handle: FileHandle,
         event: GraphWatchEvent,
     ) -> Vec<PollHandle> {
-        self.queue_watch_event(handle, event, true)
+        self.queue_watch_change(handle, event.into(), true)
     }
 
     pub fn dependent_watch_paths(&self, dependency: &WatchKey) -> Vec<(FileHandle, String)> {
@@ -406,24 +473,39 @@ impl WatchRegistry {
         handle: FileHandle,
         path: String,
         result: std::result::Result<WatchTarget, Errno>,
-        event: WatchEvent,
+        state: Option<WatchState>,
     ) -> Vec<PollHandle> {
+        let previous_mode = self.watch_mode(handle).unwrap_or_default();
         match result {
             Ok(target) => {
                 self.detach_watch(handle);
+                let ready = target.ready;
+                let mode = target.mode;
                 if let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) {
                     watch.original_path = Some(path);
                     watch.resolved_subject = Some(target.subject.clone());
                     watch.dependencies = target.dependencies.clone();
+                    watch.mode = mode;
                 }
                 self.attach_watch(handle, &target.subject, &target.dependencies);
+                return match mode {
+                    WatchMode::State => self.queue_watch_state(
+                        handle,
+                        state.unwrap_or_else(|| fallback_state_for_target(&target, ready)),
+                    ),
+                    WatchMode::Changes => {
+                        self.queue_watch_change(handle, WatchChange::Change, false)
+                    }
+                };
             }
             Err(_) => {
                 self.detach_subject(handle);
-                return Vec::new();
+                if matches!(previous_mode, WatchMode::State) {
+                    return self.queue_watch_state(handle, WatchState::Unset);
+                }
             }
         }
-        self.queue_watch_event(handle, event, false)
+        self.queue_watch_change(handle, WatchChange::Change, false)
     }
 
     fn notify_property_poll_change(&mut self, key: &WatchKey) -> Vec<PollHandle> {
@@ -438,7 +520,7 @@ impl WatchRegistry {
     fn notify_subject_change(
         &mut self,
         subject: &WatchSubjectKey,
-        event: WatchEvent,
+        event: WatchChange,
     ) -> Vec<PollHandle> {
         self.notify_subject_change_excluding(subject, event, &HashSet::new())
     }
@@ -446,7 +528,7 @@ impl WatchRegistry {
     fn notify_subject_change_excluding(
         &mut self,
         subject: &WatchSubjectKey,
-        event: WatchEvent,
+        event: WatchChange,
         excluded_watchers: &HashSet<FileHandle>,
     ) -> Vec<PollHandle> {
         let watchers = self
@@ -459,27 +541,47 @@ impl WatchRegistry {
             if excluded_watchers.contains(&watcher) {
                 continue;
             }
-            handles.extend(self.queue_watch_event(watcher, event.clone(), false));
+            handles.extend(self.queue_watch_change(watcher, event.clone(), false));
         }
         handles
     }
 
-    fn queue_watch_event(
+    pub fn queue_watch_state(&mut self, handle: FileHandle, state: WatchState) -> Vec<PollHandle> {
+        let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
+            return Vec::new();
+        };
+        if !matches!(watch.mode, WatchMode::State) {
+            return Vec::new();
+        }
+        watch
+            .pending_events
+            .retain(|pending| !matches!(pending, WatchMessage::State(_)));
+        if watch.pending_events.len() >= MAX_PENDING_WATCH_EVENTS {
+            watch.pending_events.pop_front();
+        }
+        watch.pending_events.push_back(WatchMessage::State(state));
+        std::mem::take(&mut watch.poll_handles)
+    }
+
+    fn queue_watch_change(
         &mut self,
         handle: FileHandle,
-        event: WatchEvent,
+        event: WatchChange,
         from_graph_watch: bool,
     ) -> Vec<PollHandle> {
         let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
             return Vec::new();
         };
+        if !matches!(watch.mode, WatchMode::Changes) {
+            return Vec::new();
+        }
         if watch.uses_graph_watch && !from_graph_watch {
             return Vec::new();
         }
         if watch.pending_events.len() >= MAX_PENDING_WATCH_EVENTS {
             watch.pending_events.pop_front();
         }
-        watch.pending_events.push_back(event);
+        watch.pending_events.push_back(WatchMessage::Change(event));
         std::mem::take(&mut watch.poll_handles)
     }
 
@@ -488,6 +590,34 @@ impl WatchRegistry {
             return None;
         };
         watch.original_path.clone()
+    }
+
+    pub fn state_watch_paths_for_subject(
+        &self,
+        subject: &WatchSubjectKey,
+    ) -> Vec<(FileHandle, String)> {
+        self.subjects
+            .get(subject)
+            .map(|subject| subject.watchers.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|handle| {
+                let Some(OpenFileState::Watch(watch)) = self.open_files.get(&handle.0) else {
+                    return None;
+                };
+                if !matches!(watch.mode, WatchMode::State) {
+                    return None;
+                }
+                watch.original_path.clone().map(|path| (handle, path))
+            })
+            .collect()
+    }
+
+    fn watch_mode(&self, handle: FileHandle) -> Option<WatchMode> {
+        match self.open_files.get(&handle.0)? {
+            OpenFileState::Watch(watch) => Some(watch.mode),
+            OpenFileState::PropertyPoll { .. } => None,
+        }
     }
 
     fn attach_watch(
@@ -589,30 +719,97 @@ impl WatchRegistry {
     }
 }
 
-fn watch_event_bytes(event: WatchEvent, subject: Option<&WatchSubjectKey>) -> Vec<u8> {
-    match event {
-        GraphWatchEvent::Change => b"change\n".to_vec(),
-        GraphWatchEvent::NodeAdded(node) => format!("node added {node}\n").into_bytes(),
-        GraphWatchEvent::NodeChanged(node) => format!("node changed {node}\n").into_bytes(),
-        GraphWatchEvent::NodeRemoved(node) => format!("node removed {node}\n").into_bytes(),
-        GraphWatchEvent::PropertyAdded(node, key) => {
-            property_event_bytes("added", node, key, subject)
-        }
-        GraphWatchEvent::PropertyChanged(node, key) => {
+fn watch_message_bytes(message: WatchMessage, subject: Option<&WatchSubjectKey>) -> Vec<u8> {
+    match message {
+        WatchMessage::State(state) => watch_state_bytes(state),
+        WatchMessage::Change(change) => watch_change_bytes(change, subject),
+    }
+}
+
+fn watch_state_bytes(state: WatchState) -> Vec<u8> {
+    match state {
+        WatchState::Unset => b"unset\n".to_vec(),
+        WatchState::Set(value) => format!("set {}\n", watch_value_payload(value)).into_bytes(),
+    }
+}
+
+fn watch_value_payload(value: WatchValue) -> String {
+    match value {
+        WatchValue::Path(path) | WatchValue::Property(path) => path,
+    }
+}
+
+fn watch_change_bytes(change: WatchChange, subject: Option<&WatchSubjectKey>) -> Vec<u8> {
+    match change {
+        WatchChange::Change => b"change\n".to_vec(),
+        WatchChange::NodeAdded(node) => format!("node added {node}\n").into_bytes(),
+        WatchChange::NodeChanged(node) => format!("node changed {node}\n").into_bytes(),
+        WatchChange::NodeRemoved(node) => format!("node removed {node}\n").into_bytes(),
+        WatchChange::PropertyAdded(node, key) => property_event_bytes("added", node, key, subject),
+        WatchChange::PropertyChanged(node, key) => {
             property_event_bytes("changed", node, key, subject)
         }
-        GraphWatchEvent::PropertyRemoved(node, key) => {
+        WatchChange::PropertyRemoved(node, key) => {
             property_event_bytes("removed", node, key, subject)
         }
-        GraphWatchEvent::RelationAdded(source, relation) => {
+        WatchChange::RelationAdded(source, relation) => {
             relation_event_bytes("added", source, relation, subject)
         }
-        GraphWatchEvent::RelationChanged(source, relation) => {
+        WatchChange::RelationChanged(source, relation) => {
             relation_event_bytes("changed", source, relation, subject)
         }
-        GraphWatchEvent::RelationRemoved(source, relation) => {
+        WatchChange::RelationRemoved(source, relation) => {
             relation_event_bytes("removed", source, relation, subject)
         }
+    }
+}
+
+pub(crate) fn watch_subject_path(subject: &WatchSubjectKey) -> String {
+    match subject {
+        GraphWatchTarget::Kind(kind) => {
+            format!(
+                "/{}",
+                encode_segment(kind.as_str()).expect("validated node kind should encode")
+            )
+        }
+        GraphWatchTarget::Node(node) => node_path(node),
+        GraphWatchTarget::NodeChild(node, name) => {
+            format!(
+                "{}/{}",
+                node_path(node),
+                encode_segment(name).expect("validated child name should encode")
+            )
+        }
+        GraphWatchTarget::Property(node, key) => {
+            format!(
+                "{}/{}",
+                node_path(node),
+                encode_segment(key.as_str()).expect("validated property key should encode")
+            )
+        }
+        GraphWatchTarget::Relation(node, relation) => {
+            format!(
+                "{}/{}",
+                node_path(node),
+                encode_segment(relation.as_str()).expect("validated relation name should encode")
+            )
+        }
+    }
+}
+
+fn node_path(node: &NodeId) -> String {
+    format!(
+        "/{}/{}",
+        encode_segment(node.kind().as_str()).expect("validated node kind should encode"),
+        encode_segment(node.local()).expect("validated node local id should encode")
+    )
+}
+
+fn fallback_state_for_target(target: &WatchTarget, ready: bool) -> WatchState {
+    if ready {
+        WatchState::Set(WatchValue::Path(watch_subject_path(&target.subject)))
+    } else {
+        WatchState::Unset
     }
 }
 

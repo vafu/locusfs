@@ -19,6 +19,34 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
     bytes_to_string(read(path).await?)
 }
 
+/// Lists the UTF-8 file names in a locusfs directory.
+pub async fn read_dir_names(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "locusfs directory entry name is not valid UTF-8",
+            )
+        })?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Resolves a locusfs symlink target to an absolute data path.
+pub async fn read_link(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let target = tokio::fs::read_link(path).await?;
+    Ok(resolve_link_target(path, target))
+}
+
+/// Returns whether a locusfs path currently exists.
+pub async fn exists(path: impl AsRef<Path>) -> bool {
+    tokio::fs::metadata(path).await.is_ok()
+}
+
 fn bytes_to_string(value: Vec<u8>) -> io::Result<String> {
     String::from_utf8(value).map_err(|error| {
         io::Error::new(
@@ -26,6 +54,14 @@ fn bytes_to_string(value: Vec<u8>) -> io::Result<String> {
             format!("locusfs value is not valid UTF-8: {error}"),
         )
     })
+}
+
+fn resolve_link_target(path: &Path, target: PathBuf) -> PathBuf {
+    if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+    }
 }
 
 /// Converts a path into an absolute path without resolving symlinks.

@@ -5,7 +5,7 @@ use super::name::{
     node_id_from_kind_and_segment, node_kind_from_segment, property_key_from_segment,
     relation_name_from_segment, relation_target_from_name,
 };
-use super::watch::{WatchKey, WatchTarget};
+use super::watch::{WatchKey, WatchMode, WatchState, WatchTarget, WatchValue, watch_subject_path};
 use crate::layout::decode_segment;
 use crate::{errno, graph_error_to_errno};
 
@@ -23,6 +23,7 @@ pub(crate) async fn resolve_watch_path(
     graph: &DynamicGraph,
     path: &str,
 ) -> std::result::Result<WatchTarget, Errno> {
+    let directory_watch = path.ends_with('/');
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -38,6 +39,8 @@ pub(crate) async fn resolve_watch_path(
         return Ok(WatchTarget {
             subject: GraphWatchTarget::Kind(kind),
             dependencies: Vec::new(),
+            ready: true,
+            mode: WatchMode::Changes,
         });
     };
 
@@ -64,6 +67,8 @@ pub(crate) async fn resolve_watch_path(
             return Ok(WatchTarget {
                 subject: GraphWatchTarget::Property(node, key),
                 dependencies,
+                ready: true,
+                mode: WatchMode::State,
             });
         }
 
@@ -78,6 +83,12 @@ pub(crate) async fn resolve_watch_path(
                     decode_segment(segment).map_err(graph_error_to_errno)?,
                 ),
                 dependencies,
+                ready: false,
+                mode: if directory_watch {
+                    WatchMode::Changes
+                } else {
+                    WatchMode::State
+                },
             });
         }
 
@@ -93,6 +104,8 @@ pub(crate) async fn resolve_watch_path(
                 return Ok(WatchTarget {
                     subject: GraphWatchTarget::Relation(node, relation),
                     dependencies,
+                    ready: true,
+                    mode: WatchMode::Changes,
                 });
             };
             relation_target_from_name(target_segment, &node, &targets)?
@@ -103,7 +116,56 @@ pub(crate) async fn resolve_watch_path(
     Ok(WatchTarget {
         subject: GraphWatchTarget::Node(node),
         dependencies,
+        ready: true,
+        mode: if directory_watch {
+            WatchMode::Changes
+        } else {
+            WatchMode::State
+        },
     })
+}
+
+pub(crate) async fn resolve_watch_state(
+    graph: &DynamicGraph,
+    path: &str,
+) -> std::result::Result<(WatchTarget, WatchState), Errno> {
+    let target = resolve_watch_path(graph, path).await?;
+    let state = watch_state_for_target(graph, &target).await?;
+    Ok((target, state))
+}
+
+pub(crate) async fn watch_state_for_target(
+    graph: &DynamicGraph,
+    target: &WatchTarget,
+) -> std::result::Result<WatchState, Errno> {
+    if !target.ready {
+        return Ok(WatchState::Unset);
+    }
+
+    match &target.subject {
+        GraphWatchTarget::Property(node, key) => match graph.property(node, key).await {
+            Ok(value) => Ok(WatchState::Set(WatchValue::Property(
+                value.display_string(),
+            ))),
+            Err(GraphError::NotFound { .. }) => Ok(WatchState::Unset),
+            Err(error) => Err(graph_error_to_errno(error)),
+        },
+        GraphWatchTarget::Relation(source, relation) => {
+            let targets = relation_targets(graph, source, relation).await?;
+            match targets.as_slice() {
+                [] => Ok(WatchState::Unset),
+                [target] => Ok(WatchState::Set(WatchValue::Path(watch_subject_path(
+                    &GraphWatchTarget::Node(target.clone()),
+                )))),
+                _ => Ok(WatchState::Set(WatchValue::Path(watch_subject_path(
+                    &target.subject,
+                )))),
+            }
+        }
+        _ => Ok(WatchState::Set(WatchValue::Path(watch_subject_path(
+            &target.subject,
+        )))),
+    }
 }
 
 fn next_segment<'a>(segments: &'a [&'a str], index: &mut usize) -> Option<&'a str> {
