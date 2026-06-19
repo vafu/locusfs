@@ -508,6 +508,37 @@ fn watch_registry_buffers_partial_event_reads() {
 }
 
 #[test]
+fn watch_registry_drains_next_event_after_completed_offset_read() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
+            },
+            false,
+        )
+        .unwrap();
+    registry.notify_node_change(&node, WatchChange::NodeChanged(node.clone()));
+    registry.notify_node_change(&node, WatchChange::NodeRemoved(node.clone()));
+
+    let first = registry.read_watch_chunk(handle, 0, 4096).unwrap();
+    assert_eq!(first, b"node changed node:57\n");
+    let second = registry
+        .read_watch_chunk(handle, first.len() as u64, 4096)
+        .unwrap();
+    assert_eq!(second, b"node removed node:57\n");
+    assert!(!registry.has_unread_change(handle));
+}
+
+#[test]
 fn watch_registry_reports_node_change_event_for_node_subject() {
     let node = test_node("57");
     let mut registry = WatchRegistry::new();

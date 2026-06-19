@@ -261,10 +261,8 @@ impl WatchRegistry {
         if offset == 0 {
             watch.pending_read = None;
         }
+        let mut event_offset = offset;
         if watch.pending_read.is_none() {
-            if offset != 0 {
-                return Ok(Vec::new());
-            }
             let Some(message) = watch.pending_events.pop_front() else {
                 return Ok(Vec::new());
             };
@@ -272,12 +270,13 @@ impl WatchRegistry {
             let path = watch.original_path.as_deref().unwrap_or("<unconfigured>");
             info!("{} >>> {}", path, format_watch_value(&value));
             watch.pending_read = Some(value);
+            event_offset = 0;
         }
 
         let Some(value) = watch.pending_read.as_ref() else {
             return Ok(Vec::new());
         };
-        let start = usize::try_from(offset)
+        let start = usize::try_from(event_offset)
             .unwrap_or(usize::MAX)
             .min(value.len());
         let requested = usize::try_from(size).unwrap_or(usize::MAX);
