@@ -3,7 +3,7 @@
 pub mod config;
 
 use async_trait::async_trait;
-use locusfs_graph::{DynamicGraph, GraphError, InMemoryProvider, NodeKind, Result};
+use locusfs_graph::{DynamicGraph, GraphError, InMemoryProvider, NodeKind, Result, TracedProvider};
 use locusfs_plugin_api::{LocusFsPlugin, PluginContext, PluginHandle, PluginManifest};
 
 use crate::config::ProjectConfig;
@@ -27,25 +27,36 @@ pub async fn register(graph: &DynamicGraph) -> Result<ProjectPluginHandle> {
 
 pub async fn register_with_config(
     graph: &DynamicGraph,
-    _config: ProjectConfig,
+    config: ProjectConfig,
 ) -> Result<ProjectPluginHandle> {
+    if let Some(state_path) = config.state_path {
+        return Err(GraphError::InvalidValue {
+            kind: "project plugin config",
+            value: state_path.display().to_string(),
+            reason: "state_path persistence is not implemented",
+        });
+    }
+
     let kind = NodeKind::new(PROJECT_KIND)?;
     let provider = InMemoryProvider::new(kind.clone());
-    graph.register_node_provider(provider.clone()).await?;
+    let traced_provider = TracedProvider::new("project", provider.clone());
     graph
-        .register_node_mutation_provider(kind.clone(), provider.clone())
+        .register_node_provider(traced_provider.clone())
         .await?;
     graph
-        .register_property_provider(kind.clone(), provider.clone())
+        .register_node_mutation_provider(kind.clone(), traced_provider.clone())
         .await?;
     graph
-        .register_property_mutation_provider(kind.clone(), provider.clone())
+        .register_property_provider(kind.clone(), traced_provider.clone())
         .await?;
     graph
-        .register_relation_provider(kind.clone(), provider.clone())
+        .register_property_mutation_provider(kind.clone(), traced_provider.clone())
         .await?;
     graph
-        .register_relation_mutation_provider(kind, provider.clone())
+        .register_relation_provider(kind.clone(), traced_provider.clone())
+        .await?;
+    graph
+        .register_relation_mutation_provider(kind, traced_provider)
         .await?;
     Ok(ProjectPluginHandle {
         _provider: provider,
@@ -85,5 +96,28 @@ fn config_error(error: toml::de::Error) -> GraphError {
         kind: "project plugin config",
         value: error.to_string(),
         reason: "invalid TOML shape",
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::PathBuf;
+
+    use locusfs_graph::{DynamicGraph, GraphError};
+
+    use super::{ProjectConfig, register_with_config};
+
+    #[tokio::test]
+    async fn state_path_is_rejected_until_persistence_exists() {
+        let error = register_with_config(
+            &DynamicGraph::new(),
+            ProjectConfig {
+                state_path: Some(PathBuf::from("/tmp/locusfs-project-state.toml")),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, GraphError::InvalidValue { .. }));
     }
 }

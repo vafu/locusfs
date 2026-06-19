@@ -552,6 +552,7 @@ dependencies = [
  "locusfs-graph",
  "locusfs-plugin-api",
  "serde",
+ "tokio",
  "toml",
 ]
 

@@ -12,3 +12,6 @@ locusfs-graph = { path = "../../locusfs-graph" }
 locusfs-plugin-api = { path = "../../locusfs-plugin-api" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

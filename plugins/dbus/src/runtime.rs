@@ -122,10 +122,10 @@ async fn snapshot_service(
 }
 
 async fn current_owner(dbus: &DBusProxy<'_>, service_name: &str) -> Result<Option<String>> {
-    let service = BusName::try_from(service_name).map_err(|error| GraphError::InvalidValue {
+    let service = BusName::try_from(service_name).map_err(|_| GraphError::InvalidValue {
         kind: "D-Bus service",
         value: service_name.to_string(),
-        reason: Box::leak(error.to_string().into_boxed_str()),
+        reason: "invalid bus name",
     })?;
     match dbus.get_name_owner(service).await {
         Ok(owner) => Ok(Some(owner.to_string())),
@@ -307,10 +307,10 @@ async fn properties_for_interface(
             ))
         })?;
     let interface_name =
-        InterfaceName::try_from(interface).map_err(|error| GraphError::InvalidValue {
+        InterfaceName::try_from(interface).map_err(|_| GraphError::InvalidValue {
             kind: "D-Bus interface",
             value: interface.to_string(),
-            reason: Box::leak(error.to_string().into_boxed_str()),
+            reason: "invalid interface name",
         })?;
     let properties = proxy.get_all(interface_name).await.map_err(|error| {
         GraphError::Io(format!("read {interface} properties at {path}: {error}"))
@@ -333,17 +333,52 @@ fn parse_child_node_names(xml: &str) -> Vec<String> {
 }
 
 fn parse_named_tags(xml: &str, tag: &str) -> Vec<String> {
-    let needle = format!("<{tag} ");
-    xml.split(&needle)
-        .skip(1)
-        .filter_map(|rest| quoted_attr(rest, "name"))
-        .collect()
+    let needle = format!("<{tag}");
+    let mut names = Vec::new();
+    let mut remaining = xml;
+    while let Some(index) = remaining.find(&needle) {
+        remaining = &remaining[index + needle.len()..];
+        let Some(first) = remaining.chars().next() else {
+            break;
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            continue;
+        }
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        if let Some(name) = attr_value(&remaining[..end], "name") {
+            names.push(name);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    names
 }
 
-fn quoted_attr(tag_body: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let value = tag_body.split_once(&needle)?.1;
-    Some(value.split_once('"')?.0.to_string())
+fn attr_value(tag_body: &str, attr: &str) -> Option<String> {
+    let mut remaining = tag_body;
+    while let Some(index) = remaining.find(attr) {
+        let before = remaining[..index].chars().next_back();
+        let after = remaining[index + attr.len()..].chars().next();
+        let is_name_boundary = before
+            .is_none_or(|character| character.is_whitespace() || character == '/')
+            && after.is_some_and(|character| character.is_whitespace() || character == '=');
+        remaining = &remaining[index + attr.len()..];
+        if !is_name_boundary {
+            continue;
+        }
+        remaining = remaining.trim_start();
+        let value = remaining.strip_prefix('=')?.trim_start();
+        let mut chars = value.chars();
+        let quote = chars.next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value = chars.as_str();
+        let end = value.find(quote)?;
+        return Some(value[..end].to_string());
+    }
+    None
 }
 
 fn is_standard_interface(interface: &str) -> bool {
@@ -423,10 +458,31 @@ mod test {
     use tokio::time::{Duration, Instant, sleep};
     use zbus::fdo::DBusProxy;
 
-    use super::current_owner;
+    use super::{current_owner, parse_child_node_names, parse_interface_names};
     use crate::config::{DbusConfig, ServiceConfig};
     use crate::register_with_config;
     use crate::state::service_node;
+
+    #[test]
+    fn introspection_parser_accepts_attribute_variants() {
+        let xml = r#"
+            <node>
+              <interface name = 'org.example.First'/>
+              <interface version="1" name="org.example.Second"></interface>
+              <node name = "child"/>
+              <node name='/absolute-is-ignored'/>
+            </node>
+        "#;
+
+        assert_eq!(
+            parse_interface_names(xml),
+            vec![
+                "org.example.First".to_string(),
+                "org.example.Second".to_string()
+            ]
+        );
+        assert_eq!(parse_child_node_names(xml), vec!["child".to_string()]);
+    }
 
     #[tokio::test]
     async fn realtime_default_service_owner_matches_system_bus_snapshot_when_available() {
