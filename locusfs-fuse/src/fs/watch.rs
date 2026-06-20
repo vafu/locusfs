@@ -4,6 +4,7 @@ use std::sync::Arc;
 use fuse3::Errno;
 use fuse3::raw::flags::FUSE_POLL_SCHEDULE_NOTIFY;
 use locusfs_graph::{GraphWatchEvent, GraphWatchTarget, NodeId, PropertyKey, RelationName};
+use locusfs_watch::{WatchAction, WatchChange as ProtocolWatchChange, WatchEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -27,6 +28,8 @@ pub enum WatchKey {
 }
 
 pub type WatchSubjectKey = GraphWatchTarget;
+
+pub(crate) use locusfs_watch::{WatchState, WatchValue};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WatchChange {
@@ -61,24 +64,6 @@ impl From<GraphWatchEvent> for WatchChange {
             }
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WatchMessage {
-    State(WatchState),
-    Change(WatchChange),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WatchState {
-    Unset,
-    Set(WatchValue),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WatchValue {
-    Path(String),
-    Property(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,7 +112,7 @@ struct WatchHandle {
     uses_graph_watch: bool,
     pending_read: Option<Vec<u8>>,
     watch_task: Option<JoinHandle<()>>,
-    pending_events: VecDeque<WatchMessage>,
+    pending_events: VecDeque<WatchEvent>,
     poll_handles: Vec<PollHandle>,
 }
 
@@ -266,7 +251,7 @@ impl WatchRegistry {
             let Some(message) = watch.pending_events.pop_front() else {
                 return Ok(Vec::new());
             };
-            let value = watch_message_bytes(message, watch.resolved_subject.as_ref());
+            let value = message.encode_text();
             let path = watch.original_path.as_deref().unwrap_or("<unconfigured>");
             info!("{} >>> {}", path, format_watch_value(&value));
             watch.pending_read = Some(value);
@@ -587,11 +572,11 @@ impl WatchRegistry {
         }
         watch
             .pending_events
-            .retain(|pending| !matches!(pending, WatchMessage::State(_)));
+            .retain(|pending| !matches!(pending, WatchEvent::State(_)));
         if watch.pending_events.len() >= MAX_PENDING_WATCH_EVENTS {
             watch.pending_events.pop_front();
         }
-        watch.pending_events.push_back(WatchMessage::State(state));
+        watch.pending_events.push_back(WatchEvent::State(state));
         std::mem::take(&mut watch.poll_handles)
     }
 
@@ -613,7 +598,8 @@ impl WatchRegistry {
         if watch.pending_events.len() >= MAX_PENDING_WATCH_EVENTS {
             watch.pending_events.pop_front();
         }
-        watch.pending_events.push_back(WatchMessage::Change(event));
+        let event = protocol_change_event(event, watch.resolved_subject.as_ref());
+        watch.pending_events.push_back(WatchEvent::Change(event));
         std::mem::take(&mut watch.poll_handles)
     }
 
@@ -753,47 +739,32 @@ impl WatchRegistry {
     }
 }
 
-fn watch_message_bytes(message: WatchMessage, subject: Option<&WatchSubjectKey>) -> Vec<u8> {
-    match message {
-        WatchMessage::State(state) => watch_state_bytes(state),
-        WatchMessage::Change(change) => watch_change_bytes(change, subject),
-    }
-}
-
-fn watch_state_bytes(state: WatchState) -> Vec<u8> {
-    match state {
-        WatchState::Unset => b"unset\n".to_vec(),
-        WatchState::Set(value) => format!("set {}\n", watch_value_payload(value)).into_bytes(),
-    }
-}
-
-fn watch_value_payload(value: WatchValue) -> String {
-    match value {
-        WatchValue::Path(path) | WatchValue::Property(path) => path,
-    }
-}
-
-fn watch_change_bytes(change: WatchChange, subject: Option<&WatchSubjectKey>) -> Vec<u8> {
+fn protocol_change_event(
+    change: WatchChange,
+    subject: Option<&WatchSubjectKey>,
+) -> ProtocolWatchChange {
     match change {
-        WatchChange::Change => b"change\n".to_vec(),
-        WatchChange::NodeAdded(node) => format!("node added {node}\n").into_bytes(),
-        WatchChange::NodeChanged(node) => format!("node changed {node}\n").into_bytes(),
-        WatchChange::NodeRemoved(node) => format!("node removed {node}\n").into_bytes(),
-        WatchChange::PropertyAdded(node, key) => property_event_bytes("added", node, key, subject),
+        WatchChange::Change => ProtocolWatchChange::Change,
+        WatchChange::NodeAdded(node) => node_event(WatchAction::Added, node),
+        WatchChange::NodeChanged(node) => node_event(WatchAction::Changed, node),
+        WatchChange::NodeRemoved(node) => node_event(WatchAction::Removed, node),
+        WatchChange::PropertyAdded(node, key) => {
+            property_event(WatchAction::Added, node, key, subject)
+        }
         WatchChange::PropertyChanged(node, key) => {
-            property_event_bytes("changed", node, key, subject)
+            property_event(WatchAction::Changed, node, key, subject)
         }
         WatchChange::PropertyRemoved(node, key) => {
-            property_event_bytes("removed", node, key, subject)
+            property_event(WatchAction::Removed, node, key, subject)
         }
         WatchChange::RelationAdded(source, relation) => {
-            relation_event_bytes("added", source, relation, subject)
+            relation_event(WatchAction::Added, source, relation, subject)
         }
         WatchChange::RelationChanged(source, relation) => {
-            relation_event_bytes("changed", source, relation, subject)
+            relation_event(WatchAction::Changed, source, relation, subject)
         }
         WatchChange::RelationRemoved(source, relation) => {
-            relation_event_bytes("removed", source, relation, subject)
+            relation_event(WatchAction::Removed, source, relation, subject)
         }
     }
 }
@@ -847,31 +818,54 @@ fn fallback_state_for_target(target: &WatchTarget, ready: bool) -> WatchState {
     }
 }
 
-fn property_event_bytes(
-    action: &str,
-    node: NodeId,
-    key: PropertyKey,
-    subject: Option<&WatchSubjectKey>,
-) -> Vec<u8> {
-    match subject {
-        Some(GraphWatchTarget::Node(watched)) if watched == &node => {
-            format!("property {action} {key}\n").into_bytes()
-        }
-        _ => format!("property {action} {node} {key}\n").into_bytes(),
+fn node_event(action: WatchAction, node: NodeId) -> ProtocolWatchChange {
+    ProtocolWatchChange::Node {
+        action,
+        node: node.to_string(),
     }
 }
 
-fn relation_event_bytes(
-    action: &str,
+fn property_event(
+    action: WatchAction,
+    node: NodeId,
+    key: PropertyKey,
+    subject: Option<&WatchSubjectKey>,
+) -> ProtocolWatchChange {
+    match subject {
+        Some(GraphWatchTarget::Node(watched)) if watched == &node => {
+            ProtocolWatchChange::Property {
+                action,
+                node: None,
+                key: key.to_string(),
+            }
+        }
+        _ => ProtocolWatchChange::Property {
+            action,
+            node: Some(node.to_string()),
+            key: key.to_string(),
+        },
+    }
+}
+
+fn relation_event(
+    action: WatchAction,
     source: NodeId,
     relation: RelationName,
     subject: Option<&WatchSubjectKey>,
-) -> Vec<u8> {
+) -> ProtocolWatchChange {
     match subject {
         Some(GraphWatchTarget::Node(watched)) if watched == &source => {
-            format!("relation {action} {relation}\n").into_bytes()
+            ProtocolWatchChange::Relation {
+                action,
+                node: None,
+                relation: relation.to_string(),
+            }
         }
-        _ => format!("relation {action} {source} {relation}\n").into_bytes(),
+        _ => ProtocolWatchChange::Relation {
+            action,
+            node: Some(source.to_string()),
+            relation: relation.to_string(),
+        },
     }
 }
 

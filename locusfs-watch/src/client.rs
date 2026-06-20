@@ -9,6 +9,8 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::info;
 
+use crate::{WatchEvent, WatchState};
+
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reads a locusfs path into memory.
@@ -192,8 +194,34 @@ impl Watch {
         self.wait_event().await.map(|_| ())
     }
 
-    /// Waits until this subscription receives a watch event and returns its raw payload.
-    pub async fn wait_event(&mut self) -> io::Result<Vec<u8>> {
+    /// Waits until this subscription receives a typed watch event.
+    pub async fn wait_event(&mut self) -> io::Result<WatchEvent> {
+        self.next_event().await
+    }
+
+    /// Waits until this subscription receives a typed watch event.
+    pub async fn next_event(&mut self) -> io::Result<WatchEvent> {
+        WatchEvent::decode_text(&self.next_raw_event().await?)
+    }
+
+    /// Waits until this subscription receives a state event.
+    pub async fn next_state(&mut self) -> io::Result<WatchState> {
+        match self.next_event().await? {
+            WatchEvent::State(state) => Ok(state),
+            event => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected watch state event, got {event:?}"),
+            )),
+        }
+    }
+
+    /// Waits until this subscription receives a raw watch event payload.
+    pub async fn wait_raw_event(&mut self) -> io::Result<Vec<u8>> {
+        self.next_raw_event().await
+    }
+
+    /// Waits until this subscription receives a raw watch event payload.
+    pub async fn next_raw_event(&mut self) -> io::Result<Vec<u8>> {
         loop {
             let mut guard = self.watch_file.readable().await?;
             match guard.try_io(|watch_file| drain_watch_events(watch_file.get_ref())) {
@@ -203,9 +231,9 @@ impl Watch {
         }
     }
 
-    /// Waits until this subscription receives a UTF-8 watch event.
-    pub async fn wait_event_to_string(&mut self) -> io::Result<String> {
-        bytes_to_string(self.wait_event().await?)
+    /// Waits until this subscription receives a raw UTF-8 watch event.
+    pub async fn wait_raw_event_to_string(&mut self) -> io::Result<String> {
+        bytes_to_string(self.next_raw_event().await?)
     }
 
     /// Reads the current value from the watched data path.

@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 locusfs-graph = { path = "../../locusfs-graph" }
-locusfs-plugin-api = { path = "../../locusfs-plugin-api" }
+locusfs-plugin-api = { path = "../api" }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml = { workspace = true }

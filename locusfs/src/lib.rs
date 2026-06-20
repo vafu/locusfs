@@ -3,6 +3,6 @@
 pub mod config;
 pub mod plugin;
 
-pub use locusfs_client as client;
 pub use locusfs_fuse as fuse;
 pub use locusfs_graph as graph;
+pub use locusfs_watch as watch;

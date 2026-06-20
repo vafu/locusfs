@@ -443,10 +443,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
- "locusfs-client",
  "locusfs-fuse",
  "locusfs-graph",
  "locusfs-plugin-api",
+ "locusfs-watch",
  "perfetto-sdk",
  "serde",
  "tokio",
@@ -454,15 +454,6 @@ dependencies = [
  "tracing",
  "tracing-perfetto-sdk",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "locusfs-client"
-version = "0.1.0"
-dependencies = [
- "libc",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -476,6 +467,7 @@ dependencies = [
  "futures-util",
  "libc",
  "locusfs-graph",
+ "locusfs-watch",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -554,6 +546,15 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "locusfs-watch"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

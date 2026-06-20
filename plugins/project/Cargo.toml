@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 async-trait = { workspace = true }
 locusfs-graph = { path = "../../locusfs-graph" }
-locusfs-plugin-api = { path = "../../locusfs-plugin-api" }
+locusfs-plugin-api = { path = "../api" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 

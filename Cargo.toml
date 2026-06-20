@@ -1,10 +1,10 @@
 [workspace]
 members = [
     "locusfs",
-    "locusfs-client",
+    "locusfs-watch",
     "locusfs-graph",
     "locusfs-fuse",
-    "locusfs-plugin-api",
+    "plugins/api",
     "plugins/dbus",
     "plugins/niri",
     "plugins/pipewire",

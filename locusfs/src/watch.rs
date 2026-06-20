@@ -1,14 +1,14 @@
 use std::io;
 use std::path::Path;
 
-use locusfs_client::Watch;
+use locusfs_watch::Watch;
 use tokio::io::{AsyncWriteExt, stdout};
 
 pub async fn watch_path(path: &Path) -> io::Result<()> {
     let mut watcher = Watch::open(path).await?;
     if tokio::fs::metadata(path).await?.is_dir() {
         loop {
-            print_value(watcher.wait_event().await?).await?;
+            print_value(watcher.wait_raw_event().await?).await?;
         }
     }
 
