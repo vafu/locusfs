@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "locusfs",
-    "locusfs-watch",
-    "locusfs-graph",
-    "locusfs-fuse",
+    "bin",
+    "watch",
+    "graph",
+    "fuse",
     "plugins/api",
     "plugins/dbus",
     "plugins/niri",

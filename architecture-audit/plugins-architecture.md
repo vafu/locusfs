@@ -8,7 +8,7 @@ Scope: `plugins/dbus/`, `plugins/niri/`, `plugins/pipewire/`, and `plugins/proje
 
 Fact: `DbusProvider`, `NiriProvider`, and `PipeWireProvider` are structurally the same wrapper: each stores a `NodeKind` plus shared async state, exposes a `new` constructor, reads the state through `with_state`, and implements `NodeProvider`, `PropertyProvider`, and `RelationProvider` by delegation. See `plugins/dbus/src/provider.rs:9`, `plugins/dbus/src/provider.rs:20`, `plugins/dbus/src/provider.rs:27`, `plugins/niri/src/provider.rs:10`, `plugins/niri/src/provider.rs:21`, `plugins/niri/src/provider.rs:27`, `plugins/pipewire/src/provider.rs:9`, `plugins/pipewire/src/provider.rs:20`, and `plugins/pipewire/src/provider.rs:29`.
 
-Fact: The graph crate already has wrappers like `TracedProvider`, but that wrapper adds instrumentation around an existing provider; it does not remove the repeated state-lock/delegate provider implementation. See `locusfs-graph/src/graph/trace.rs:13` and `locusfs-graph/src/graph/trace.rs:28`.
+Fact: The graph crate already has wrappers like `TracedProvider`, but that wrapper adds instrumentation around an existing provider; it does not remove the repeated state-lock/delegate provider implementation. See `graph/src/graph/trace.rs:13` and `graph/src/graph/trace.rs:28`.
 
 Recommendation: Introduce a small shared read-only projection provider abstraction, probably in `locusfs-graph` or `plugins/api` (`locusfs-plugin-api`), that can wrap `Arc<RwLock<S>>` where `S` implements a local projection trait. This would let plugin crates define their domain projection once and avoid three near-identical provider files. Keep it read-only; `ProjectPlugin` already uses `InMemoryProvider` for read-write behavior.
 

@@ -10,8 +10,8 @@ fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 libc = "0.2.177"
-locusfs-graph = { path = "../locusfs-graph" }
-locusfs-watch = { path = "../locusfs-watch", default-features = false }
+locusfs-graph = { path = "../graph", default-features = false, features = ["dynamic", "in-memory", "watch-provider"] }
+locusfs-watch = { path = "../watch", default-features = false }
 thiserror = "2.0.18"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"

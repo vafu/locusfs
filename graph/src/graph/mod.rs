@@ -1,8 +1,12 @@
 mod access;
 mod change;
+#[cfg(feature = "dynamic")]
 mod dynamic;
+#[cfg(feature = "in-memory")]
 mod memory;
+#[cfg(feature = "provider-tracing")]
 mod trace;
+#[cfg(feature = "watch-provider")]
 mod watch;
 
 use async_trait::async_trait;
@@ -11,11 +15,15 @@ use crate::{LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationNam
 
 pub use access::NodeAccess;
 pub use change::GraphChange;
+#[cfg(feature = "dynamic")]
 pub use dynamic::{
     DynamicGraph, GraphChangeReceiver, GraphChangeStreamError, GraphChangeSubscription,
 };
+#[cfg(feature = "in-memory")]
 pub use memory::InMemoryProvider;
+#[cfg(feature = "provider-tracing")]
 pub use trace::TracedProvider;
+#[cfg(feature = "watch-provider")]
 pub use watch::{GraphWatch, GraphWatchEvent, GraphWatchTarget, WatchProvider};
 
 #[async_trait]
@@ -74,5 +82,11 @@ pub trait RelationMutationProvider: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "dynamic",
+    feature = "in-memory",
+    feature = "provider-tracing",
+    feature = "watch-provider"
+))]
 mod test;

@@ -18,7 +18,7 @@ type PluginInit = unsafe extern "C" fn() -> *mut dyn LocusFsPlugin;
 
 #[derive(Default)]
 pub struct PluginManager {
-    _loaded: Vec<LoadedPlugin>,
+    loaded: Vec<LoadedPlugin>,
 }
 
 struct LoadedPlugin {
@@ -47,15 +47,11 @@ impl PluginManager {
             };
             loaded.push(plugin);
         }
-        Ok(Self { _loaded: loaded })
-    }
-
-    pub fn loaded_count(&self) -> usize {
-        self._loaded.len()
+        Ok(Self { loaded })
     }
 
     pub async fn shutdown(&mut self) {
-        shutdown_loaded(&mut self._loaded).await;
+        shutdown_loaded(&mut self.loaded).await;
     }
 }
 

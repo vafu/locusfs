@@ -4,7 +4,7 @@ set -euo pipefail
 metadata_file=".project.json"
 default_icon="folder_code"
 default_branch_regex='^[^/]+/(?P<subproj>[^/]+)/(?P<task>.+)$'
-mountpoint="${LOCUSFS_MOUNT:-${LOCUS_MOUNT:-/tmp/rsynapse}}"
+mountpoint="${LOCUSFS_MOUNT:-${LOCUS_MOUNT:-/tmp/locusfs}}"
 
 usage() {
   cat >&2 <<'EOF'
@@ -297,6 +297,7 @@ cmd_clear() {
 
 main() {
   need jq
+  need realpath
   local command="${1:-}"
   [[ -n "$command" ]] || { usage; exit 2; }
   shift || true

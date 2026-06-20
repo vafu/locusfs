@@ -3,13 +3,15 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use locusfs::config::Config;
-use locusfs::fuse::{FuseMount, FuseMountConfig, mount};
-use locusfs::graph::DynamicGraph;
-use locusfs::plugin::PluginManager;
+use crate::config::Config;
+use crate::plugin::PluginManager;
+use locusfs_fuse::{FuseMount, FuseMountConfig, mount};
+use locusfs_graph::DynamicGraph;
 use tracing_subscriber::prelude::*;
 
+mod config;
 mod perfetto;
+mod plugin;
 mod watch;
 
 type AppError = Box<dyn std::error::Error + Send + Sync>;

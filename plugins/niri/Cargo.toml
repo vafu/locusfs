@@ -8,7 +8,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 async-trait = { workspace = true }
-locusfs-graph = { path = "../../locusfs-graph" }
+locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic", "provider-tracing"] }
 locusfs-plugin-api = { path = "../api" }
 niri-ipc = "=26.4.0"
 serde = { workspace = true, features = ["derive"] }
