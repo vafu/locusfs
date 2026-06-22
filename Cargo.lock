@@ -510,6 +510,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "locusfs-plugin-mpris"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "locusfs-graph",
+ "locusfs-plugin-api",
+ "tokio",
+ "toml",
+ "zbus",
+]
+
+[[package]]
 name = "locusfs-plugin-niri"
 version = "0.1.0"
 dependencies = [

@@ -1,14 +1,12 @@
 use locusfs_graph::{DynamicGraph, GraphError, Result};
 use locusfs_plugin_api::enter_runtime;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::config::PipeWireConfig;
 use crate::state::{PactlEndpoint, PactlInfo, SharedPipeWireState, snapshot_from_pactl};
-
-const SUBSCRIPTION_REFRESH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Default)]
 pub struct PipeWireRuntime;
@@ -65,19 +63,7 @@ async fn run_pipewire_watcher(
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if subscription_line_affects_snapshot(&line) {
-                        match wait_for_subscription_burst_to_settle(&mut lines).await {
-                            Ok(true) => refresh_and_publish(&config, &state, &graph).await,
-                            Ok(false) => {
-                                eprintln!("locusfs-pipewire: pactl subscribe ended");
-                                break;
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "locusfs-pipewire: failed to read pactl subscribe: {error}"
-                                );
-                                break;
-                            }
-                        }
+                        refresh_and_publish(&config, &state, &graph).await;
                     }
                 }
                 Ok(None) => {
@@ -94,26 +80,6 @@ async fn run_pipewire_watcher(
         let _ = child.kill().await;
         sleep_retry().await;
         refresh_and_publish(&config, &state, &graph).await;
-    }
-}
-
-async fn wait_for_subscription_burst_to_settle<R>(
-    lines: &mut Lines<BufReader<R>>,
-) -> std::result::Result<bool, std::io::Error>
-where
-    R: AsyncRead + Unpin,
-{
-    loop {
-        match tokio::time::timeout(SUBSCRIPTION_REFRESH_DEBOUNCE, lines.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                if subscription_line_affects_snapshot(&line) {
-                    continue;
-                }
-            }
-            Ok(Ok(None)) => return Ok(false),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Ok(true),
-        }
     }
 }
 

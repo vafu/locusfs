@@ -1,0 +1,16 @@
+[package]
+name = "locusfs-plugin-mpris"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic", "provider-tracing"] }
+locusfs-plugin-api = { path = "../api" }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+toml = { workspace = true }
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }
