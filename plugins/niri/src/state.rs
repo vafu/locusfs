@@ -254,11 +254,19 @@ impl NiriState {
                 }
                 for workspace in workspaces {
                     let node = workspace_id_node(workspace.id)?;
-                    changes.push(if old_workspace_ids.contains(&workspace.id) {
+                    let change = if let Some(old_workspace) =
+                        self.stream.workspaces.workspaces.get(&workspace.id)
+                    {
+                        push_workspace_update_property_changes(
+                            &mut changes,
+                            old_workspace,
+                            workspace,
+                        )?;
                         GraphChange::NodeChanged { node: node.clone() }
                     } else {
                         GraphChange::NodeAdded { node: node.clone() }
-                    });
+                    };
+                    changes.push(change);
                     changes.push(GraphChange::RelationChanged {
                         source: node,
                         relation: relation(OUTPUT_RELATION)?,
@@ -352,11 +360,14 @@ impl NiriState {
                 }
                 for window in windows {
                     let node = window_id_node(window.id)?;
-                    changes.push(if old_window_ids.contains(&window.id) {
-                        GraphChange::NodeChanged { node: node.clone() }
-                    } else {
-                        GraphChange::NodeAdded { node: node.clone() }
-                    });
+                    let change =
+                        if let Some(old_window) = self.stream.windows.windows.get(&window.id) {
+                            push_window_update_property_changes(&mut changes, old_window, window)?;
+                            GraphChange::NodeChanged { node: node.clone() }
+                        } else {
+                            GraphChange::NodeAdded { node: node.clone() }
+                        };
+                    changes.push(change);
                     changes.push(GraphChange::RelationChanged {
                         source: node,
                         relation: relation(WORKSPACE_RELATION)?,
@@ -373,11 +384,13 @@ impl NiriState {
                 changes.push(GraphChange::NodeKindChanged {
                     kind: NodeKind::new(WINDOW_KIND)?,
                 });
-                changes.push(if self.window(&node).is_some() {
+                let change = if let Some(old_window) = self.window(&node) {
+                    push_window_update_property_changes(&mut changes, old_window, window)?;
                     GraphChange::NodeChanged { node: node.clone() }
                 } else {
                     GraphChange::NodeAdded { node: node.clone() }
-                });
+                };
+                changes.push(change);
                 changes.push(GraphChange::RelationChanged {
                     source: node,
                     relation: relation(WORKSPACE_RELATION)?,
@@ -443,7 +456,15 @@ impl NiriState {
                 changes.push(property_change(window_id_node(*id)?, "urgent")?);
             }
             Event::WindowLayoutsChanged { changes: layouts } => {
-                for (id, _) in layouts {
+                for (id, layout) in layouts {
+                    if let Some(window) = self.stream.windows.windows.get(id) {
+                        push_window_layout_property_changes(
+                            &mut changes,
+                            window_id_node(*id)?,
+                            &window.layout,
+                            layout,
+                        )?;
+                    }
                     changes.push(GraphChange::NodeChanged {
                         node: window_id_node(*id)?,
                     });
@@ -531,11 +552,6 @@ fn workspace_properties(
     insert(
         &mut properties,
         "index",
-        LocusValue::U32(workspace.idx.into()),
-    )?;
-    insert(
-        &mut properties,
-        "idx",
         LocusValue::U32(workspace.idx.into()),
     )?;
     insert(
@@ -711,6 +727,159 @@ fn property_change(node: NodeId, key: &'static str) -> Result<GraphChange> {
         node,
         key: PropertyKey::new(key)?,
     })
+}
+
+fn property_add(node: NodeId, key: &'static str) -> Result<GraphChange> {
+    Ok(GraphChange::PropertyAdded {
+        node,
+        key: PropertyKey::new(key)?,
+    })
+}
+
+fn property_remove(node: NodeId, key: &'static str) -> Result<GraphChange> {
+    Ok(GraphChange::PropertyRemoved {
+        node,
+        key: PropertyKey::new(key)?,
+    })
+}
+
+fn push_property_update<T: PartialEq>(
+    changes: &mut Vec<GraphChange>,
+    node: &NodeId,
+    key: &'static str,
+    old: T,
+    new: T,
+) -> Result<()> {
+    if old != new {
+        changes.push(property_change(node.clone(), key)?);
+    }
+    Ok(())
+}
+
+fn push_optional_property_update<T: PartialEq>(
+    changes: &mut Vec<GraphChange>,
+    node: &NodeId,
+    key: &'static str,
+    old: Option<T>,
+    new: Option<T>,
+) -> Result<()> {
+    match (old, new) {
+        (None, None) => {}
+        (None, Some(_)) => changes.push(property_add(node.clone(), key)?),
+        (Some(_), None) => changes.push(property_remove(node.clone(), key)?),
+        (Some(old), Some(new)) if old != new => changes.push(property_change(node.clone(), key)?),
+        (Some(_), Some(_)) => {}
+    }
+    Ok(())
+}
+
+fn push_workspace_update_property_changes(
+    changes: &mut Vec<GraphChange>,
+    old: &Workspace,
+    new: &Workspace,
+) -> Result<()> {
+    let node = workspace_id_node(new.id)?;
+    push_property_update(changes, &node, "index", old.idx, new.idx)?;
+    if old.name != new.name || (old.name.is_none() && new.name.is_none() && old.idx != new.idx) {
+        changes.push(property_change(node.clone(), "name")?);
+    }
+    push_property_update(changes, &node, "urgent", old.is_urgent, new.is_urgent)?;
+    push_property_update(changes, &node, "active", old.is_active, new.is_active)?;
+    push_property_update(changes, &node, "focused", old.is_focused, new.is_focused)?;
+    push_optional_property_update(
+        changes,
+        &node,
+        "active-window-id",
+        old.active_window_id,
+        new.active_window_id,
+    )?;
+    Ok(())
+}
+
+fn push_window_update_property_changes(
+    changes: &mut Vec<GraphChange>,
+    old: &Window,
+    new: &Window,
+) -> Result<()> {
+    let node = window_id_node(new.id)?;
+    push_optional_property_update(
+        changes,
+        &node,
+        "title",
+        old.title.as_deref(),
+        new.title.as_deref(),
+    )?;
+    push_optional_property_update(
+        changes,
+        &node,
+        "app-id",
+        old.app_id.as_deref(),
+        new.app_id.as_deref(),
+    )?;
+    push_optional_property_update(changes, &node, "pid", old.pid, new.pid)?;
+    push_optional_property_update(
+        changes,
+        &node,
+        "workspace-id",
+        old.workspace_id,
+        new.workspace_id,
+    )?;
+    push_property_update(changes, &node, "focused", old.is_focused, new.is_focused)?;
+    push_property_update(changes, &node, "floating", old.is_floating, new.is_floating)?;
+    push_property_update(changes, &node, "urgent", old.is_urgent, new.is_urgent)?;
+    push_window_layout_property_changes(changes, node, &old.layout, &new.layout)?;
+    Ok(())
+}
+
+fn push_window_layout_property_changes(
+    changes: &mut Vec<GraphChange>,
+    node: NodeId,
+    old: &niri_ipc::WindowLayout,
+    new: &niri_ipc::WindowLayout,
+) -> Result<()> {
+    push_optional_property_update(
+        changes,
+        &node,
+        "column",
+        old.pos_in_scrolling_layout.map(|(column, _)| column),
+        new.pos_in_scrolling_layout.map(|(column, _)| column),
+    )?;
+    push_optional_property_update(
+        changes,
+        &node,
+        "row",
+        old.pos_in_scrolling_layout.map(|(_, row)| row),
+        new.pos_in_scrolling_layout.map(|(_, row)| row),
+    )?;
+    push_property_update(
+        changes,
+        &node,
+        "tile-width",
+        old.tile_size.0,
+        new.tile_size.0,
+    )?;
+    push_property_update(
+        changes,
+        &node,
+        "tile-height",
+        old.tile_size.1,
+        new.tile_size.1,
+    )?;
+    push_property_update(
+        changes,
+        &node,
+        "window-width",
+        old.window_size.0,
+        new.window_size.0,
+    )?;
+    push_property_update(
+        changes,
+        &node,
+        "window-height",
+        old.window_size.1,
+        new.window_size.1,
+    )?;
+    Ok(())
 }
 
 fn push_selected_window_property_changes(

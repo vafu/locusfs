@@ -74,6 +74,22 @@ fn exposes_properties_as_read_only_specs() {
 }
 
 #[test]
+fn workspace_properties_do_not_expose_idx_alias() {
+    let mut state = NiriState::new(HashMap::new());
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+
+    assert!(
+        state
+            .property(&node("workspace", "42"), &property("idx"))
+            .is_err()
+    );
+}
+
+#[test]
 fn empty_registered_kind_lists_as_empty_nodes() {
     let mut state = NiriState::new(HashMap::new());
     state
@@ -293,6 +309,124 @@ fn windows_changed_emits_node_removed_for_missing_old_window() {
     assert!(changes.contains(&locusfs_graph::GraphChange::NodeRemoved {
         node: node("window", "7"),
     }));
+}
+
+#[test]
+fn windows_changed_emits_property_changes_for_reordered_window() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1"), workspace(43, "DP-1")],
+        })
+        .unwrap();
+    state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(7, 42, "Terminal")],
+        })
+        .unwrap();
+
+    let mut moved = window(7, 43, "Terminal");
+    moved.layout.pos_in_scrolling_layout = Some((3, 4));
+    let changes = state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![moved],
+        })
+        .unwrap();
+
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("workspace-id"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("column"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("row"),
+        })
+    );
+}
+
+#[test]
+fn window_layouts_changed_emits_position_property_changes() {
+    let mut state = state_with_output("DP-1");
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![workspace(42, "DP-1")],
+        })
+        .unwrap();
+    state
+        .apply_event(Event::WindowsChanged {
+            windows: vec![window(7, 42, "Terminal")],
+        })
+        .unwrap();
+
+    let mut layout = window(7, 42, "Terminal").layout;
+    layout.pos_in_scrolling_layout = Some((5, 6));
+    let changes = state
+        .apply_event(Event::WindowLayoutsChanged {
+            changes: vec![(7, layout)],
+        })
+        .unwrap();
+
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("column"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("window", "7"),
+            key: property("row"),
+        })
+    );
+}
+
+#[test]
+fn workspaces_changed_emits_property_changes_for_reordered_workspace() {
+    let mut state = state_with_output("DP-1");
+    let mut first = workspace(42, "DP-1");
+    first.idx = 1;
+    first.name = None;
+    state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![first.clone()],
+        })
+        .unwrap();
+
+    let mut reordered = first;
+    reordered.idx = 3;
+    let changes = state
+        .apply_event(Event::WorkspacesChanged {
+            workspaces: vec![reordered],
+        })
+        .unwrap();
+
+    assert_eq!(
+        state
+            .property(&node("workspace", "42"), &property("index"))
+            .unwrap(),
+        LocusValue::U32(3)
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("workspace", "42"),
+            key: property("index"),
+        })
+    );
+    assert!(
+        changes.contains(&locusfs_graph::GraphChange::PropertyChanged {
+            node: node("workspace", "42"),
+            key: property("name"),
+        })
+    );
 }
 
 fn state_with_output(name: &str) -> NiriState {
