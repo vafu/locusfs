@@ -62,6 +62,7 @@ pub async fn register_with_config(
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
+        graph.register_path_provider(provider.clone()).await?;
         graph.register_relation_provider(kind, provider).await?;
     }
     let item_kind = NodeKind::new(DBUSMENU_ITEM_KIND)?;

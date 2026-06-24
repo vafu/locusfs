@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::config::DbusConfig;
 use crate::runtime::DbusRuntime;
 
-pub const DBUS_SERVICE_KIND: &str = "dbus-service";
+pub const DBUS_SERVICE_KIND: &str = "dbus";
 pub const DBUS_OBJECT_KIND: &str = "dbus-object";
 pub const DBUS_METHOD_KIND: &str = "dbus-method";
 

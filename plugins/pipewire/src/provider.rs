@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use locusfs_graph::{
-    LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyProvider, PropertySpec,
-    RelationName, RelationProvider, Result,
+    GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget, LocusValue, NodeAccess,
+    NodeId, NodeKind, NodeProvider, PathName, PathProvider, PropertyKey, PropertyProvider,
+    PropertySpec, RelationName, RelationProvider, Result,
 };
 
 use crate::state::{PipeWireState, SharedPipeWireState};
+use crate::{PIPEWIRE_SINK_KIND, PIPEWIRE_SOURCE_KIND};
 
 #[derive(Clone)]
 pub struct PipeWireProvider {
@@ -32,12 +34,51 @@ impl NodeProvider for PipeWireProvider {
         &self.kind
     }
 
+    fn access(&self) -> NodeAccess {
+        if matches!(
+            self.kind.as_str(),
+            PIPEWIRE_SINK_KIND | PIPEWIRE_SOURCE_KIND
+        ) {
+            NodeAccess::hidden()
+        } else {
+            NodeAccess::read_only()
+        }
+    }
+
     async fn contains_node(&self, node: &NodeId) -> Result<bool> {
         self.with_state(|state| state.contains_node(node)).await
     }
 
     async fn nodes(&self) -> Result<Vec<NodeId>> {
         self.with_state(|state| state.nodes(&self.kind)).await
+    }
+}
+
+#[async_trait]
+impl PathProvider for PipeWireProvider {
+    fn kind(&self) -> &NodeKind {
+        &self.kind
+    }
+
+    async fn lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        self.with_state(|state| state.path_lookup_child(parent, name))
+            .await
+    }
+
+    async fn children(&self, parent: &GraphPathDirectory) -> Result<Option<Vec<GraphPathChild>>> {
+        self.with_state(|state| state.path_children(parent)).await
+    }
+
+    async fn watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        self.with_state(|state| state.path_watch_target(directory))
+            .await
     }
 }
 

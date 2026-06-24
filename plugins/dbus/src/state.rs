@@ -14,7 +14,7 @@ pub type SharedDbusState = Arc<RwLock<DbusState>>;
 
 pub const OBJECT_RELATION: &str = "object";
 pub const METHODS_RELATION: &str = "methods";
-pub const SERVICE_RELATION: &str = "dbus-service";
+pub const SERVICE_RELATION: &str = "dbus";
 
 const PATH_OBJECT: &str = "object";
 const PATH_PROPERTIES: &str = "@properties";

@@ -124,38 +124,8 @@ impl LocusFs {
                 }
             }
             FsEntry::NodeDir(node) => {
-                if let Some(entry) = self
-                    .lookup_path_child(
-                        &GraphPathDirectory::Node(node.clone()),
-                        name,
-                        FsEntry::NodeDir(node.clone()),
-                    )
-                    .await?
-                {
-                    return Ok(entry);
-                }
-                let property = property_key_from_segment(name)?;
-                let has_property = self.graph.property_spec(&node, &property).await.is_ok();
-                let relation = relation_name_from_segment(name)?;
-                let targets = self.relation_targets(&node, &relation).await?;
-                let has_relation = !targets.is_empty();
-
-                if has_property && has_relation {
-                    return Err(errno(libc::EIO));
-                }
-                if has_property {
-                    return Ok(FsEntry::PropertyFile(node, property));
-                }
-
-                match targets.as_slice() {
-                    [] => Err(errno(libc::ENOENT)),
-                    [target] => Ok(FsEntry::RelationLink {
-                        source: node,
-                        relation,
-                        target: target.clone(),
-                    }),
-                    _ => Ok(FsEntry::RelationDir(node, relation)),
-                }
+                self.lookup_node_child(&node, name, FsEntry::NodeDir(node.clone()))
+                    .await
             }
             FsEntry::RelationDir(source, relation) => {
                 let targets = self
@@ -170,10 +140,20 @@ impl LocusFs {
                     target,
                 })
             }
-            FsEntry::PathDir { directory, .. } => self
-                .lookup_path_child(&directory, name, parent)
-                .await?
-                .ok_or(errno(libc::ENOENT)),
+            FsEntry::PathDir { directory, .. } => {
+                if let Some(entry) = self
+                    .lookup_path_child(&directory, name, parent.clone())
+                    .await?
+                {
+                    return Ok(entry);
+                }
+                match directory {
+                    GraphPathDirectory::Node(node) => {
+                        self.lookup_graph_node_child(&node, name).await
+                    }
+                    GraphPathDirectory::Virtual { .. } => Err(errno(libc::ENOENT)),
+                }
+            }
             FsEntry::WatchFile
             | FsEntry::PropertyFile(_, _)
             | FsEntry::RelationLink { .. }
@@ -199,6 +179,50 @@ impl LocusFs {
             return Ok(None);
         };
         Ok(Some(self.path_entry(entry, parent)))
+    }
+
+    async fn lookup_node_child(
+        &self,
+        node: &NodeId,
+        name: &str,
+        parent: FsEntry,
+    ) -> std::result::Result<FsEntry, Errno> {
+        if let Some(entry) = self
+            .lookup_path_child(&GraphPathDirectory::Node(node.clone()), name, parent)
+            .await?
+        {
+            return Ok(entry);
+        }
+        self.lookup_graph_node_child(node, name).await
+    }
+
+    async fn lookup_graph_node_child(
+        &self,
+        node: &NodeId,
+        name: &str,
+    ) -> std::result::Result<FsEntry, Errno> {
+        let property = property_key_from_segment(name)?;
+        let has_property = self.graph.property_spec(node, &property).await.is_ok();
+        let relation = relation_name_from_segment(name)?;
+        let targets = self.relation_targets(node, &relation).await?;
+        let has_relation = !targets.is_empty();
+
+        if has_property && has_relation {
+            return Err(errno(libc::EIO));
+        }
+        if has_property {
+            return Ok(FsEntry::PropertyFile(node.clone(), property));
+        }
+
+        match targets.as_slice() {
+            [] => Err(errno(libc::ENOENT)),
+            [target] => Ok(FsEntry::RelationLink {
+                source: node.clone(),
+                relation,
+                target: target.clone(),
+            }),
+            _ => Ok(FsEntry::RelationDir(node.clone(), relation)),
+        }
     }
 
     fn path_entry(&self, entry: GraphPathEntry, parent: FsEntry) -> FsEntry {

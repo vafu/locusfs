@@ -56,14 +56,17 @@ async fn register_with_runtime(graph: &DynamicGraph) -> Result<StatusNotifierPlu
     let runtime = PluginRuntime::new("locusfs-statusnotifier")?;
     let (state, event_stream) = StatusNotifierRuntime::start(graph.clone(), runtime.handle());
 
-    for kind in PROVIDER_KINDS {
-        let kind = NodeKind::new(*kind)?;
+    for kind_name in PROVIDER_KINDS {
+        let kind = NodeKind::new(*kind_name)?;
         let provider = StatusNotifierProvider::new(kind.clone(), state.clone());
         let provider = TracedProvider::new(PROVIDER_NAME, provider);
         graph.register_node_provider(provider.clone()).await?;
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
+        if *kind_name == STATUS_NOTIFIER_KIND {
+            graph.register_path_provider(provider.clone()).await?;
+        }
         graph.register_relation_provider(kind, provider).await?;
     }
 

@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use locusfs_graph::{
-    GraphError, LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyMutationProvider,
-    PropertyProvider, PropertySpec, RelationName, RelationProvider, Result,
+    GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget, LocusValue,
+    NodeAccess, NodeId, NodeKind, NodeProvider, PathName, PathProvider, PropertyKey,
+    PropertyMutationProvider, PropertyProvider, PropertySpec, RelationName, RelationProvider,
+    Result,
 };
 use tokio::runtime::Handle;
 
 use crate::state::{DbusMenuState, SharedDbusMenuState};
+use crate::{DBUSMENU_ITEM_KIND, DBUSMENU_MENU_KIND};
 
 #[derive(Clone)]
 pub struct DbusMenuProvider {
@@ -38,12 +41,48 @@ impl NodeProvider for DbusMenuProvider {
         &self.kind
     }
 
+    fn access(&self) -> NodeAccess {
+        if matches!(self.kind.as_str(), DBUSMENU_MENU_KIND | DBUSMENU_ITEM_KIND) {
+            NodeAccess::hidden()
+        } else {
+            NodeAccess::read_only()
+        }
+    }
+
     async fn contains_node(&self, node: &NodeId) -> Result<bool> {
         self.with_state(|state| state.contains_node(node)).await
     }
 
     async fn nodes(&self) -> Result<Vec<NodeId>> {
         self.with_state(|state| state.nodes(&self.kind)).await
+    }
+}
+
+#[async_trait]
+impl PathProvider for DbusMenuProvider {
+    fn kind(&self) -> &NodeKind {
+        &self.kind
+    }
+
+    async fn lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        self.with_state(|state| state.path_lookup_child(parent, name))
+            .await
+    }
+
+    async fn children(&self, parent: &GraphPathDirectory) -> Result<Option<Vec<GraphPathChild>>> {
+        self.with_state(|state| state.path_children(parent)).await
+    }
+
+    async fn watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        self.with_state(|state| state.path_watch_target(directory))
+            .await
     }
 }
 

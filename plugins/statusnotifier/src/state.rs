@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use locusfs_graph::{
-    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
-    Result,
+    GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget,
+    LocusValue, NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
 };
 use tokio::sync::RwLock;
 
@@ -135,9 +135,71 @@ impl StatusNotifierState {
             })
     }
 
+    pub fn path_lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == STATUS_NOTIFIER_KIND && node.local() == ITEM_NODE =>
+            {
+                if self.snapshot.items.contains_key(name.as_str()) {
+                    Ok(Some(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                        item_node(name.as_str())?,
+                    ))))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_children(
+        &self,
+        parent: &GraphPathDirectory,
+    ) -> Result<Option<Vec<GraphPathChild>>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == STATUS_NOTIFIER_KIND && node.local() == ITEM_NODE =>
+            {
+                Ok(Some(
+                    self.snapshot
+                        .items
+                        .keys()
+                        .map(|id| {
+                            Ok(GraphPathChild {
+                                name: PathName::new(id)?,
+                                entry: GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                    item_node(id)?,
+                                )),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        match directory {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == STATUS_NOTIFIER_KIND && node.local() == ITEM_NODE =>
+            {
+                Ok(Some(GraphWatchTarget::Node(node.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn node_properties(&self, node: &NodeId) -> Result<BTreeMap<PropertyKey, LocusValue>> {
         match node.kind().as_str() {
-            STATUS_NOTIFIER_KIND if node.local() == ITEM_NODE => facade_properties(node.local()),
+            STATUS_NOTIFIER_KIND if node.local() == ITEM_NODE => Ok(BTreeMap::new()),
             STATUS_NOTIFIER_ITEM_KIND => self
                 .snapshot
                 .items
@@ -235,14 +297,6 @@ fn changed_property_keys(
         .into_iter()
         .filter(|key| old.get(key) != new.get(key))
         .collect())
-}
-
-fn facade_properties(local: &str) -> Result<BTreeMap<PropertyKey, LocusValue>> {
-    let mut properties = BTreeMap::new();
-    insert(&mut properties, "kind", string(STATUS_NOTIFIER_KIND))?;
-    insert(&mut properties, "source", string(SOURCE))?;
-    insert(&mut properties, "name", string(local))?;
-    Ok(properties)
 }
 
 fn item_properties(item: &StatusNotifierItem) -> Result<BTreeMap<PropertyKey, LocusValue>> {

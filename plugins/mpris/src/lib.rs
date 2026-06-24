@@ -56,14 +56,17 @@ async fn register_with_runtime(graph: &DynamicGraph) -> Result<MprisPluginHandle
     let runtime = PluginRuntime::new("locusfs-mpris")?;
     let (state, event_stream) = MprisRuntime::start(graph.clone(), runtime.handle());
 
-    for kind in PROVIDER_KINDS {
-        let kind = NodeKind::new(*kind)?;
+    for kind_name in PROVIDER_KINDS {
+        let kind = NodeKind::new(*kind_name)?;
         let provider = MprisProvider::new(kind.clone(), state.clone());
         let provider = TracedProvider::new(PROVIDER_NAME, provider);
         graph.register_node_provider(provider.clone()).await?;
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
+        if *kind_name == MPRIS_KIND {
+            graph.register_path_provider(provider.clone()).await?;
+        }
         graph.register_relation_provider(kind, provider).await?;
     }
 

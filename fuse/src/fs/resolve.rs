@@ -168,6 +168,9 @@ async fn resolve_path_provider_entry(
 ) -> std::result::Result<WatchTarget, Errno> {
     loop {
         match entry {
+            GraphPathEntry::Directory(GraphPathDirectory::Node(node)) => {
+                return resolve_graph_node_path(graph, node, remaining, directory_watch).await;
+            }
             GraphPathEntry::Directory(directory) => {
                 if let Some((segment, rest)) = remaining.split_first() {
                     let name =
@@ -226,6 +229,90 @@ async fn resolve_path_provider_entry(
             }
         }
     }
+}
+
+async fn resolve_graph_node_path(
+    graph: &DynamicGraph,
+    mut node: NodeId,
+    mut remaining: &[&str],
+    directory_watch: bool,
+) -> std::result::Result<WatchTarget, Errno> {
+    let mut dependencies = Vec::new();
+    while let Some((segment, rest)) = remaining.split_first() {
+        remaining = rest;
+        let relation = relation_name_from_segment(segment)?;
+        let targets = relation_targets(graph, &node, &relation).await?;
+        let has_relation = !targets.is_empty();
+        let property = property_key_from_segment(segment)?;
+        let has_property = graph.property_spec(&node, &property).await.is_ok();
+
+        if has_property && has_relation {
+            return Err(errno(libc::EIO));
+        }
+
+        if has_property {
+            if !remaining.is_empty() {
+                return Err(errno(libc::ENOTDIR));
+            }
+            return Ok(WatchTarget {
+                subject: GraphWatchTarget::Property(node, property),
+                dependencies,
+                ready: true,
+                mode: WatchMode::State,
+            });
+        }
+
+        if !has_relation {
+            push_unique(
+                &mut dependencies,
+                WatchKey::Relation(node.clone(), relation.clone()),
+            );
+            return Ok(WatchTarget {
+                subject: GraphWatchTarget::NodeChild(
+                    node,
+                    decode_segment(segment).map_err(graph_error_to_errno)?,
+                ),
+                dependencies,
+                ready: false,
+                mode: if directory_watch {
+                    WatchMode::Changes
+                } else {
+                    WatchMode::State
+                },
+            });
+        }
+
+        push_unique(
+            &mut dependencies,
+            WatchKey::Relation(node.clone(), relation.clone()),
+        );
+
+        node = if targets.len() == 1 {
+            targets[0].clone()
+        } else {
+            let Some((target_segment, rest)) = remaining.split_first() else {
+                return Ok(WatchTarget {
+                    subject: GraphWatchTarget::Relation(node, relation),
+                    dependencies,
+                    ready: true,
+                    mode: WatchMode::Changes,
+                });
+            };
+            remaining = rest;
+            relation_target_from_name(target_segment, &node, &targets)?
+        };
+    }
+
+    Ok(WatchTarget {
+        subject: GraphWatchTarget::Node(node),
+        dependencies,
+        ready: true,
+        mode: if directory_watch {
+            WatchMode::Changes
+        } else {
+            WatchMode::State
+        },
+    })
 }
 
 pub(crate) async fn resolve_watch_state(

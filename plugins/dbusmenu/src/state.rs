@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use locusfs_graph::{
-    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
-    Result,
+    GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget,
+    LocusValue, NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
 };
 use tokio::sync::RwLock;
 
@@ -12,9 +12,13 @@ use crate::{DBUSMENU_ITEM_KIND, DBUSMENU_KIND, DBUSMENU_MENU_KIND};
 pub type SharedDbusMenuState = Arc<RwLock<DbusMenuState>>;
 
 pub const MENU_NODE: &str = "menu";
+pub const ITEM_NODE: &str = "item";
 pub const MENU_RELATION: &str = "menu";
 pub const ITEM_RELATION: &str = "item";
 pub const CHILD_RELATION: &str = "child";
+const VIRTUAL_MENU_ITEMS: &str = "menu-items";
+const VIRTUAL_ITEM_CHILDREN: &str = "item-children";
+const VIRTUAL_SEPARATOR: &str = "|";
 
 const SOURCE: &str = "dbusmenu";
 const ACTIVATE_PROPERTY: &str = "activate";
@@ -77,7 +81,7 @@ impl DbusMenuState {
 
     pub fn contains_node(&self, node: &NodeId) -> Result<bool> {
         Ok(match node.kind().as_str() {
-            DBUSMENU_KIND => node.local() == MENU_NODE,
+            DBUSMENU_KIND => matches!(node.local(), MENU_NODE | ITEM_NODE),
             DBUSMENU_MENU_KIND => self.menus.contains_key(node.local()),
             DBUSMENU_ITEM_KIND => self.item(node.local()).is_some(),
             _ => false,
@@ -86,7 +90,7 @@ impl DbusMenuState {
 
     pub fn nodes(&self, kind: &NodeKind) -> Result<Vec<NodeId>> {
         let mut nodes = match kind.as_str() {
-            DBUSMENU_KIND => vec![dbusmenu_node(MENU_NODE)?],
+            DBUSMENU_KIND => vec![dbusmenu_node(MENU_NODE)?, dbusmenu_node(ITEM_NODE)?],
             DBUSMENU_MENU_KIND => self
                 .menus
                 .keys()
@@ -156,9 +160,244 @@ impl DbusMenuState {
             })
     }
 
+    pub fn path_lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == MENU_NODE =>
+            {
+                if self.menus.contains_key(name.as_str()) {
+                    Ok(Some(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                        menu_node(name.as_str())?,
+                    ))))
+                } else {
+                    Ok(None)
+                }
+            }
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == ITEM_NODE =>
+            {
+                self.item_entry(name.as_str())
+            }
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_MENU_KIND && name.as_str() == ITEM_RELATION =>
+            {
+                if self.menus.contains_key(node.local()) {
+                    Ok(Some(GraphPathEntry::Directory(
+                        GraphPathDirectory::Virtual {
+                            owner: NodeKind::new(DBUSMENU_KIND)?,
+                            local: menu_items_virtual(node.local()),
+                        },
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_ITEM_KIND
+                    && name.as_str() == CHILD_RELATION =>
+            {
+                if self.item(node.local()).is_some() {
+                    Ok(Some(GraphPathEntry::Directory(
+                        GraphPathDirectory::Virtual {
+                            owner: NodeKind::new(DBUSMENU_KIND)?,
+                            local: item_children_virtual(node.local()),
+                        },
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUSMENU_KIND => {
+                let Some((kind, id)) = local.split_once(VIRTUAL_SEPARATOR) else {
+                    return Ok(None);
+                };
+                match kind {
+                    VIRTUAL_MENU_ITEMS => self
+                        .menus
+                        .get(id)
+                        .and_then(|menu| {
+                            menu.root_items.iter().find_map(|item_id| {
+                                let item = menu.items.get(item_id)?;
+                                (item.local_id() == name.as_str()).then_some(item)
+                            })
+                        })
+                        .map(|item| {
+                            Ok(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                item_node(item.local_id())?,
+                            )))
+                        })
+                        .transpose(),
+                    VIRTUAL_ITEM_CHILDREN => self
+                        .item(id)
+                        .and_then(|item| {
+                            item.child_ids.iter().find_map(|child_id| {
+                                let menu = self.menus.get(&item.menu_id)?;
+                                let child = menu.items.get(child_id)?;
+                                (child.local_id() == name.as_str()).then_some(child)
+                            })
+                        })
+                        .map(|item| {
+                            Ok(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                item_node(item.local_id())?,
+                            )))
+                        })
+                        .transpose(),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_children(
+        &self,
+        parent: &GraphPathDirectory,
+    ) -> Result<Option<Vec<GraphPathChild>>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == MENU_NODE =>
+            {
+                Ok(Some(
+                    self.menus
+                        .keys()
+                        .map(|id| {
+                            Ok(GraphPathChild {
+                                name: PathName::new(id)?,
+                                entry: GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                    menu_node(id)?,
+                                )),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == ITEM_NODE =>
+            {
+                Ok(Some(self.item_children(self.all_item_ids())?))
+            }
+            GraphPathDirectory::Node(node) if node.kind().as_str() == DBUSMENU_MENU_KIND => {
+                if !self.menus.contains_key(node.local()) {
+                    return Ok(None);
+                }
+                Ok(Some(vec![GraphPathChild {
+                    name: PathName::new(ITEM_RELATION)?,
+                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                        owner: NodeKind::new(DBUSMENU_KIND)?,
+                        local: menu_items_virtual(node.local()),
+                    }),
+                }]))
+            }
+            GraphPathDirectory::Node(node) if node.kind().as_str() == DBUSMENU_ITEM_KIND => {
+                if self.item(node.local()).is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(vec![GraphPathChild {
+                    name: PathName::new(CHILD_RELATION)?,
+                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                        owner: NodeKind::new(DBUSMENU_KIND)?,
+                        local: item_children_virtual(node.local()),
+                    }),
+                }]))
+            }
+            GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUSMENU_KIND => {
+                let Some((kind, id)) = local.split_once(VIRTUAL_SEPARATOR) else {
+                    return Ok(None);
+                };
+                match kind {
+                    VIRTUAL_MENU_ITEMS => {
+                        let Some(menu) = self.menus.get(id) else {
+                            return Ok(None);
+                        };
+                        Ok(Some(
+                            self.item_children(
+                                menu.root_items
+                                    .iter()
+                                    .filter_map(|item_id| menu.items.get(item_id))
+                                    .map(DbusMenuItem::local_id)
+                                    .collect(),
+                            )?,
+                        ))
+                    }
+                    VIRTUAL_ITEM_CHILDREN => {
+                        let Some(item) = self.item(id) else {
+                            return Ok(None);
+                        };
+                        let Some(menu) = self.menus.get(&item.menu_id) else {
+                            return Ok(None);
+                        };
+                        Ok(Some(
+                            self.item_children(
+                                item.child_ids
+                                    .iter()
+                                    .filter_map(|child_id| menu.items.get(child_id))
+                                    .map(DbusMenuItem::local_id)
+                                    .collect(),
+                            )?,
+                        ))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        match directory {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == MENU_NODE =>
+            {
+                Ok(Some(GraphWatchTarget::Relation(
+                    node.clone(),
+                    relation(MENU_RELATION)?,
+                )))
+            }
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == DBUSMENU_KIND && node.local() == ITEM_NODE =>
+            {
+                Ok(Some(GraphWatchTarget::Kind(NodeKind::new(
+                    DBUSMENU_ITEM_KIND,
+                )?)))
+            }
+            GraphPathDirectory::Node(node)
+                if matches!(
+                    node.kind().as_str(),
+                    DBUSMENU_MENU_KIND | DBUSMENU_ITEM_KIND
+                ) =>
+            {
+                Ok(Some(GraphWatchTarget::Node(node.clone())))
+            }
+            GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUSMENU_KIND => {
+                let Some((kind, id)) = local.split_once(VIRTUAL_SEPARATOR) else {
+                    return Ok(None);
+                };
+                match kind {
+                    VIRTUAL_MENU_ITEMS => Ok(Some(GraphWatchTarget::Relation(
+                        menu_node(id)?,
+                        relation(ITEM_RELATION)?,
+                    ))),
+                    VIRTUAL_ITEM_CHILDREN => Ok(Some(GraphWatchTarget::Relation(
+                        item_node(id)?,
+                        relation(CHILD_RELATION)?,
+                    ))),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn node_properties(&self, node: &NodeId) -> Result<BTreeMap<PropertyKey, LocusValue>> {
         match node.kind().as_str() {
-            DBUSMENU_KIND if node.local() == MENU_NODE => facade_properties(),
+            DBUSMENU_KIND if matches!(node.local(), MENU_NODE | ITEM_NODE) => Ok(BTreeMap::new()),
             DBUSMENU_MENU_KIND => self
                 .menus
                 .get(node.local())
@@ -177,15 +416,7 @@ impl DbusMenuState {
     fn node_relations(&self, node: &NodeId) -> Result<BTreeMap<RelationName, Vec<NodeId>>> {
         let mut relations = BTreeMap::new();
         match node.kind().as_str() {
-            DBUSMENU_KIND if node.local() == MENU_NODE => {
-                relations.insert(
-                    relation(MENU_RELATION)?,
-                    self.menus
-                        .keys()
-                        .map(|local| menu_node(local))
-                        .collect::<Result<Vec<_>>>()?,
-                );
-            }
+            DBUSMENU_KIND if matches!(node.local(), MENU_NODE | ITEM_NODE) => {}
             DBUSMENU_MENU_KIND => {
                 let menu = self
                     .menus
@@ -249,6 +480,34 @@ impl DbusMenuState {
         let item_id = item_id.parse::<i32>().ok()?;
         self.menus.get(menu_id)?.items.get(&item_id)
     }
+
+    fn all_item_ids(&self) -> Vec<String> {
+        self.menus
+            .values()
+            .flat_map(|menu| menu.items.values().map(DbusMenuItem::local_id))
+            .collect()
+    }
+
+    fn item_entry(&self, local: &str) -> Result<Option<GraphPathEntry>> {
+        if self.item(local).is_some() {
+            Ok(Some(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                item_node(local)?,
+            ))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn item_children(&self, ids: Vec<String>) -> Result<Vec<GraphPathChild>> {
+        ids.into_iter()
+            .map(|id| {
+                Ok(GraphPathChild {
+                    name: PathName::new(&id)?,
+                    entry: GraphPathEntry::Directory(GraphPathDirectory::Node(item_node(id)?)),
+                })
+            })
+            .collect()
+    }
 }
 
 impl BusKind {
@@ -290,13 +549,6 @@ impl DbusMenuItem {
     fn child_targets(&self) -> Result<Vec<NodeId>> {
         Ok(Vec::new())
     }
-}
-
-fn facade_properties() -> Result<BTreeMap<PropertyKey, LocusValue>> {
-    let mut properties = BTreeMap::new();
-    insert(&mut properties, "kind", string(DBUSMENU_KIND))?;
-    insert(&mut properties, "source", string(SOURCE))?;
-    Ok(properties)
 }
 
 fn endpoint_properties(endpoint: &DbusMenuEndpoint) -> Result<BTreeMap<PropertyKey, LocusValue>> {
@@ -352,6 +604,14 @@ fn menu_node(local: &str) -> Result<NodeId> {
 
 fn item_node(local: impl AsRef<str>) -> Result<NodeId> {
     NodeId::new(NodeKind::new(DBUSMENU_ITEM_KIND)?, local.as_ref())
+}
+
+fn menu_items_virtual(menu_id: &str) -> String {
+    format!("{VIRTUAL_MENU_ITEMS}{VIRTUAL_SEPARATOR}{menu_id}")
+}
+
+fn item_children_virtual(item_id: &str) -> String {
+    format!("{VIRTUAL_ITEM_CHILDREN}{VIRTUAL_SEPARATOR}{item_id}")
 }
 
 fn menu_changes(
@@ -494,11 +754,11 @@ pub fn menu_local_id(service: &str, path: &str) -> String {
 mod test {
     use std::collections::BTreeMap;
 
-    use locusfs_graph::{LocusValue, NodeKind, PropertyKey, RelationName};
+    use locusfs_graph::{GraphPathDirectory, GraphPathEntry, LocusValue, NodeKind, PropertyKey};
 
     use super::{
         BusKind, DBUSMENU_ITEM_KIND, DBUSMENU_KIND, DBUSMENU_MENU_KIND, DbusMenuEndpoint,
-        DbusMenuItem, DbusMenuState, MENU_RELATION, dbusmenu_node, menu_node,
+        DbusMenuItem, DbusMenuState, ITEM_NODE, MENU_NODE, dbusmenu_node, menu_node,
     };
 
     #[test]
@@ -513,12 +773,13 @@ mod test {
             items: BTreeMap::new(),
         }]);
 
-        let facade = dbusmenu_node("menu").unwrap();
+        let facade = dbusmenu_node(MENU_NODE).unwrap();
+        let item_facade = dbusmenu_node(ITEM_NODE).unwrap();
         let endpoint = menu_node("app:Menu").unwrap();
 
         assert_eq!(
             state.nodes(&NodeKind::new(DBUSMENU_KIND).unwrap()).unwrap(),
-            vec![facade.clone()]
+            vec![item_facade, facade.clone()]
         );
         assert_eq!(
             state
@@ -526,11 +787,15 @@ mod test {
                 .unwrap(),
             vec![endpoint.clone()]
         );
+        let children = state
+            .path_children(&GraphPathDirectory::Node(facade.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name.as_str(), "app:Menu");
         assert_eq!(
-            state
-                .targets(&facade, &RelationName::new(MENU_RELATION).unwrap())
-                .unwrap(),
-            vec![endpoint.clone()]
+            children[0].entry,
+            GraphPathEntry::Directory(GraphPathDirectory::Node(endpoint.clone()))
         );
         assert_eq!(
             state

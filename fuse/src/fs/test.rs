@@ -1180,7 +1180,7 @@ async fn root_mkdir_creates_writable_in_memory_kind() {
 
 #[tokio::test]
 async fn relation_directory_uses_compact_unique_target_names() {
-    let service_kind = NodeKind::new("dbus-service").unwrap();
+    let service_kind = NodeKind::new("dbus").unwrap();
     let object_kind = NodeKind::new("dbus-object").unwrap();
     let service_provider = InMemoryProvider::new(service_kind.clone());
     let object_provider = InMemoryProvider::new(object_kind.clone());
@@ -1210,7 +1210,7 @@ async fn relation_directory_uses_compact_unique_target_names() {
         .await
         .unwrap();
 
-    let service = NodeId::new(NodeKind::new("dbus-service").unwrap(), "upower").unwrap();
+    let service = NodeId::new(NodeKind::new("dbus").unwrap(), "upower").unwrap();
     let battery = NodeId::new(
         NodeKind::new("dbus-object").unwrap(),
         "upower:devices/battery_BAT1",

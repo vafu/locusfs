@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use locusfs_graph::{
-    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
-    Result,
+    GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget,
+    LocusValue, NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
 };
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -17,8 +17,6 @@ pub const SINK_NODE: &str = "sink";
 pub const SOURCE_NODE: &str = "source";
 pub const SINK_RELATION: &str = "sink";
 pub const SOURCE_RELATION: &str = "source";
-
-const SOURCE: &str = "pipewire";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PipeWireSnapshot {
@@ -140,10 +138,129 @@ impl PipeWireState {
             })
     }
 
+    pub fn path_lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        if let Some(entry) = self.default_endpoint_entry(parent, name.as_str())? {
+            return Ok(Some(entry));
+        }
+        let Some(kind) = endpoint_kind_for_facade(parent) else {
+            return Ok(None);
+        };
+        let exists = match kind {
+            PIPEWIRE_SINK_KIND => self.snapshot.sinks.contains_key(name.as_str()),
+            PIPEWIRE_SOURCE_KIND => self.snapshot.sources.contains_key(name.as_str()),
+            _ => false,
+        };
+        if exists {
+            Ok(Some(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                node_id(kind, name.as_str())?,
+            ))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn path_children(
+        &self,
+        parent: &GraphPathDirectory,
+    ) -> Result<Option<Vec<GraphPathChild>>> {
+        let Some(kind) = endpoint_kind_for_facade(parent) else {
+            return match parent {
+                GraphPathDirectory::Node(node)
+                    if node.kind().as_str() == PIPEWIRE_KIND && node.local() == DEFAULT_NODE =>
+                {
+                    let mut children = Vec::new();
+                    if let Some(sink) = &self.snapshot.default_sink {
+                        children.push(GraphPathChild {
+                            name: PathName::new(SINK_RELATION)?,
+                            entry: GraphPathEntry::Directory(GraphPathDirectory::Node(sink_node(
+                                sink,
+                            )?)),
+                        });
+                    }
+                    if let Some(source) = &self.snapshot.default_source {
+                        children.push(GraphPathChild {
+                            name: PathName::new(SOURCE_RELATION)?,
+                            entry: GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                source_node(source)?,
+                            )),
+                        });
+                    }
+                    Ok(Some(children))
+                }
+                _ => Ok(None),
+            };
+        };
+        let ids = match kind {
+            PIPEWIRE_SINK_KIND => self.snapshot.sinks.keys().collect::<Vec<_>>(),
+            PIPEWIRE_SOURCE_KIND => self.snapshot.sources.keys().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        Ok(Some(
+            ids.into_iter()
+                .map(|id| {
+                    Ok(GraphPathChild {
+                        name: PathName::new(id)?,
+                        entry: GraphPathEntry::Directory(GraphPathDirectory::Node(node_id(
+                            kind, id,
+                        )?)),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
+    pub fn path_watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        match directory {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == PIPEWIRE_KIND
+                    && matches!(node.local(), DEFAULT_NODE | SINK_NODE | SOURCE_NODE) =>
+            {
+                Ok(Some(GraphWatchTarget::Node(node.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn default_endpoint_entry(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &str,
+    ) -> Result<Option<GraphPathEntry>> {
+        let GraphPathDirectory::Node(node) = parent else {
+            return Ok(None);
+        };
+        if node.kind().as_str() != PIPEWIRE_KIND || node.local() != DEFAULT_NODE {
+            return Ok(None);
+        }
+        let target = match name {
+            SINK_RELATION => self
+                .snapshot
+                .default_sink
+                .as_deref()
+                .map(sink_node)
+                .transpose()?,
+            SOURCE_RELATION => self
+                .snapshot
+                .default_source
+                .as_deref()
+                .map(source_node)
+                .transpose()?,
+            _ => None,
+        };
+        Ok(target.map(|node| GraphPathEntry::Directory(GraphPathDirectory::Node(node))))
+    }
+
     fn node_properties(&self, node: &NodeId) -> Result<BTreeMap<PropertyKey, LocusValue>> {
         match node.kind().as_str() {
             PIPEWIRE_KIND if matches!(node.local(), DEFAULT_NODE | SINK_NODE | SOURCE_NODE) => {
-                facade_properties(node.local())
+                Ok(BTreeMap::new())
             }
             PIPEWIRE_SINK_KIND => self
                 .snapshot
@@ -189,6 +306,20 @@ impl PipeWireState {
             _ => return Err(node_not_found(node)),
         }
         Ok(relations)
+    }
+}
+
+fn endpoint_kind_for_facade(parent: &GraphPathDirectory) -> Option<&'static str> {
+    let GraphPathDirectory::Node(node) = parent else {
+        return None;
+    };
+    if node.kind().as_str() != PIPEWIRE_KIND {
+        return None;
+    }
+    match node.local() {
+        SINK_NODE => Some(PIPEWIRE_SINK_KIND),
+        SOURCE_NODE => Some(PIPEWIRE_SOURCE_KIND),
+        _ => None,
     }
 }
 
@@ -432,14 +563,6 @@ fn changed_property_keys(old: &AudioEndpoint, new: &AudioEndpoint) -> Result<Vec
         .into_iter()
         .filter(|key| old.get(key) != new.get(key))
         .collect())
-}
-
-fn facade_properties(local: &str) -> Result<BTreeMap<PropertyKey, LocusValue>> {
-    let mut properties = BTreeMap::new();
-    insert(&mut properties, "kind", string(PIPEWIRE_KIND))?;
-    insert(&mut properties, "source", string(SOURCE))?;
-    insert(&mut properties, "name", string(local))?;
-    Ok(properties)
 }
 
 fn endpoint_properties(endpoint: &AudioEndpoint) -> Result<BTreeMap<PropertyKey, LocusValue>> {

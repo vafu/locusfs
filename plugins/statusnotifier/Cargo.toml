@@ -9,7 +9,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 async-trait = { workspace = true }
 futures-util = { workspace = true }
-locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic", "provider-tracing"] }
+locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic", "provider-tracing", "watch-provider"] }
 locusfs-plugin-api = { path = "../api" }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml = { workspace = true }

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use locusfs_graph::{
-    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
-    Result,
+    GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, GraphWatchTarget,
+    LocusValue, NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
 };
 use tokio::sync::RwLock;
 
@@ -130,9 +130,71 @@ impl MprisState {
             })
     }
 
+    pub fn path_lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == MPRIS_KIND && node.local() == PLAYER_NODE =>
+            {
+                if self.snapshot.players.contains_key(name.as_str()) {
+                    Ok(Some(GraphPathEntry::Directory(GraphPathDirectory::Node(
+                        player_node(name.as_str())?,
+                    ))))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_children(
+        &self,
+        parent: &GraphPathDirectory,
+    ) -> Result<Option<Vec<GraphPathChild>>> {
+        match parent {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == MPRIS_KIND && node.local() == PLAYER_NODE =>
+            {
+                Ok(Some(
+                    self.snapshot
+                        .players
+                        .keys()
+                        .map(|id| {
+                            Ok(GraphPathChild {
+                                name: PathName::new(id)?,
+                                entry: GraphPathEntry::Directory(GraphPathDirectory::Node(
+                                    player_node(id)?,
+                                )),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn path_watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        match directory {
+            GraphPathDirectory::Node(node)
+                if node.kind().as_str() == MPRIS_KIND && node.local() == PLAYER_NODE =>
+            {
+                Ok(Some(GraphWatchTarget::Node(node.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn node_properties(&self, node: &NodeId) -> Result<BTreeMap<PropertyKey, LocusValue>> {
         match node.kind().as_str() {
-            MPRIS_KIND if node.local() == PLAYER_NODE => facade_properties(node.local()),
+            MPRIS_KIND if node.local() == PLAYER_NODE => Ok(BTreeMap::new()),
             MPRIS_PLAYER_KIND => self
                 .snapshot
                 .players
@@ -224,14 +286,6 @@ fn changed_property_keys(old: &MprisPlayer, new: &MprisPlayer) -> Result<Vec<Pro
         .into_iter()
         .filter(|key| old.get(key) != new.get(key))
         .collect())
-}
-
-fn facade_properties(local: &str) -> Result<BTreeMap<PropertyKey, LocusValue>> {
-    let mut properties = BTreeMap::new();
-    insert(&mut properties, "kind", string(MPRIS_KIND))?;
-    insert(&mut properties, "source", string(SOURCE))?;
-    insert(&mut properties, "name", string(local))?;
-    Ok(properties)
 }
 
 fn player_properties(player: &MprisPlayer) -> Result<BTreeMap<PropertyKey, LocusValue>> {

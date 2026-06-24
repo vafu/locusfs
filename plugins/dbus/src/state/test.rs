@@ -83,7 +83,7 @@ fn service_snapshot_exposes_objects_and_relations() {
     );
     assert_eq!(
         state
-            .targets(&object_node, &RelationName::new("dbus-service").unwrap())
+            .targets(&object_node, &RelationName::new("dbus").unwrap())
             .unwrap(),
         vec![service]
     );

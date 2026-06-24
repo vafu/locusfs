@@ -69,14 +69,17 @@ async fn register_with_config_and_runtime(
     let runtime = PluginRuntime::new("locusfs-pipewire")?;
     let (state, event_stream) = PipeWireRuntime::start(graph.clone(), config, runtime.handle());
 
-    for kind in PROVIDER_KINDS {
-        let kind = NodeKind::new(*kind)?;
+    for kind_name in PROVIDER_KINDS {
+        let kind = NodeKind::new(*kind_name)?;
         let provider = PipeWireProvider::new(kind.clone(), state.clone());
         let provider = TracedProvider::new(PROVIDER_NAME, provider);
         graph.register_node_provider(provider.clone()).await?;
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
+        if *kind_name == PIPEWIRE_KIND {
+            graph.register_path_provider(provider.clone()).await?;
+        }
         graph.register_relation_provider(kind, provider).await?;
     }
 
