@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use locusfs_graph::{DynamicGraph, GraphError, Result};
-use tokio::runtime::Handle;
+use tokio::runtime::{Builder, Handle, Runtime};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Static metadata used by the host to identify and validate a plugin.
@@ -90,6 +90,48 @@ pub trait LocusFsPlugin: Send + Sync {
 pub trait PluginHandle: Send + Sync {
     /// Stops plugin runtime work and releases resources.
     async fn shutdown(self: Box<Self>) {}
+}
+
+/// Tokio runtime owned by a plugin dynamic library.
+///
+/// Rust plugins are loaded as `cdylib`s, so async runtimes and reactor-bound
+/// resources must be created, polled, and dropped inside the same plugin image.
+/// Long-lived plugin work should use this runtime rather than the host runtime.
+#[derive(Debug)]
+pub struct PluginRuntime {
+    runtime: Option<Runtime>,
+}
+
+impl PluginRuntime {
+    /// Creates a small multi-thread runtime for plugin-owned async work.
+    pub fn new(thread_name: &'static str) -> Result<Self> {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name(thread_name)
+            .enable_all()
+            .build()
+            .map_err(|error| GraphError::Io(format!("create plugin runtime: {error}")))?;
+        Ok(Self {
+            runtime: Some(runtime),
+        })
+    }
+
+    /// Returns a handle for spawning plugin-owned tasks.
+    pub fn handle(&self) -> Handle {
+        self.runtime
+            .as_ref()
+            .expect("plugin runtime handle requested after shutdown")
+            .handle()
+            .clone()
+    }
+}
+
+impl Drop for PluginRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 /// Wraps a future so every poll and drop happens inside the provided runtime.

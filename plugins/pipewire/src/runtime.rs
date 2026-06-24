@@ -1,5 +1,4 @@
 use locusfs_graph::{DynamicGraph, GraphError, Result};
-use locusfs_plugin_api::enter_runtime;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Handle;
@@ -18,11 +17,10 @@ impl PipeWireRuntime {
         runtime: Handle,
     ) -> (SharedPipeWireState, JoinHandle<()>) {
         let state = crate::state::PipeWireState::shared();
-        let task_runtime = runtime.clone();
         let task_state = state.clone();
-        let task = runtime.spawn(enter_runtime(task_runtime, async move {
+        let task = runtime.spawn(async move {
             run_pipewire_watcher(config, task_state, graph).await;
-        }));
+        });
         (state, task)
     }
 }

@@ -6,10 +6,12 @@ members = [
     "fuse",
     "plugins/api",
     "plugins/dbus",
+    "plugins/dbusmenu",
     "plugins/niri",
     "plugins/mpris",
     "plugins/pipewire",
     "plugins/project",
+    "plugins/statusnotifier",
 ]
 resolver = "3"
 

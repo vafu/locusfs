@@ -4,7 +4,7 @@ set -euo pipefail
 metadata_file=".project.json"
 default_icon="folder_code"
 default_branch_regex='^[^/]+/(?P<subproj>[^/]+)/(?P<task>.+)$'
-mountpoint="${LOCUSFS_MOUNT:-${LOCUS_MOUNT:-/tmp/locusfs}}"
+mountpoint="${LOCUS_ROOT:-${LOCUSFS_MOUNT:-${LOCUS_MOUNT:-/tmp/locusfs}}}"
 
 usage() {
   cat >&2 <<'EOF'

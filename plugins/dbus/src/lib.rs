@@ -9,7 +9,9 @@ pub use provider::DbusProvider;
 
 use async_trait::async_trait;
 use locusfs_graph::{DynamicGraph, GraphError, NodeKind, Result, TracedProvider};
-use locusfs_plugin_api::{LocusFsPlugin, PluginContext, PluginHandle, PluginManifest};
+use locusfs_plugin_api::{
+    LocusFsPlugin, PluginContext, PluginHandle, PluginManifest, PluginRuntime,
+};
 use tokio::task::JoinHandle;
 
 use crate::config::DbusConfig;
@@ -17,16 +19,18 @@ use crate::runtime::DbusRuntime;
 
 pub const DBUS_SERVICE_KIND: &str = "dbus-service";
 pub const DBUS_OBJECT_KIND: &str = "dbus-object";
+pub const DBUS_METHOD_KIND: &str = "dbus-method";
 
 const PROVIDER_NAME: &str = "dbus";
 
 #[derive(Debug, Default)]
 pub struct DbusPlugin;
 
-/// Registers read-only D-Bus service providers on the graph.
+/// Registers D-Bus service providers on the graph.
 #[derive(Debug)]
 pub struct DbusPluginHandle {
     _watchers: Vec<JoinHandle<()>>,
+    _runtime: PluginRuntime,
 }
 
 impl Drop for DbusPluginHandle {
@@ -55,29 +59,35 @@ pub async fn register_with_config(
     graph: &DynamicGraph,
     config: DbusConfig,
 ) -> Result<DbusPluginHandle> {
-    let runtime = tokio::runtime::Handle::current();
-    register_with_config_and_runtime(graph, config, runtime).await
+    register_with_config_and_runtime(graph, config).await
 }
 
 async fn register_with_config_and_runtime(
     graph: &DynamicGraph,
     config: DbusConfig,
-    runtime: tokio::runtime::Handle,
 ) -> Result<DbusPluginHandle> {
-    let (state, watchers) = DbusRuntime::start(graph.clone(), config, runtime)?;
-    for kind_name in [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND] {
+    let runtime = PluginRuntime::new("locusfs-dbus")?;
+    let runtime_handle = runtime.handle();
+    let (state, watchers) = DbusRuntime::start(graph.clone(), config, runtime_handle.clone())?;
+    for kind_name in [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND, DBUS_METHOD_KIND] {
         let kind = NodeKind::new(kind_name)?;
-        let provider = DbusProvider::new(kind.clone(), state.clone());
+        let provider = DbusProvider::new(kind.clone(), state.clone(), runtime_handle.clone());
         let provider = TracedProvider::new(PROVIDER_NAME, provider);
 
         graph.register_node_provider(provider.clone()).await?;
         graph
             .register_property_provider(kind.clone(), provider.clone())
             .await?;
+        if matches!(kind_name, DBUS_OBJECT_KIND | DBUS_METHOD_KIND) {
+            graph
+                .register_property_mutation_provider(kind.clone(), provider.clone())
+                .await?;
+        }
         graph.register_relation_provider(kind, provider).await?;
     }
     Ok(DbusPluginHandle {
         _watchers: watchers,
+        _runtime: runtime,
     })
 }
 
@@ -98,7 +108,7 @@ impl LocusFsPlugin for DbusPlugin {
     ) -> Result<Box<dyn PluginHandle>> {
         let config = DbusConfig::from_value(config)?;
         Ok(Box::new(
-            register_with_config_and_runtime(&context.graph, config, context.runtime).await?,
+            register_with_config_and_runtime(&context.graph, config).await?,
         ))
     }
 }

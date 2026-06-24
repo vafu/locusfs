@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures_util::StreamExt;
 use locusfs_graph::{DynamicGraph, GraphChange, GraphError, Result};
-use locusfs_plugin_api::enter_runtime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -25,12 +24,11 @@ pub struct MprisRuntime;
 impl MprisRuntime {
     pub fn start(graph: DynamicGraph, runtime: Handle) -> (SharedMprisState, JoinHandle<()>) {
         let state = crate::state::MprisState::shared();
-        let task_runtime = runtime.clone();
         let watcher_runtime = runtime.clone();
         let task_state = state.clone();
-        let task = runtime.spawn(enter_runtime(task_runtime, async move {
+        let task = runtime.spawn(async move {
             run_mpris_watcher(task_state, graph, watcher_runtime).await;
-        }));
+        });
         (state, task)
     }
 }
@@ -132,12 +130,11 @@ fn spawn_player_watcher(
     graph: DynamicGraph,
     runtime: Handle,
 ) -> JoinHandle<()> {
-    let task_runtime = runtime.clone();
-    runtime.spawn(enter_runtime(task_runtime, async move {
+    runtime.spawn(async move {
         if let Err(error) = watch_player(connection, service_name.clone(), state, graph).await {
             eprintln!("locusfs-mpris: player watcher for {service_name} stopped: {error}");
         }
-    }))
+    })
 }
 
 async fn watch_player(

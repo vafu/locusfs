@@ -510,6 +510,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "locusfs-plugin-dbusmenu"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "locusfs-graph",
+ "locusfs-plugin-api",
+ "serde",
+ "tokio",
+ "toml",
+ "zbus",
+]
+
+[[package]]
 name = "locusfs-plugin-mpris"
 version = "0.1.0"
 dependencies = [
@@ -559,6 +573,19 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "locusfs-plugin-statusnotifier"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "locusfs-graph",
+ "locusfs-plugin-api",
+ "tokio",
+ "toml",
+ "zbus",
 ]
 
 [[package]]

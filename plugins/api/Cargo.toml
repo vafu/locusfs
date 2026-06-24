@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 async-trait = { workspace = true }
 locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic"] }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 toml = { workspace = true }

@@ -9,7 +9,9 @@ pub use provider::PipeWireProvider;
 
 use async_trait::async_trait;
 use locusfs_graph::{DynamicGraph, GraphError, NodeKind, Result, TracedProvider};
-use locusfs_plugin_api::{LocusFsPlugin, PluginContext, PluginHandle, PluginManifest};
+use locusfs_plugin_api::{
+    LocusFsPlugin, PluginContext, PluginHandle, PluginManifest, PluginRuntime,
+};
 use tokio::task::JoinHandle;
 
 use crate::config::PipeWireConfig;
@@ -28,6 +30,7 @@ pub struct PipeWirePlugin;
 #[derive(Debug)]
 pub struct PipeWirePluginHandle {
     event_stream: Option<JoinHandle<()>>,
+    _runtime: PluginRuntime,
 }
 
 impl Drop for PipeWirePluginHandle {
@@ -56,16 +59,15 @@ pub async fn register_with_config(
     graph: &DynamicGraph,
     config: PipeWireConfig,
 ) -> Result<PipeWirePluginHandle> {
-    let runtime = tokio::runtime::Handle::current();
-    register_with_config_and_runtime(graph, config, runtime).await
+    register_with_config_and_runtime(graph, config).await
 }
 
 async fn register_with_config_and_runtime(
     graph: &DynamicGraph,
     config: PipeWireConfig,
-    runtime: tokio::runtime::Handle,
 ) -> Result<PipeWirePluginHandle> {
-    let (state, event_stream) = PipeWireRuntime::start(graph.clone(), config, runtime);
+    let runtime = PluginRuntime::new("locusfs-pipewire")?;
+    let (state, event_stream) = PipeWireRuntime::start(graph.clone(), config, runtime.handle());
 
     for kind in PROVIDER_KINDS {
         let kind = NodeKind::new(*kind)?;
@@ -80,6 +82,7 @@ async fn register_with_config_and_runtime(
 
     Ok(PipeWirePluginHandle {
         event_stream: Some(event_stream),
+        _runtime: runtime,
     })
 }
 
@@ -100,7 +103,7 @@ impl LocusFsPlugin for PipeWirePlugin {
     ) -> Result<Box<dyn PluginHandle>> {
         let config = PipeWireConfig::from_value(config)?;
         Ok(Box::new(
-            register_with_config_and_runtime(&context.graph, config, context.runtime).await?,
+            register_with_config_and_runtime(&context.graph, config).await?,
         ))
     }
 }

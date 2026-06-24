@@ -4,7 +4,6 @@ use std::io;
 use std::sync::Arc;
 
 use locusfs_graph::{DynamicGraph, GraphError, Result};
-use locusfs_plugin_api::enter_runtime;
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{Event, Output, Reply, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -42,8 +41,7 @@ async fn spawn_event_stream(
 ) -> Result<JoinHandle<()>> {
     let socket = connect_event_stream().await?;
 
-    let task_runtime = runtime.clone();
-    Ok(runtime.spawn(enter_runtime(task_runtime, async move {
+    Ok(runtime.spawn(async move {
         let mut socket = socket;
         loop {
             read_event_stream(&mut socket, &state, &graph).await;
@@ -61,7 +59,7 @@ async fn spawn_event_stream(
                 }
             }
         }
-    })))
+    }))
 }
 
 async fn connect_event_stream() -> Result<AsyncNiriSocket> {

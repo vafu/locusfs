@@ -1,0 +1,17 @@
+[package]
+name = "locusfs-plugin-dbusmenu"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+locusfs-graph = { path = "../../graph", default-features = false, features = ["dynamic", "provider-tracing"] }
+locusfs-plugin-api = { path = "../api" }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml = { workspace = true }
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }

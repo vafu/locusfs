@@ -291,6 +291,16 @@ async fn invalidate_relation_change(
 ) {
     let watch_event = event(source.clone(), relation.clone());
 
+    retarget_relation_watchers(
+        notifier.clone(),
+        graph,
+        watch,
+        source.clone(),
+        relation.clone(),
+        watch_event,
+    )
+    .await;
+
     if invalidate_parent {
         let parent = FsEntry::NodeDir(source.clone());
         let name = match encode_segment(relation.as_str()) {
@@ -301,10 +311,13 @@ async fn invalidate_relation_change(
         invalidate_known_inode(notifier.clone(), inodes.clone(), parent).await;
     }
 
-    invalidate_matching_relation_inodes(notifier.clone(), inodes, source.clone(), relation.clone())
-        .await;
-
-    retarget_relation_watchers(notifier, graph, watch, source, relation, watch_event).await;
+    // For plain target changes, relation-dependent watches receive the new
+    // state directly and the short entry TTL covers non-watch readlink users.
+    // Invalidating the symlink inode here can block in FUSE reverse
+    // invalidation while clients are resolving that same symlink.
+    if invalidate_parent {
+        invalidate_matching_relation_inodes(notifier, inodes, source, relation).await;
+    }
 }
 
 async fn resync_known_state(

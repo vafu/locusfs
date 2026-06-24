@@ -2,18 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt;
 use locusfs_graph::{DynamicGraph, GraphChange, GraphError, Result};
-use locusfs_plugin_api::enter_runtime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use zbus::fdo::{DBusProxy, IntrospectableProxy, ObjectManagerProxy, PropertiesProxy};
+use zbus::message::Type as MessageType;
 use zbus::names::{BusName, InterfaceName};
+use zbus::{MatchRule, MessageStream};
 
 use crate::state::{
-    BusKind, ObjectSnapshot, ServiceConfig, SharedDbusState, convert_managed_interfaces,
-    object_snapshot_from_managed,
+    BusKind, DbusMethodSnapshot, DbusPropertySnapshot, ObjectSnapshot, ServiceConfig,
+    SharedDbusState, convert_managed_interfaces, object_snapshot_from_managed,
 };
-use crate::{DBUS_OBJECT_KIND, DBUS_SERVICE_KIND};
+use crate::{DBUS_METHOD_KIND, DBUS_OBJECT_KIND, DBUS_SERVICE_KIND};
 
 #[derive(Debug, Default)]
 pub struct DbusRuntime;
@@ -42,8 +43,7 @@ fn spawn_service_watcher(
     graph: DynamicGraph,
     runtime: Handle,
 ) -> JoinHandle<()> {
-    let task_runtime = runtime.clone();
-    runtime.spawn(enter_runtime(task_runtime, async move {
+    runtime.spawn(async move {
         loop {
             if let Err(error) = watch_service(config.clone(), state.clone(), graph.clone()).await {
                 eprintln!(
@@ -53,7 +53,7 @@ fn spawn_service_watcher(
             }
             sleep_retry().await;
         }
-    }))
+    })
 }
 
 async fn watch_service(
@@ -77,30 +77,124 @@ async fn watch_service(
         .await
         .map_err(|error| GraphError::Io(format!("watch NameOwnerChanged: {error}")))?;
 
-    publish_snapshot(
-        &state,
-        &graph,
-        snapshot_service(&connection, &dbus, &config).await,
-    )
-    .await;
+    let mut owner = publish_current_snapshot(&connection, &dbus, &config, &state, &graph).await;
 
-    while let Some(signal) = owner_changed.next().await {
-        let args = signal
-            .args()
-            .map_err(|error| GraphError::Io(format!("read NameOwnerChanged args: {error}")))?;
-        if args.name().as_str() == config.name {
-            publish_snapshot(
-                &state,
-                &graph,
-                snapshot_service(&connection, &dbus, &config).await,
-            )
-            .await;
+    loop {
+        let Some(owner_name) = owner.as_deref() else {
+            let Some(signal) = owner_changed.next().await else {
+                return Err(GraphError::Io(
+                    "D-Bus NameOwnerChanged stream ended".to_string(),
+                ));
+            };
+            let args = signal
+                .args()
+                .map_err(|error| GraphError::Io(format!("read NameOwnerChanged args: {error}")))?;
+            if args.name().as_str() == config.name {
+                owner = publish_current_snapshot(&connection, &dbus, &config, &state, &graph).await;
+            }
+            continue;
+        };
+
+        let mut property_changes = dbus_signal_stream(
+            &connection,
+            owner_name,
+            "org.freedesktop.DBus.Properties",
+            None,
+        )
+        .await?;
+        let mut object_changes = dbus_signal_stream(
+            &connection,
+            owner_name,
+            "org.freedesktop.DBus.ObjectManager",
+            None,
+        )
+        .await?;
+
+        loop {
+            tokio::select! {
+                signal = owner_changed.next() => {
+                    let Some(signal) = signal else {
+                        return Err(GraphError::Io(
+                            "D-Bus NameOwnerChanged stream ended".to_string(),
+                        ));
+                    };
+                    let args = signal
+                        .args()
+                        .map_err(|error| GraphError::Io(format!("read NameOwnerChanged args: {error}")))?;
+                    if args.name().as_str() == config.name {
+                        owner = publish_current_snapshot(&connection, &dbus, &config, &state, &graph).await;
+                        break;
+                    }
+                }
+                message = property_changes.next() => {
+                    read_signal_message(message, "PropertiesChanged")?;
+                    let _ = publish_current_snapshot(&connection, &dbus, &config, &state, &graph).await;
+                }
+                message = object_changes.next() => {
+                    read_signal_message(message, "ObjectManager")?;
+                    owner = publish_current_snapshot(&connection, &dbus, &config, &state, &graph).await;
+                    break;
+                }
+            }
         }
     }
+}
 
-    Err(GraphError::Io(
-        "D-Bus NameOwnerChanged stream ended".to_string(),
-    ))
+async fn publish_current_snapshot(
+    connection: &zbus::Connection,
+    dbus: &DBusProxy<'_>,
+    config: &ServiceConfig,
+    state: &SharedDbusState,
+    graph: &DynamicGraph,
+) -> Option<String> {
+    match snapshot_service(connection, dbus, config).await {
+        Ok(snapshot) => {
+            let owner = snapshot.owner.clone();
+            publish_snapshot(state, graph, Ok(snapshot)).await;
+            owner
+        }
+        Err(error) => {
+            publish_snapshot(state, graph, Err(error)).await;
+            None
+        }
+    }
+}
+
+async fn dbus_signal_stream(
+    connection: &zbus::Connection,
+    owner: &str,
+    interface: &'static str,
+    member: Option<&'static str>,
+) -> Result<MessageStream> {
+    let mut builder = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(owner)
+        .map_err(|error| GraphError::Io(format!("create D-Bus signal sender match: {error}")))?
+        .interface(interface)
+        .map_err(|error| GraphError::Io(format!("create D-Bus signal interface match: {error}")))?;
+    if let Some(member) = member {
+        builder = builder.member(member).map_err(|error| {
+            GraphError::Io(format!("create D-Bus signal member match: {error}"))
+        })?;
+    }
+    MessageStream::for_match_rule(builder.build(), connection, Some(256))
+        .await
+        .map_err(|error| GraphError::Io(format!("subscribe to D-Bus {interface} signals: {error}")))
+}
+
+fn read_signal_message(
+    message: Option<zbus::Result<zbus::Message>>,
+    signal: &'static str,
+) -> Result<()> {
+    match message {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => Err(GraphError::Io(format!(
+            "read D-Bus {signal} signal: {error}"
+        ))),
+        None => Err(GraphError::Io(format!(
+            "D-Bus {signal} signal stream ended"
+        ))),
+    }
 }
 
 async fn snapshot_service(
@@ -144,14 +238,18 @@ async fn managed_objects(
 ) -> Result<BTreeMap<String, ObjectSnapshot>> {
     let mut errors = Vec::new();
     match managed_objects_at(connection, config, &config.object_manager_path).await {
-        Ok(objects) if !objects.is_empty() => return Ok(objects),
+        Ok(objects) if !objects.is_empty() => {
+            return annotate_introspection(connection, config, objects).await;
+        }
         Ok(_) => {}
         Err(error) => errors.push(error.to_string()),
     }
 
     if config.object_manager_path != "/" {
         match managed_objects_at(connection, config, "/").await {
-            Ok(objects) if !objects.is_empty() => return Ok(objects),
+            Ok(objects) if !objects.is_empty() => {
+                return annotate_introspection(connection, config, objects).await;
+            }
             Ok(_) => {}
             Err(error) => errors.push(error.to_string()),
         }
@@ -172,6 +270,29 @@ async fn managed_objects(
 
 async fn sleep_retry() {
     sleep(Duration::from_secs(1)).await;
+}
+
+async fn annotate_introspection(
+    connection: &zbus::Connection,
+    config: &ServiceConfig,
+    mut objects: BTreeMap<String, ObjectSnapshot>,
+) -> Result<BTreeMap<String, ObjectSnapshot>> {
+    for object in objects.values_mut() {
+        let xml = match introspect_path(connection, config, &object.path).await {
+            Ok(xml) => xml,
+            Err(_) => continue,
+        };
+        for (interface, properties) in &mut object.interfaces {
+            let writable_properties = parse_interface_property_access(&xml, interface);
+            for (property, snapshot) in properties {
+                if let Some(writable) = writable_properties.get(property) {
+                    snapshot.writable = *writable;
+                }
+            }
+        }
+        object.methods = parse_interface_methods(&xml);
+    }
+    Ok(objects)
 }
 
 async fn managed_objects_at(
@@ -232,25 +353,40 @@ async fn introspected_objects(
         };
 
         let mut interfaces = BTreeMap::new();
+        let all_methods = parse_interface_methods(&xml);
+        let mut methods = BTreeMap::new();
         for interface in parse_interface_names(&xml) {
             if is_standard_interface(&interface) {
                 continue;
             }
-            let properties =
-                match properties_for_interface(connection, config, &path, &interface).await {
-                    Ok(properties) => properties,
-                    Err(_) => continue,
-                };
+            let interface_methods = all_methods.get(&interface).cloned().unwrap_or_default();
+            if !interface_methods.is_empty() {
+                methods.insert(interface.clone(), interface_methods);
+            }
+            let writable_properties = parse_interface_property_access(&xml, &interface);
+            let properties = match properties_for_interface(
+                connection,
+                config,
+                &path,
+                &interface,
+                &writable_properties,
+            )
+            .await
+            {
+                Ok(properties) => properties,
+                Err(_) => continue,
+            };
             if !properties.is_empty() {
                 interfaces.insert(interface, properties);
             }
         }
 
-        if !interfaces.is_empty() {
+        if !interfaces.is_empty() || !methods.is_empty() {
             let object = ObjectSnapshot {
                 service_local_id: config.local_id.clone(),
                 path: path.clone(),
                 interfaces,
+                methods,
             };
             objects.insert(path.clone(), object);
         }
@@ -292,7 +428,8 @@ async fn properties_for_interface(
     config: &ServiceConfig,
     path: &str,
     interface: &str,
-) -> Result<BTreeMap<String, locusfs_graph::LocusValue>> {
+    writable_properties: &BTreeMap<String, bool>,
+) -> Result<BTreeMap<String, DbusPropertySnapshot>> {
     let proxy = PropertiesProxy::builder(connection)
         .destination(config.name.as_str())
         .map_err(|error| GraphError::Io(format!("create properties destination: {error}")))?
@@ -317,7 +454,15 @@ async fn properties_for_interface(
     })?;
     Ok(properties
         .iter()
-        .map(|(key, value)| (key.clone(), crate::state::locus_value_from_dbus(value)))
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                DbusPropertySnapshot {
+                    value: crate::state::locus_value_from_dbus(value),
+                    writable: writable_properties.get(key).copied().unwrap_or(false),
+                },
+            )
+        })
         .collect())
 }
 
@@ -330,6 +475,137 @@ fn parse_child_node_names(xml: &str) -> Vec<String> {
         .into_iter()
         .filter(|name| !name.starts_with('/'))
         .collect()
+}
+
+fn parse_interface_property_access(xml: &str, interface: &str) -> BTreeMap<String, bool> {
+    let mut properties = BTreeMap::new();
+    for body in interface_bodies(xml, interface) {
+        let needle = "<property";
+        let mut remaining = body;
+        while let Some(index) = remaining.find(needle) {
+            remaining = &remaining[index + needle.len()..];
+            let Some(first) = remaining.chars().next() else {
+                break;
+            };
+            if !(first.is_whitespace() || first == '/' || first == '>') {
+                continue;
+            }
+            let Some(end) = remaining.find('>') else {
+                break;
+            };
+            let tag = &remaining[..end];
+            if let Some(name) = attr_value(tag, "name") {
+                let writable = matches!(
+                    attr_value(tag, "access").as_deref(),
+                    Some("readwrite" | "write")
+                );
+                properties.insert(name, writable);
+            }
+            remaining = &remaining[end + 1..];
+        }
+    }
+    properties
+}
+
+fn parse_interface_methods(xml: &str) -> BTreeMap<String, BTreeMap<String, DbusMethodSnapshot>> {
+    let mut methods = BTreeMap::new();
+    for interface in parse_interface_names(xml) {
+        if is_standard_interface(&interface) {
+            continue;
+        }
+        let mut interface_methods = BTreeMap::new();
+        for body in interface_bodies(xml, &interface) {
+            let needle = "<method";
+            let mut remaining = body;
+            while let Some(index) = remaining.find(needle) {
+                remaining = &remaining[index + needle.len()..];
+                let Some(first) = remaining.chars().next() else {
+                    break;
+                };
+                if !(first.is_whitespace() || first == '/' || first == '>') {
+                    continue;
+                }
+                let Some(tag_end) = remaining.find('>') else {
+                    break;
+                };
+                let tag = &remaining[..tag_end];
+                let Some(name) = attr_value(tag, "name") else {
+                    remaining = &remaining[tag_end + 1..];
+                    continue;
+                };
+                let body_start = tag_end + 1;
+                let Some(body_end) = remaining[body_start..].find("</method>") else {
+                    remaining = &remaining[body_start..];
+                    continue;
+                };
+                let method_body = &remaining[body_start..body_start + body_end];
+                interface_methods.insert(
+                    name,
+                    DbusMethodSnapshot {
+                        input_signature: parse_input_arg_types(method_body),
+                    },
+                );
+                remaining = &remaining[body_start + body_end + "</method>".len()..];
+            }
+        }
+        if !interface_methods.is_empty() {
+            methods.insert(interface, interface_methods);
+        }
+    }
+    methods
+}
+
+fn parse_input_arg_types(method_body: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let needle = "<arg";
+    let mut remaining = method_body;
+    while let Some(index) = remaining.find(needle) {
+        remaining = &remaining[index + needle.len()..];
+        let Some(first) = remaining.chars().next() else {
+            break;
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            continue;
+        }
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        let tag = &remaining[..end];
+        let direction = attr_value(tag, "direction");
+        if direction.as_deref().unwrap_or("in") == "in"
+            && let Some(arg_type) = attr_value(tag, "type")
+        {
+            args.push(arg_type);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    args
+}
+
+fn interface_bodies<'a>(xml: &'a str, interface: &str) -> Vec<&'a str> {
+    let mut bodies = Vec::new();
+    let mut remaining = xml;
+    while let Some(index) = remaining.find("<interface") {
+        remaining = &remaining[index + "<interface".len()..];
+        let Some(first) = remaining.chars().next() else {
+            break;
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            continue;
+        }
+        let Some(tag_end) = remaining.find('>') else {
+            break;
+        };
+        let tag = &remaining[..tag_end];
+        let body_start = tag_end + 1;
+        if attr_value(tag, "name").as_deref() == Some(interface) {
+            if let Some(body_end) = remaining[body_start..].find("</interface>") {
+                bodies.push(&remaining[body_start..body_start + body_end]);
+            }
+        }
+        remaining = &remaining[body_start..];
+    }
+    bodies
 }
 
 fn parse_named_tags(xml: &str, tag: &str) -> Vec<String> {
@@ -429,7 +705,7 @@ async fn publish_snapshot(
 }
 
 fn leading_kind_changes() -> Vec<GraphChange> {
-    [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND]
+    [DBUS_SERVICE_KIND, DBUS_OBJECT_KIND, DBUS_METHOD_KIND]
         .into_iter()
         .filter_map(|kind| {
             Some(GraphChange::NodeKindChanged {

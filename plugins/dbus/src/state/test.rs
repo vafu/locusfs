@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use locusfs_graph::{LocusValue, NodeId, NodeKind, PropertyKey, RelationName};
 
 use super::{
-    DBUS_OBJECT_KIND, DBUS_SERVICE_KIND, DbusState, ServiceConfig, object_snapshot, service_node,
+    DBUS_METHOD_KIND, DBUS_OBJECT_KIND, DBUS_SERVICE_KIND, DbusMethodSnapshot,
+    DbusPropertySnapshot, DbusState, ServiceConfig, object_snapshot, service_node,
 };
 
 #[test]
@@ -43,10 +44,10 @@ fn service_snapshot_exposes_objects_and_relations() {
         BTreeMap::from([(
             "org.example.Power.Device".to_string(),
             BTreeMap::from([
-                ("Percentage".to_string(), LocusValue::F64(82.5)),
+                ("Percentage".to_string(), property(LocusValue::F64(82.5))),
                 (
                     "NativePath".to_string(),
-                    LocusValue::String("BAT0".to_string()),
+                    property(LocusValue::String("BAT0".to_string())),
                 ),
             ]),
         )]),
@@ -123,7 +124,7 @@ fn object_node_ids_round_trip_for_paths_outside_object_manager() {
             "org.example.Device".to_string(),
             BTreeMap::from([(
                 "Name".to_string(),
-                LocusValue::String("outside".to_string()),
+                property(LocusValue::String("outside".to_string())),
             )]),
         )]),
     );
@@ -163,6 +164,131 @@ fn object_node_ids_round_trip_for_paths_outside_object_manager() {
 }
 
 #[test]
+fn writable_object_properties_are_marked_and_update_cache() {
+    let mut state = test_state();
+    let object = object_snapshot(
+        "power",
+        "/org/example/Power",
+        BTreeMap::from([(
+            "org.example.Power".to_string(),
+            BTreeMap::from([(
+                "ActiveProfile".to_string(),
+                writable_property(LocusValue::String("balanced".to_string())),
+            )]),
+        )]),
+    );
+    state
+        .set_service_snapshot(
+            "power",
+            Some(":1.42".to_string()),
+            BTreeMap::from([(object.path.clone(), object)]),
+        )
+        .expect("snapshot update succeeds");
+
+    let object_node = NodeId::new(NodeKind::new(DBUS_OBJECT_KIND).unwrap(), "power:@").unwrap();
+    let key = PropertyKey::new("ActiveProfile").unwrap();
+
+    assert!(
+        state
+            .property_spec(&object_node, &key)
+            .unwrap()
+            .is_writable()
+    );
+    assert_eq!(
+        state
+            .writable_property(&object_node, &key)
+            .unwrap()
+            .interface,
+        "org.example.Power"
+    );
+
+    state
+        .update_cached_property(
+            &object_node,
+            &key,
+            LocusValue::String("performance".to_string()),
+        )
+        .unwrap();
+    assert_eq!(
+        state.property(&object_node, &key).unwrap(),
+        LocusValue::String("performance".to_string())
+    );
+}
+
+#[test]
+fn object_methods_are_exposed_as_write_only_call_nodes() {
+    let mut state = test_state();
+    let mut object = object_snapshot(
+        "power",
+        "/org/example/Power/devices/Keyboard0",
+        BTreeMap::from([(
+            "org.example.Power.Device".to_string(),
+            BTreeMap::from([(
+                "Name".to_string(),
+                property(LocusValue::String("Keyboard".to_string())),
+            )]),
+        )]),
+    );
+    object.methods = BTreeMap::from([(
+        "org.example.Power.Device".to_string(),
+        BTreeMap::from([(
+            "Connect".to_string(),
+            DbusMethodSnapshot {
+                input_signature: Vec::new(),
+            },
+        )]),
+    )]);
+    state
+        .set_service_snapshot(
+            "power",
+            Some(":1.42".to_string()),
+            BTreeMap::from([(object.path.clone(), object)]),
+        )
+        .expect("snapshot update succeeds");
+
+    let object_node = NodeId::new(
+        NodeKind::new(DBUS_OBJECT_KIND).unwrap(),
+        "power:devices/Keyboard0",
+    )
+    .unwrap();
+    let method_node = NodeId::new(
+        NodeKind::new(DBUS_METHOD_KIND).unwrap(),
+        "power:devices/Keyboard0:Connect",
+    )
+    .unwrap();
+    let call_key = PropertyKey::new("call").unwrap();
+
+    assert_eq!(
+        state
+            .targets(&object_node, &RelationName::new("methods").unwrap())
+            .unwrap(),
+        vec![method_node.clone()]
+    );
+    assert_eq!(
+        state
+            .property(&method_node, &PropertyKey::new("method").unwrap())
+            .unwrap(),
+        LocusValue::String("Connect".to_string())
+    );
+    assert_eq!(
+        state
+            .property(&method_node, &PropertyKey::new("interface").unwrap())
+            .unwrap(),
+        LocusValue::String("org.example.Power.Device".to_string())
+    );
+    let spec = state.property_spec(&method_node, &call_key).unwrap();
+    assert!(spec.is_writable());
+    assert!(!spec.is_readable());
+    assert_eq!(
+        state
+            .callable_method(&method_node, &call_key)
+            .unwrap()
+            .method,
+        "Connect"
+    );
+}
+
+#[test]
 fn rejects_unconfigured_service_nodes() {
     let state = test_state();
     let node = NodeId::new(
@@ -181,4 +307,18 @@ fn rejects_unconfigured_service_nodes() {
 
 fn test_state() -> DbusState {
     DbusState::new(vec![ServiceConfig::system("org.example.Power")])
+}
+
+fn property(value: LocusValue) -> DbusPropertySnapshot {
+    DbusPropertySnapshot {
+        value,
+        writable: false,
+    }
+}
+
+fn writable_property(value: LocusValue) -> DbusPropertySnapshot {
+    DbusPropertySnapshot {
+        value,
+        writable: true,
+    }
 }

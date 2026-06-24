@@ -10,7 +10,7 @@ pub use provider::NiriProvider;
 use async_trait::async_trait;
 use locusfs_graph::{DynamicGraph, GraphError, NodeKind, Result, TracedProvider};
 use locusfs_plugin_api::{
-    LocusFsPlugin, PluginContext, PluginHandle, PluginManifest, enter_runtime,
+    LocusFsPlugin, PluginContext, PluginHandle, PluginManifest, PluginRuntime,
 };
 use tokio::task::JoinHandle;
 
@@ -31,6 +31,7 @@ pub struct NiriPlugin;
 #[derive(Debug)]
 pub struct NiriPluginHandle {
     event_stream: Option<JoinHandle<()>>,
+    _runtime: PluginRuntime,
 }
 
 impl Drop for NiriPluginHandle {
@@ -59,20 +60,20 @@ pub async fn register_with_config(
     graph: &DynamicGraph,
     _config: NiriConfig,
 ) -> Result<NiriPluginHandle> {
-    let runtime = tokio::runtime::Handle::current();
-    register_with_config_and_runtime(graph, _config, runtime).await
+    register_with_config_and_runtime(graph, _config).await
 }
 
 async fn register_with_config_and_runtime(
     graph: &DynamicGraph,
     _config: NiriConfig,
-    runtime: tokio::runtime::Handle,
 ) -> Result<NiriPluginHandle> {
-    let (state, event_stream) = enter_runtime(
-        runtime.clone(),
-        IpcNiriClient::start(graph.clone(), runtime),
-    )
-    .await?;
+    let runtime = PluginRuntime::new("locusfs-niri")?;
+    let runtime_handle = runtime.handle();
+    let init_runtime = runtime_handle.clone();
+    let (state, event_stream) = runtime_handle
+        .spawn(IpcNiriClient::start(graph.clone(), init_runtime))
+        .await
+        .map_err(|error| GraphError::Io(format!("start Niri IPC task failed: {error}")))??;
 
     for kind in PROVIDER_KINDS {
         let kind = NodeKind::new(*kind)?;
@@ -87,6 +88,7 @@ async fn register_with_config_and_runtime(
 
     Ok(NiriPluginHandle {
         event_stream: Some(event_stream),
+        _runtime: runtime,
     })
 }
 
@@ -107,7 +109,7 @@ impl LocusFsPlugin for NiriPlugin {
     ) -> Result<Box<dyn PluginHandle>> {
         let config = NiriConfig::from_value(config)?;
         Ok(Box::new(
-            register_with_config_and_runtime(&context.graph, config, context.runtime).await?,
+            register_with_config_and_runtime(&context.graph, config).await?,
         ))
     }
 }
