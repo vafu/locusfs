@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use locusfs_graph::{
-    GraphError, LocusValue, NodeId, NodeKind, NodeProvider, PropertyKey, PropertyMutationProvider,
+    GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, LocusValue, NodeAccess, NodeId,
+    NodeKind, NodeProvider, PathName, PathProvider, PropertyKey, PropertyMutationProvider,
     PropertyProvider, PropertySpec, RelationName, RelationProvider, Result,
 };
 use tokio::runtime::Handle;
@@ -39,6 +40,17 @@ impl NodeProvider for DbusProvider {
         &self.kind
     }
 
+    fn access(&self) -> NodeAccess {
+        if matches!(
+            self.kind.as_str(),
+            crate::DBUS_OBJECT_KIND | crate::DBUS_METHOD_KIND
+        ) {
+            NodeAccess::hidden()
+        } else {
+            NodeAccess::read_only()
+        }
+    }
+
     async fn contains_node(&self, node: &NodeId) -> Result<bool> {
         self.with_state(|state| state.contains_node(node)).await
     }
@@ -72,6 +84,34 @@ impl RelationProvider for DbusProvider {
 
     async fn targets(&self, source: &NodeId, relation: &RelationName) -> Result<Vec<NodeId>> {
         self.with_state(|state| state.targets(source, relation))
+            .await
+    }
+}
+
+#[async_trait]
+impl PathProvider for DbusProvider {
+    fn kind(&self) -> &NodeKind {
+        &self.kind
+    }
+
+    async fn lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        self.with_state(|state| state.path_lookup_child(parent, name))
+            .await
+    }
+
+    async fn children(&self, parent: &GraphPathDirectory) -> Result<Option<Vec<GraphPathChild>>> {
+        self.with_state(|state| state.path_children(parent)).await
+    }
+
+    async fn watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<locusfs_graph::GraphWatchTarget>> {
+        self.with_state(|state| state.path_watch_target(directory))
             .await
     }
 }

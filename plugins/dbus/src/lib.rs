@@ -83,6 +83,9 @@ async fn register_with_config_and_runtime(
                 .register_property_mutation_provider(kind.clone(), provider.clone())
                 .await?;
         }
+        if kind_name == DBUS_SERVICE_KIND {
+            graph.register_path_provider(provider.clone()).await?;
+        }
         graph.register_relation_provider(kind, provider).await?;
     }
     Ok(DbusPluginHandle {

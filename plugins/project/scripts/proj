@@ -76,6 +76,16 @@ project_name() {
   fi
 }
 
+project_icon_default() {
+  local name="$1"
+  local icon
+  if icon="$(pick-icon "$name" 2>/dev/null)" && [[ -n "$icon" ]]; then
+    printf '%s\n' "$icon"
+  else
+    printf '%s\n' "$default_icon"
+  fi
+}
+
 git_output() {
   local root="$1"
   shift
@@ -150,13 +160,15 @@ cmd_init() {
     force=true
     shift
   fi
-  local root
+  local root name icon
   root="$(absolute_dir "${1:-.}")"
   local file="$root/$metadata_file"
   if [[ -e "$file" && "$force" != true ]]; then
     die "$file already exists"
   fi
-  jq -n --arg name "$(basename "$root")" --arg icon "$default_icon" \
+  name="$(basename "$root")"
+  icon="$(project_icon_default "$name")"
+  jq -n --arg name "$name" --arg icon "$icon" \
     '{name: $name, icon: $icon}' > "$file"
   printf '%s\n' "$file"
 }
@@ -224,22 +236,24 @@ build_snapshot() {
 cmd_update() {
   local root
   root="$(project_root_for_path "${1:-.}")" || return 0
-  local node metadata branch worktree worktree_name regex fields icon display_icon
+  local node metadata branch worktree worktree_name regex fields name icon_default icon display_icon
   ensure_project_node "$root"
   node="$(project_node_dir "$root")"
   metadata="$(metadata_json "$root")"
+  name="$(project_name "$root")"
   branch="$(git_output "$root" branch --show-current)"
   worktree="$(git_output "$root" rev-parse --show-toplevel)"
   worktree_name=""
   [[ -n "$worktree" ]] && worktree_name="$(basename "$worktree")"
   regex="$(jq -r --arg default "$default_branch_regex" '.branch_regex // $default' <<<"$metadata")"
   fields="$(branch_fields "$branch" "$regex")"
-  icon="$(jq -r --arg default "$default_icon" '.icon // $default' <<<"$metadata")"
+  icon_default="$(project_icon_default "$name")"
+  icon="$(jq -r --arg default "$icon_default" '.icon // $default' <<<"$metadata")"
   display_icon="$icon"
 
   write_prop "$node" kind project
   write_prop "$node" path "$root"
-  write_prop "$node" name "$(project_name "$root")"
+  write_prop "$node" name "$name"
   write_prop "$node" icon "$icon"
   write_prop "$node" display-icon "$display_icon"
   [[ -n "$branch" ]] && write_prop "$node" branch "$branch" || remove_prop "$node" branch

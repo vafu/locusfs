@@ -17,8 +17,8 @@ use fuse3::raw::reply::{
 use fuse3::{Errno, FileType, Inode, SetAttr};
 use futures_util::stream::{self, Iter};
 use locusfs_graph::{
-    DynamicGraph, GraphError, GraphWatch, InMemoryProvider, NodeId, NodeKind, PropertyKey,
-    RelationName,
+    DynamicGraph, GraphError, GraphPathDirectory, GraphPathEntry, GraphWatch, InMemoryProvider,
+    NodeId, NodeKind, PathName, PropertyKey, RelationName,
 };
 use tokio::sync::Mutex;
 
@@ -83,12 +83,21 @@ impl LocusFs {
     async fn lookup_entry(&self, parent: u64, name: &OsStr) -> std::result::Result<FsEntry, Errno> {
         let name = os_str_to_str(name)?;
         let parent = self.entry(parent).await?;
-        match parent {
+        match parent.clone() {
             FsEntry::Root => {
                 if name == WATCH_FILE_NAME {
                     return Ok(FsEntry::WatchFile);
                 }
                 let kind = node_kind_from_segment(name)?;
+                if self
+                    .graph
+                    .kind_access(&kind)
+                    .await
+                    .map_err(graph_error_to_errno)
+                    .is_ok_and(|access| !access.is_readable())
+                {
+                    return Err(errno(libc::ENOENT));
+                }
                 if self
                     .graph
                     .node_kinds()
@@ -115,6 +124,16 @@ impl LocusFs {
                 }
             }
             FsEntry::NodeDir(node) => {
+                if let Some(entry) = self
+                    .lookup_path_child(
+                        &GraphPathDirectory::Node(node.clone()),
+                        name,
+                        FsEntry::NodeDir(node.clone()),
+                    )
+                    .await?
+                {
+                    return Ok(entry);
+                }
                 let property = property_key_from_segment(name)?;
                 let has_property = self.graph.property_spec(&node, &property).await.is_ok();
                 let relation = relation_name_from_segment(name)?;
@@ -151,10 +170,48 @@ impl LocusFs {
                     target,
                 })
             }
+            FsEntry::PathDir { directory, .. } => self
+                .lookup_path_child(&directory, name, parent)
+                .await?
+                .ok_or(errno(libc::ENOENT)),
             FsEntry::WatchFile
             | FsEntry::PropertyFile(_, _)
             | FsEntry::RelationLink { .. }
-            | FsEntry::RelationTargetLink { .. } => Err(errno(libc::ENOTDIR)),
+            | FsEntry::RelationTargetLink { .. }
+            | FsEntry::PathLink { .. } => Err(errno(libc::ENOTDIR)),
+        }
+    }
+
+    async fn lookup_path_child(
+        &self,
+        directory: &GraphPathDirectory,
+        name: &str,
+        parent: FsEntry,
+    ) -> std::result::Result<Option<FsEntry>, Errno> {
+        let name = PathName::new(decode_segment(name).map_err(graph_error_to_errno)?)
+            .map_err(graph_error_to_errno)?;
+        let Some(entry) = self
+            .graph
+            .lookup_path_child(directory, &name)
+            .await
+            .map_err(graph_error_to_errno)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.path_entry(entry, parent)))
+    }
+
+    fn path_entry(&self, entry: GraphPathEntry, parent: FsEntry) -> FsEntry {
+        match entry {
+            GraphPathEntry::Directory(directory) => FsEntry::PathDir {
+                directory,
+                parent: Box::new(parent),
+            },
+            GraphPathEntry::Property { node, key } => FsEntry::PropertyFile(node, key),
+            GraphPathEntry::Symlink { target } => FsEntry::PathLink {
+                target,
+                parent: Box::new(parent),
+            },
         }
     }
 
@@ -221,6 +278,7 @@ impl LocusFs {
                     .map_err(graph_error_to_errno)?;
                 (FileType::Directory, node_dir_perm(access), 0)
             }
+            FsEntry::PathDir { .. } => (FileType::Directory, 0o555, 0),
             FsEntry::PropertyFile(node, key) => {
                 let spec = self
                     .graph
@@ -271,6 +329,14 @@ impl LocusFs {
                         .len() as u64,
                 )
             }
+            FsEntry::PathLink { target, .. } => (
+                FileType::Symlink,
+                0o777,
+                direct_relation_link_target(target)
+                    .as_os_str()
+                    .as_bytes()
+                    .len() as u64,
+            ),
         };
 
         Ok(file_attr(
@@ -433,11 +499,13 @@ impl Filesystem for LocusFs {
             FsEntry::Root
             | FsEntry::KindDir(_)
             | FsEntry::NodeDir(_)
-            | FsEntry::RelationDir(_, _) => Ok(ReplyOpen { fh: 0, flags: 0 }),
+            | FsEntry::RelationDir(_, _)
+            | FsEntry::PathDir { .. } => Ok(ReplyOpen { fh: 0, flags: 0 }),
             FsEntry::WatchFile
             | FsEntry::PropertyFile(_, _)
             | FsEntry::RelationLink { .. }
-            | FsEntry::RelationTargetLink { .. } => Err(errno(libc::ENOTDIR)),
+            | FsEntry::RelationTargetLink { .. }
+            | FsEntry::PathLink { .. } => Err(errno(libc::ENOTDIR)),
         }
     }
 
@@ -543,6 +611,10 @@ impl Filesystem for LocusFs {
                     .as_bytes()
                     .to_vec()
             }
+            FsEntry::PathLink { target, .. } => direct_relation_link_target(&target)
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
             _ => return Err(errno(libc::EINVAL)),
         };
         Ok(ReplyData {
@@ -569,7 +641,9 @@ impl Filesystem for LocusFs {
                     .await
                     .read_watch_chunk(FileHandle(fh), offset, size)?
             }
-            FsEntry::RelationLink { .. } | FsEntry::RelationTargetLink { .. } => {
+            FsEntry::RelationLink { .. }
+            | FsEntry::RelationTargetLink { .. }
+            | FsEntry::PathLink { .. } => {
                 return Err(errno(libc::EINVAL));
             }
             _ => return Err(errno(libc::EISDIR)),

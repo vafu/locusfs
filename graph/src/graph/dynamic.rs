@@ -7,14 +7,14 @@ use tokio::sync::broadcast::{self, Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::{
-    GraphChange, GraphError, LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName,
-    Result,
+    GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, LocusValue,
+    NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
 };
 
 use super::{
     GraphWatch, GraphWatchEvent, GraphWatchTarget, NodeAccess, NodeMutationProvider, NodeProvider,
-    PropertyMutationProvider, PropertyProvider, RelationMutationProvider, RelationProvider,
-    WatchProvider,
+    PathProvider, PropertyMutationProvider, PropertyProvider, RelationMutationProvider,
+    RelationProvider, WatchProvider,
 };
 
 type NodeProviders = BTreeMap<NodeKind, Arc<dyn NodeProvider>>;
@@ -23,6 +23,7 @@ type PropertyProviders = BTreeMap<NodeKind, Arc<dyn PropertyProvider>>;
 type PropertyMutationProviders = BTreeMap<NodeKind, Arc<dyn PropertyMutationProvider>>;
 type RelationProviders = BTreeMap<NodeKind, Arc<dyn RelationProvider>>;
 type RelationMutationProviders = BTreeMap<NodeKind, Arc<dyn RelationMutationProvider>>;
+type PathProviders = BTreeMap<NodeKind, Arc<dyn PathProvider>>;
 type WatchProviders = BTreeMap<NodeKind, Arc<dyn WatchProvider>>;
 type RegistryReadGuard<'a> = tokio::sync::RwLockReadGuard<'a, ProviderRegistry>;
 type RegistryWriteGuard<'a> = tokio::sync::RwLockWriteGuard<'a, ProviderRegistry>;
@@ -82,6 +83,7 @@ struct ProviderRegistry {
     property_mutations: PropertyMutationProviders,
     relations: RelationProviders,
     relation_mutations: RelationMutationProviders,
+    paths: PathProviders,
     watches: WatchProviders,
 }
 
@@ -210,6 +212,17 @@ impl DynamicGraph {
         Ok(())
     }
 
+    pub async fn register_path_provider<P>(&self, provider: P) -> Result<()>
+    where
+        P: PathProvider,
+    {
+        let kind = provider.kind().clone();
+        let mut providers = self.write_providers().await;
+        ensure_provider_slot_empty(&providers.paths, "path provider", &kind)?;
+        providers.paths.insert(kind, Arc::new(provider));
+        Ok(())
+    }
+
     pub async fn register_watch_provider<P>(&self, kind: NodeKind, provider: P) -> Result<()>
     where
         P: WatchProvider,
@@ -227,6 +240,37 @@ impl DynamicGraph {
         Ok(self.fallback_watch(target))
     }
 
+    pub async fn lookup_path_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        let Some(provider) = self.path_provider_for_directory(parent).await else {
+            return Ok(None);
+        };
+        provider.lookup_child(parent, name).await
+    }
+
+    pub async fn path_children(
+        &self,
+        parent: &GraphPathDirectory,
+    ) -> Result<Option<Vec<GraphPathChild>>> {
+        let Some(provider) = self.path_provider_for_directory(parent).await else {
+            return Ok(None);
+        };
+        provider.children(parent).await
+    }
+
+    pub async fn path_watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>> {
+        let Some(provider) = self.path_provider_for_directory(directory).await else {
+            return Ok(None);
+        };
+        provider.watch_target(directory).await
+    }
+
     async fn watch_provider_for_target(
         &self,
         target: &GraphWatchTarget,
@@ -239,6 +283,17 @@ impl DynamicGraph {
             | GraphWatchTarget::Relation(node, _) => node.kind(),
         };
         self.read_providers().await.watches.get(kind).cloned()
+    }
+
+    async fn path_provider_for_directory(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Option<Arc<dyn PathProvider>> {
+        let kind = match directory {
+            GraphPathDirectory::Node(node) => node.kind(),
+            GraphPathDirectory::Virtual { owner, .. } => owner,
+        };
+        self.read_providers().await.paths.get(kind).cloned()
     }
 
     fn fallback_watch(&self, target: GraphWatchTarget) -> GraphWatch {

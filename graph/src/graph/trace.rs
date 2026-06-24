@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use tracing::{Instrument, info_span, trace};
 
 use crate::{
-    LocusValue, NodeAccess, NodeId, NodeKind, NodeMutationProvider, NodeProvider, PropertyKey,
+    GraphPathChild, GraphPathDirectory, GraphPathEntry, LocusValue, NodeAccess, NodeId, NodeKind,
+    NodeMutationProvider, NodeProvider, PathName, PathProvider, PropertyKey,
     PropertyMutationProvider, PropertyProvider, PropertySpec, RelationMutationProvider,
     RelationName, RelationProvider, Result,
 };
@@ -334,6 +335,71 @@ where
             &result,
         );
         result
+    }
+}
+
+#[async_trait]
+impl<P> PathProvider for TracedProvider<P>
+where
+    P: PathProvider,
+{
+    fn kind(&self) -> &NodeKind {
+        self.inner.kind()
+    }
+
+    async fn lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        let started = Instant::now();
+        let span = info_span!(
+            target: "locusfs_graph::provider",
+            "provider.lookup_path_child",
+            plugin = self.label,
+            operation = "lookup_path_child",
+            parent = ?parent,
+            name = ?name,
+        );
+        let result = self.inner.lookup_child(parent, name).instrument(span).await;
+        trace!(
+            target: "locusfs_graph::provider",
+            provider = self.label,
+            operation = "lookup_path_child",
+            parent = ?parent,
+            name = ?name,
+            elapsed_us = started.elapsed().as_micros(),
+            ok = result.is_ok(),
+        );
+        result
+    }
+
+    async fn children(&self, parent: &GraphPathDirectory) -> Result<Option<Vec<GraphPathChild>>> {
+        let started = Instant::now();
+        let span = info_span!(
+            target: "locusfs_graph::provider",
+            "provider.path_children",
+            plugin = self.label,
+            operation = "path_children",
+            parent = ?parent,
+        );
+        let result = self.inner.children(parent).instrument(span).await;
+        trace!(
+            target: "locusfs_graph::provider",
+            provider = self.label,
+            operation = "path_children",
+            parent = ?parent,
+            elapsed_us = started.elapsed().as_micros(),
+            ok = result.is_ok(),
+        );
+        result
+    }
+
+    async fn watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<crate::GraphWatchTarget>> {
+        self.inner.watch_target(directory).await
     }
 }
 

@@ -17,6 +17,10 @@ impl NodeAccess {
         Self::new(true, true)
     }
 
+    pub const fn hidden() -> Self {
+        Self::new(false, false)
+    }
+
     pub const fn is_readable(self) -> bool {
         self.readable
     }

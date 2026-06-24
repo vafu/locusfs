@@ -29,8 +29,9 @@ pub use graph::{
     DynamicGraph, GraphChangeReceiver, GraphChangeStreamError, GraphChangeSubscription,
 };
 pub use graph::{
-    GraphChange, NodeAccess, NodeMutationProvider, NodeProvider, PropertyMutationProvider,
-    PropertyProvider, RelationMutationProvider, RelationProvider,
+    GraphChange, GraphPathChild, GraphPathDirectory, GraphPathEntry, NodeAccess,
+    NodeMutationProvider, NodeProvider, PathProvider, PropertyMutationProvider, PropertyProvider,
+    RelationMutationProvider, RelationProvider,
 };
 #[cfg(feature = "watch-provider")]
 pub use graph::{GraphWatch, GraphWatchEvent, GraphWatchTarget, WatchProvider};
@@ -44,8 +45,9 @@ pub use value::{LocusValue, PropertySpec, ValueKind};
 /// `InMemoryProvider`.
 pub mod prelude {
     pub use crate::{
-        GraphChange, GraphError, LocusValue, NodeAccess, NodeId, NodeKind, NodeMutationProvider,
-        NodeProvider, PathName, PropertyKey, PropertyMutationProvider, PropertyProvider,
-        PropertySpec, RelationMutationProvider, RelationName, RelationProvider, Result, ValueKind,
+        GraphChange, GraphError, GraphPathChild, GraphPathDirectory, GraphPathEntry, LocusValue,
+        NodeAccess, NodeId, NodeKind, NodeMutationProvider, NodeProvider, PathName, PathProvider,
+        PropertyKey, PropertyMutationProvider, PropertyProvider, PropertySpec,
+        RelationMutationProvider, RelationName, RelationProvider, Result, ValueKind,
     };
 }

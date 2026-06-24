@@ -1,5 +1,8 @@
 use fuse3::Errno;
-use locusfs_graph::{DynamicGraph, GraphError, GraphWatchTarget, NodeId, NodeKind, RelationName};
+use locusfs_graph::{
+    DynamicGraph, GraphError, GraphPathDirectory, GraphPathEntry, GraphWatchTarget, NodeId,
+    NodeKind, PathName, RelationName,
+};
 
 use super::name::{
     node_id_from_kind_and_segment, node_kind_from_segment, property_key_from_segment,
@@ -49,6 +52,17 @@ pub(crate) async fn resolve_watch_path(
 
     let mut dependencies = Vec::new();
     while let Some(segment) = next_segment(&segments, &mut index) {
+        if let Some(target) = resolve_path_provider_child(
+            graph,
+            GraphPathDirectory::Node(node.clone()),
+            segment,
+            &segments[index..],
+            directory_watch,
+        )
+        .await?
+        {
+            return Ok(target);
+        }
         let relation = relation_name_from_segment(segment)?;
         let targets = relation_targets(graph, &node, &relation).await?;
         let has_relation = !targets.is_empty();
@@ -123,6 +137,95 @@ pub(crate) async fn resolve_watch_path(
             WatchMode::State
         },
     })
+}
+
+async fn resolve_path_provider_child(
+    graph: &DynamicGraph,
+    directory: GraphPathDirectory,
+    segment: &str,
+    remaining: &[&str],
+    directory_watch: bool,
+) -> std::result::Result<Option<WatchTarget>, Errno> {
+    let name = PathName::new(decode_segment(segment).map_err(graph_error_to_errno)?)
+        .map_err(graph_error_to_errno)?;
+    let Some(entry) = graph
+        .lookup_path_child(&directory, &name)
+        .await
+        .map_err(graph_error_to_errno)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        resolve_path_provider_entry(graph, entry, remaining, directory_watch).await?,
+    ))
+}
+
+async fn resolve_path_provider_entry(
+    graph: &DynamicGraph,
+    mut entry: GraphPathEntry,
+    mut remaining: &[&str],
+    directory_watch: bool,
+) -> std::result::Result<WatchTarget, Errno> {
+    loop {
+        match entry {
+            GraphPathEntry::Directory(directory) => {
+                if let Some((segment, rest)) = remaining.split_first() {
+                    let name =
+                        PathName::new(decode_segment(segment).map_err(graph_error_to_errno)?)
+                            .map_err(graph_error_to_errno)?;
+                    entry = graph
+                        .lookup_path_child(&directory, &name)
+                        .await
+                        .map_err(graph_error_to_errno)?
+                        .ok_or(errno(libc::ENOENT))?;
+                    remaining = rest;
+                    continue;
+                }
+
+                let subject = graph
+                    .path_watch_target(&directory)
+                    .await
+                    .map_err(graph_error_to_errno)?
+                    .ok_or(errno(libc::ENOENT))?;
+                return Ok(WatchTarget {
+                    subject,
+                    dependencies: Vec::new(),
+                    ready: true,
+                    mode: if directory_watch {
+                        WatchMode::Changes
+                    } else {
+                        WatchMode::State
+                    },
+                });
+            }
+            GraphPathEntry::Property { node, key } => {
+                if !remaining.is_empty() {
+                    return Err(errno(libc::ENOTDIR));
+                }
+                return Ok(WatchTarget {
+                    subject: GraphWatchTarget::Property(node, key),
+                    dependencies: Vec::new(),
+                    ready: true,
+                    mode: WatchMode::State,
+                });
+            }
+            GraphPathEntry::Symlink { target } => {
+                if !remaining.is_empty() {
+                    return Err(errno(libc::ENOTDIR));
+                }
+                return Ok(WatchTarget {
+                    subject: GraphWatchTarget::Node(target),
+                    dependencies: Vec::new(),
+                    ready: true,
+                    mode: if directory_watch {
+                        WatchMode::Changes
+                    } else {
+                        WatchMode::State
+                    },
+                });
+            }
+        }
+    }
 }
 
 pub(crate) async fn resolve_watch_state(

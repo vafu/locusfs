@@ -11,7 +11,9 @@ mod watch;
 
 use async_trait::async_trait;
 
-use crate::{LocusValue, NodeId, NodeKind, PropertyKey, PropertySpec, RelationName, Result};
+use crate::{
+    LocusValue, NodeId, NodeKind, PathName, PropertyKey, PropertySpec, RelationName, Result,
+};
 
 pub use access::NodeAccess;
 pub use change::GraphChange;
@@ -25,6 +27,32 @@ pub use memory::InMemoryProvider;
 pub use trace::TracedProvider;
 #[cfg(feature = "watch-provider")]
 pub use watch::{GraphWatch, GraphWatchEvent, GraphWatchTarget, WatchProvider};
+
+/// Directory identity used by provider-owned filesystem path layouts.
+///
+/// `Node` represents the normal directory for a graph node. `Virtual` lets a
+/// provider expose additional directories below one of its nodes without adding
+/// synthetic graph nodes for every path segment.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum GraphPathDirectory {
+    Node(NodeId),
+    Virtual { owner: NodeKind, local: String },
+}
+
+/// Filesystem entry resolved by a [`PathProvider`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum GraphPathEntry {
+    Directory(GraphPathDirectory),
+    Property { node: NodeId, key: PropertyKey },
+    Symlink { target: NodeId },
+}
+
+/// Named child entry exposed by a [`PathProvider`] directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphPathChild {
+    pub name: PathName,
+    pub entry: GraphPathEntry,
+}
 
 #[async_trait]
 pub trait NodeProvider: Send + Sync + 'static {
@@ -80,6 +108,30 @@ pub trait RelationMutationProvider: Send + Sync + 'static {
         relation: &RelationName,
         target: &NodeId,
     ) -> Result<()>;
+}
+
+/// Optional provider-owned filesystem path layout.
+///
+/// FUSE asks this trait before falling back to generic graph property/relation
+/// layout. Implementations may expose virtual directories, remap path children
+/// to real graph properties, and provide a watch target for directory updates.
+#[async_trait]
+pub trait PathProvider: Send + Sync + 'static {
+    fn kind(&self) -> &NodeKind;
+
+    async fn lookup_child(
+        &self,
+        parent: &GraphPathDirectory,
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>>;
+
+    async fn children(&self, parent: &GraphPathDirectory) -> Result<Option<Vec<GraphPathChild>>>;
+
+    #[cfg(feature = "watch-provider")]
+    async fn watch_target(
+        &self,
+        directory: &GraphPathDirectory,
+    ) -> Result<Option<GraphWatchTarget>>;
 }
 
 #[cfg(all(

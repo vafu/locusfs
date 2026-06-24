@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use fuse3::FileType;
-use locusfs_graph::{NodeId, NodeKind, PropertyKey, RelationName};
+use locusfs_graph::{GraphPathDirectory, NodeId, NodeKind, PropertyKey, RelationName};
 
 use crate::layout::encode_segment;
 
@@ -25,6 +25,14 @@ pub enum FsEntry {
         source: NodeId,
         relation: RelationName,
         target: NodeId,
+    },
+    PathDir {
+        directory: GraphPathDirectory,
+        parent: Box<FsEntry>,
+    },
+    PathLink {
+        target: NodeId,
+        parent: Box<FsEntry>,
     },
 }
 
@@ -57,6 +65,7 @@ pub fn parent_entry(entry: &FsEntry) -> FsEntry {
         FsEntry::RelationTargetLink {
             source, relation, ..
         } => FsEntry::RelationDir(source.clone(), relation.clone()),
+        FsEntry::PathDir { parent, .. } | FsEntry::PathLink { parent, .. } => *parent.clone(),
     }
 }
 
