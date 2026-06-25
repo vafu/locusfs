@@ -98,6 +98,13 @@ async fn invalidate_change(
                 WatchChange::NodeAdded(node.clone()),
             )
             .await;
+            refresh_node_state_watchers(
+                notifier.clone(),
+                graph.clone(),
+                watch.clone(),
+                node.clone(),
+            )
+            .await;
             let parent = FsEntry::KindDir(node.kind().clone());
             let name = match encode_segment(node.local()) {
                 Ok(name) => name,
@@ -119,6 +126,13 @@ async fn invalidate_change(
                 WatchChange::NodeChanged(node.clone()),
             )
             .await;
+            refresh_node_state_watchers(
+                notifier.clone(),
+                graph.clone(),
+                watch.clone(),
+                node.clone(),
+            )
+            .await;
             invalidate_known_inode(
                 notifier.clone(),
                 inodes.clone(),
@@ -132,6 +146,13 @@ async fn invalidate_change(
                 watch.clone(),
                 node.clone(),
                 WatchChange::NodeRemoved(node.clone()),
+            )
+            .await;
+            refresh_node_state_watchers(
+                notifier.clone(),
+                graph.clone(),
+                watch.clone(),
+                node.clone(),
             )
             .await;
             let parent = FsEntry::KindDir(node.kind().clone());
@@ -423,6 +444,20 @@ async fn retarget_relation_watchers(
         )
     };
     let mut had_poll_waiters = notify_poll_handles(notifier.clone(), handles).await;
+    had_poll_waiters |= refresh_state_watchers_for_subject(
+        notifier.clone(),
+        graph.clone(),
+        watch.clone(),
+        GraphWatchTarget::Relation(source.clone(), relation.clone()),
+    )
+    .await;
+    had_poll_waiters |= refresh_state_watchers_for_subject(
+        notifier.clone(),
+        graph.clone(),
+        watch.clone(),
+        GraphWatchTarget::NodeChild(source.clone(), relation.as_str().to_string()),
+    )
+    .await;
 
     had_poll_waiters |= !paths.is_empty();
     for (handle, path) in paths {
@@ -464,6 +499,27 @@ async fn refresh_state_watchers_for_subject(
         };
         had_poll_waiters |= notify_poll_handles(notifier.clone(), handles).await;
     }
+    had_poll_waiters
+}
+
+async fn refresh_node_state_watchers(
+    notifier: SharedKernelNotify,
+    graph: DynamicGraph,
+    watch: SharedWatchRegistry,
+    node: locusfs_graph::NodeId,
+) -> bool {
+    let node_subject = GraphWatchTarget::Node(node.clone());
+    let kind_subject = GraphWatchTarget::Kind(node.kind().clone());
+
+    let mut had_poll_waiters = refresh_state_watchers_for_subject(
+        notifier.clone(),
+        graph.clone(),
+        watch.clone(),
+        node_subject,
+    )
+    .await;
+    had_poll_waiters |=
+        refresh_state_watchers_for_subject(notifier, graph, watch, kind_subject).await;
     had_poll_waiters
 }
 

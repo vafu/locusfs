@@ -326,6 +326,10 @@ fn service_path_exposes_object_tree_properties_and_methods() {
     let object_dir = lookup_dir(&state, &root, "object");
     let devices_dir = lookup_dir(&state, &object_dir, "devices");
     let keyboard_dir = lookup_dir(&state, &devices_dir, "Keyboard0");
+    let listed_children = child_names(&state, &keyboard_dir);
+    assert!(!listed_children.contains(&"@properties".to_string()));
+    assert!(!listed_children.contains(&"@methods".to_string()));
+
     let properties_dir = lookup_dir(&state, &keyboard_dir, "@properties");
     let methods_dir = lookup_dir(&state, &keyboard_dir, "@methods");
 
@@ -459,6 +463,16 @@ fn lookup_dir(state: &DbusState, parent: &GraphPathDirectory, name: &str) -> Gra
         Some(GraphPathEntry::Directory(directory)) => directory,
         other => panic!("expected directory for {name}, got {other:?}"),
     }
+}
+
+fn child_names(state: &DbusState, parent: &GraphPathDirectory) -> Vec<String> {
+    state
+        .path_children(parent)
+        .unwrap()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|child| child.name.as_str().to_owned())
+        .collect()
 }
 
 fn writable_property(value: LocusValue) -> DbusPropertySnapshot {

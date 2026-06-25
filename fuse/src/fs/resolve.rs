@@ -38,17 +38,28 @@ pub(crate) async fn resolve_watch_path(
     };
     let kind = node_kind_from_segment(kind_segment)?;
     let Some(local_segment) = next_segment(&segments, &mut index) else {
-        ensure_kind_exists(graph, &kind).await?;
+        let ready = kind_exists(graph, &kind).await?;
         return Ok(WatchTarget {
             subject: GraphWatchTarget::Kind(kind),
             dependencies: Vec::new(),
-            ready: true,
+            ready,
             mode: WatchMode::Changes,
         });
     };
 
     let mut node = node_id_from_kind_and_segment(kind, local_segment)?;
-    ensure_node_exists(graph, &node).await?;
+    if !node_exists(graph, &node).await? {
+        return Ok(WatchTarget {
+            subject: GraphWatchTarget::Kind(node.kind().clone()),
+            dependencies: Vec::new(),
+            ready: false,
+            mode: if directory_watch {
+                WatchMode::Changes
+            } else {
+                WatchMode::State
+            },
+        });
+    }
 
     let mut dependencies = Vec::new();
     while let Some(segment) = next_segment(&segments, &mut index) {
@@ -364,31 +375,19 @@ fn next_segment<'a>(segments: &'a [&'a str], index: &mut usize) -> Option<&'a st
     segment
 }
 
-async fn ensure_kind_exists(
-    graph: &DynamicGraph,
-    kind: &NodeKind,
-) -> std::result::Result<(), Errno> {
-    if graph
+async fn kind_exists(graph: &DynamicGraph, kind: &NodeKind) -> std::result::Result<bool, Errno> {
+    Ok(graph
         .node_kinds()
         .await
         .map_err(graph_error_to_errno)?
-        .contains(kind)
-    {
-        Ok(())
-    } else {
-        Err(errno(libc::ENOENT))
-    }
+        .contains(kind))
 }
 
-async fn ensure_node_exists(graph: &DynamicGraph, node: &NodeId) -> std::result::Result<(), Errno> {
-    if graph
-        .contains_node(node)
-        .await
-        .map_err(graph_error_to_errno)?
-    {
-        Ok(())
-    } else {
-        Err(errno(libc::ENOENT))
+async fn node_exists(graph: &DynamicGraph, node: &NodeId) -> std::result::Result<bool, Errno> {
+    match graph.contains_node(node).await {
+        Ok(exists) => Ok(exists),
+        Err(GraphError::NotFound { .. }) => Ok(false),
+        Err(error) => Err(graph_error_to_errno(error)),
     }
 }
 

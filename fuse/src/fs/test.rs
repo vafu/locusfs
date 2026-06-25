@@ -936,6 +936,71 @@ async fn watch_path_can_target_missing_node_child_under_existing_node() {
     assert!(!target.ready);
 }
 
+#[tokio::test]
+async fn watch_path_can_target_missing_kind() {
+    let graph = DynamicGraph::new();
+    let kind = NodeKind::new("dbus").unwrap();
+
+    let (target, state) = resolve_watch_state(&graph, "/dbus/networkmanager")
+        .await
+        .unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Kind(kind));
+    assert_eq!(target.dependencies, Vec::new());
+    assert_eq!(target.mode, watch::WatchMode::State);
+    assert!(!target.ready);
+    assert_eq!(state, watch::WatchState::Unset);
+}
+
+#[tokio::test]
+async fn watch_path_can_target_missing_node_under_existing_kind() {
+    let kind = test_kind();
+    let provider = InMemoryProvider::new(kind.clone());
+    let graph = DynamicGraph::new();
+    graph
+        .register_node_provider(provider.clone())
+        .await
+        .unwrap();
+    graph
+        .register_node_mutation_provider(kind.clone(), provider)
+        .await
+        .unwrap();
+
+    let (target, state) = resolve_watch_state(&graph, "/node/57/title").await.unwrap();
+
+    assert_eq!(target.subject, watch::WatchSubjectKey::Kind(kind));
+    assert_eq!(target.dependencies, Vec::new());
+    assert_eq!(target.mode, watch::WatchMode::State);
+    assert!(!target.ready);
+    assert_eq!(state, watch::WatchState::Unset);
+}
+
+#[test]
+fn missing_node_state_watch_is_indexed_by_kind_for_refresh() {
+    let kind = test_kind();
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57/title".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Kind(kind.clone()),
+                dependencies: Vec::new(),
+                ready: false,
+                mode: watch::WatchMode::State,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.state_watch_paths_for_subject(&watch::WatchSubjectKey::Kind(kind)),
+        vec![(handle, "/node/57/title".to_string())]
+    );
+}
+
 #[test]
 fn watch_registry_replaces_stale_meta_watch_poll_handles() {
     let node = test_node("57");

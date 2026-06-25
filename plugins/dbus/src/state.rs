@@ -559,7 +559,7 @@ impl DbusState {
             Some(VIRTUAL_OBJECT) if parts.len() >= 2 => {
                 let service_local_id = parts[1].as_str();
                 let segments = parts[2..].to_vec();
-                let mut children = self
+                let children = self
                     .child_object_segment_names(service_local_id, &segments)?
                     .into_iter()
                     .map(|segment| {
@@ -574,24 +574,9 @@ impl DbusState {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                if let Some(object) = self.exact_object(service_local_id, &segments)? {
-                    children.push(GraphPathChild {
-                        name: PathName::new(PATH_PROPERTIES)?,
-                        entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: object_node_virtual_local(VIRTUAL_PROPERTIES, &object),
-                        }),
-                    });
-                    if !self.method_targets(&object)?.is_empty() {
-                        children.push(GraphPathChild {
-                            name: PathName::new(PATH_METHODS)?,
-                            entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                                owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                                local: object_node_virtual_local(VIRTUAL_METHODS, &object),
-                            }),
-                        });
-                    }
-                }
+                // Metadata directories are still addressable through lookup, but
+                // they are not D-Bus object children and must not be emitted in
+                // watched child snapshots.
                 Ok(children)
             }
             Some(VIRTUAL_PROPERTIES) if parts.len() == 2 => {
