@@ -68,6 +68,11 @@ impl WatchEvent {
         if text == "unset" {
             return Ok(Self::State(WatchState::Unset));
         }
+        if text == "set" {
+            return Ok(Self::State(WatchState::Set(WatchValue::Property(
+                String::new(),
+            ))));
+        }
         if let Some(value) = text.strip_prefix("set ") {
             let value = if value.starts_with('/') {
                 WatchValue::Path(value.to_string())

@@ -34,6 +34,16 @@ fn decodes_non_absolute_set_payload_as_property() {
 }
 
 #[test]
+fn decodes_empty_set_payload_as_property() {
+    let decoded = WatchEvent::decode_text(b"set \n").unwrap();
+
+    assert_eq!(
+        decoded,
+        WatchEvent::State(WatchState::Set(WatchValue::Property(String::new())))
+    );
+}
+
+#[test]
 fn encodes_and_decodes_subject_relative_property_change() {
     let event = WatchEvent::Change(WatchChange::Property {
         action: WatchAction::Changed,
