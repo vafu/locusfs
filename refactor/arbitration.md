@@ -29,22 +29,25 @@ Decision: prioritize clarity and correctness over preserving the current D-Bus `
 
 Reasoning: the user explicitly identified that layout as hard to maintain and requested a clearer structure. No report identified a stable downstream contract that requires legacy aliases. The implementation should skip compatibility aliases unless tests or a real consumer breakage force them.
 
-### 2. D-Bus path layout becomes explicit
+### 2. D-Bus path layout becomes bus-native
 
-Decision: replace `/dbus/<service>/object/.../@properties` and `/dbus/<service>/object/.../@methods` with:
+Decision: replace `/dbus/<service>/object/.../@properties`, `/dbus/<service>/object/.../@methods`, and the interim `/objects`/`/methods` split with a bus-native object-path projection:
 
 ```text
-/dbus/<service>/objects/<relative-object-path>/<property>
-/dbus/<service>/methods/<relative-object-path>/<method>
+/dbus/system/<actual/dbus/path>/<property>
+/dbus/system/<actual/dbus/path>/<method>.call
+/dbus/session/<actual/dbus/path>/<property>
+/dbus/session/<actual/dbus/path>/<method>.call
 ```
 
 Rules:
 
-- `objects` exposes only real D-Bus properties as leaf files.
-- `methods` exposes callable method files, each mapped to the existing hidden method node's write-only `call` property.
-- The ObjectManager root object, when present, lives directly under `objects` and `methods`.
-- Objects outside the configured ObjectManager root live under `_absolute`, replacing `@absolute`.
+- The path after `/dbus/system` or `/dbus/session` is the actual D-Bus object path without the leading slash. The configured ObjectManager root is not stripped from public paths.
+- There is no `_absolute`, `objects`, or `methods` directory. Full D-Bus paths avoid the earlier duplicated service/root distinction and keep UPower, BlueZ, NetworkManager, and AgentDBus predictable.
+- Normal property files map to real D-Bus properties.
+- Callable method files use a `.call` suffix and map to the existing hidden method node's write-only `call` property.
 - Canonical `interface.member` names remain available. Short aliases remain available only when already unambiguous in the state resolver.
+- Child object directory names win over property/method file names on collision.
 - Service/object/method metadata remains graph properties and is not projected into the object property tree.
 
 ### 3. Watch protocol replacement is deferred, but framing is fixed now
@@ -82,7 +85,7 @@ Reasoning: the current API is explicit about Rust extension semantics. The Rust 
 
 ## Acceptance Criteria For This Pass
 
-- D-Bus generic plugin tests assert the new `objects` and `methods` paths.
+- D-Bus generic plugin tests assert the new bus-native paths and `.call` method files.
 - Graph feature matrix includes `provider-tracing` without `watch-provider`.
 - Watch client has a regression test for two frames read together.
 - FUSE registry tests cover readiness while a partial watch event is buffered.

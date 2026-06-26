@@ -785,9 +785,13 @@ mod test {
         )
         .await
         .expect("dbus plugin registers");
-        let node = service_node("upower").expect("service node id is valid");
-        let active = PropertyKey::new("active").expect("active property key is valid");
-        let expected = LocusValue::Bool(expected_owner.is_some());
+        let node = service_node("system").expect("service node id is valid");
+        let active = PropertyKey::new("active-services").expect("active property key is valid");
+        let expected = LocusValue::String(if expected_owner.is_some() {
+            "upower".to_string()
+        } else {
+            String::new()
+        });
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {

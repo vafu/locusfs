@@ -16,13 +16,10 @@ pub const OBJECT_RELATION: &str = "object";
 pub const METHODS_RELATION: &str = "methods";
 pub const SERVICE_RELATION: &str = "dbus";
 
-const PATH_OBJECTS: &str = "objects";
-const PATH_METHODS: &str = "methods";
-const PATH_ABSOLUTE: &str = "_absolute";
-const VIRTUAL_OBJECTS: &str = "objects";
-const VIRTUAL_METHODS: &str = "methods";
+const VIRTUAL_BUS: &str = "bus";
 const VIRTUAL_SEPARATOR: &str = "|";
 const CALL_PROPERTY: &str = "call";
+const METHOD_CALL_SUFFIX: &str = ".call";
 
 const SOURCE: &str = "dbus";
 
@@ -34,7 +31,7 @@ pub struct ServiceConfig {
     pub object_manager_path: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BusKind {
     System,
     Session,
@@ -135,7 +132,7 @@ impl DbusState {
 
     pub fn contains_node(&self, node: &NodeId) -> Result<bool> {
         Ok(match node.kind().as_str() {
-            DBUS_SERVICE_KIND => self.services.contains_key(node.local()),
+            DBUS_SERVICE_KIND => self.contains_bus_node(node.local()),
             DBUS_OBJECT_KIND => self.object(node).is_some(),
             DBUS_METHOD_KIND => self.method(node).is_some(),
             _ => false,
@@ -145,9 +142,9 @@ impl DbusState {
     pub fn nodes(&self, kind: &NodeKind) -> Result<Vec<NodeId>> {
         let mut nodes = match kind.as_str() {
             DBUS_SERVICE_KIND => self
-                .services
-                .keys()
-                .map(|local| service_node(local))
+                .configured_buses()
+                .into_iter()
+                .map(|bus| service_node(bus.as_str()))
                 .collect::<Result<Vec<_>>>()?,
             DBUS_OBJECT_KIND => self
                 .services
@@ -243,15 +240,10 @@ impl DbusState {
                 if !self.contains_node(node)? {
                     return Ok(None);
                 }
-                let Some(root) = service_path_root(name.as_str()) else {
+                let Some(bus) = bus_kind_from_local(node.local()) else {
                     return Ok(None);
                 };
-                Ok(Some(GraphPathEntry::Directory(
-                    GraphPathDirectory::Virtual {
-                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: tree_virtual_local(root, node.local(), &[]),
-                    },
-                )))
+                self.bus_tree_lookup(bus, &[], name)
             }
             GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUS_SERVICE_KIND => {
                 self.virtual_path_lookup(local, name)
@@ -269,22 +261,10 @@ impl DbusState {
                 if !self.contains_node(node)? {
                     return Ok(None);
                 }
-                Ok(Some(vec![
-                    GraphPathChild {
-                        name: PathName::new(PATH_OBJECTS)?,
-                        entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: tree_virtual_local(VIRTUAL_OBJECTS, node.local(), &[]),
-                        }),
-                    },
-                    GraphPathChild {
-                        name: PathName::new(PATH_METHODS)?,
-                        entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: tree_virtual_local(VIRTUAL_METHODS, node.local(), &[]),
-                        }),
-                    },
-                ]))
+                let Some(bus) = bus_kind_from_local(node.local()) else {
+                    return Ok(None);
+                };
+                self.bus_tree_children(bus, &[]).map(Some)
             }
             GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUS_SERVICE_KIND => {
                 self.virtual_path_children(local).map(Some)
@@ -299,6 +279,9 @@ impl DbusState {
     ) -> Result<Option<GraphWatchTarget>> {
         match directory {
             GraphPathDirectory::Node(node) if node.kind().as_str() == DBUS_SERVICE_KIND => {
+                if !self.contains_node(node)? {
+                    return Ok(None);
+                }
                 Ok(Some(GraphWatchTarget::Relation(
                     node.clone(),
                     relation(OBJECT_RELATION)?,
@@ -391,12 +374,13 @@ impl DbusState {
 
     fn node_properties(&self, node: &NodeId) -> Result<BTreeMap<PropertyKey, LocusValue>> {
         match node.kind().as_str() {
-            DBUS_SERVICE_KIND => self
-                .services
-                .get(node.local())
-                .map(service_properties)
-                .transpose()?
-                .ok_or_else(|| node_not_found(node)),
+            DBUS_SERVICE_KIND => {
+                let bus = bus_kind_from_local(node.local()).ok_or_else(|| node_not_found(node))?;
+                if !self.contains_bus(bus) {
+                    return Err(node_not_found(node));
+                }
+                Ok(bus_properties(bus, self.services_on_bus(bus))?)
+            }
             DBUS_OBJECT_KIND => self
                 .object_entry(node)
                 .map(|(service, object)| object_properties(service, object))
@@ -417,16 +401,19 @@ impl DbusState {
         let mut relations = BTreeMap::new();
         match node.kind().as_str() {
             DBUS_SERVICE_KIND => {
-                let service = self
-                    .services
-                    .get(node.local())
-                    .ok_or_else(|| node_not_found(node))?;
+                let bus = bus_kind_from_local(node.local()).ok_or_else(|| node_not_found(node))?;
+                if !self.contains_bus(bus) {
+                    return Err(node_not_found(node));
+                }
                 relations.insert(
                     relation(OBJECT_RELATION)?,
-                    service
-                        .objects
-                        .values()
-                        .map(|object| service_object_node(service, object))
+                    self.services_on_bus(bus)
+                        .flat_map(|service| {
+                            service
+                                .objects
+                                .values()
+                                .map(|object| service_object_node(service, object))
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 );
             }
@@ -436,7 +423,7 @@ impl DbusState {
                     .ok_or_else(|| node_not_found(node))?;
                 relations.insert(
                     relation(SERVICE_RELATION)?,
-                    vec![service_node(&object.service_local_id)?],
+                    vec![service_node(service.config.bus.as_str())?],
                 );
                 let methods = object
                     .methods
@@ -457,7 +444,7 @@ impl DbusState {
                     .ok_or_else(|| node_not_found(node))?;
                 relations.insert(
                     relation(SERVICE_RELATION)?,
-                    vec![service_node(&service.config.local_id)?],
+                    vec![service_node(service.config.bus.as_str())?],
                 );
                 relations.insert(
                     relation(OBJECT_RELATION)?,
@@ -476,11 +463,11 @@ impl DbusState {
     fn virtual_path_lookup(&self, local: &str, name: &PathName) -> Result<Option<GraphPathEntry>> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
-                self.object_tree_lookup(parts[1].as_str(), &parts[2..], name)
-            }
-            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
-                self.method_tree_lookup(parts[1].as_str(), &parts[2..], name)
+            Some(VIRTUAL_BUS) if parts.len() >= 2 => {
+                let Some(bus) = bus_kind_from_local(parts[1].as_str()) else {
+                    return Ok(None);
+                };
+                self.bus_tree_lookup(bus, &parts[2..], name)
             }
             _ => Ok(None),
         }
@@ -489,11 +476,11 @@ impl DbusState {
     fn virtual_path_children(&self, local: &str) -> Result<Vec<GraphPathChild>> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
-                self.object_tree_children(parts[1].as_str(), &parts[2..])
-            }
-            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
-                self.method_tree_children(parts[1].as_str(), &parts[2..])
+            Some(VIRTUAL_BUS) if parts.len() >= 2 => {
+                let Some(bus) = bus_kind_from_local(parts[1].as_str()) else {
+                    return Ok(Vec::new());
+                };
+                self.bus_tree_children(bus, &parts[2..])
             }
             _ => Ok(Vec::new()),
         }
@@ -502,26 +489,17 @@ impl DbusState {
     fn virtual_path_watch_target(&self, local: &str) -> Result<GraphWatchTarget> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
-                let service_local_id = parts[1].as_str();
-                if let Some(object) = self.exact_object(service_local_id, &parts[2..])? {
+            Some(VIRTUAL_BUS) if parts.len() >= 2 => {
+                let bus =
+                    bus_kind_from_local(parts[1].as_str()).ok_or_else(|| GraphError::NotFound {
+                        kind: "D-Bus virtual path",
+                        name: local.to_string(),
+                    })?;
+                if let Some(object) = self.exact_object_on_bus(bus, &parts[2..])? {
                     return Ok(GraphWatchTarget::Node(object));
                 }
                 Ok(GraphWatchTarget::Relation(
-                    service_node(service_local_id)?,
-                    relation(OBJECT_RELATION)?,
-                ))
-            }
-            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
-                let service_local_id = parts[1].as_str();
-                if let Some(object) = self.exact_object(service_local_id, &parts[2..])? {
-                    return Ok(GraphWatchTarget::Relation(
-                        object,
-                        relation(METHODS_RELATION)?,
-                    ));
-                }
-                Ok(GraphWatchTarget::Relation(
-                    service_node(service_local_id)?,
+                    service_node(bus.as_str())?,
                     relation(OBJECT_RELATION)?,
                 ))
             }
@@ -532,58 +510,38 @@ impl DbusState {
         }
     }
 
-    fn object_tree_lookup(
+    fn bus_tree_lookup(
         &self,
-        service_local_id: &str,
+        bus: BusKind,
         segments: &[String],
         name: &PathName,
     ) -> Result<Option<GraphPathEntry>> {
         let mut child = segments.to_vec();
         child.push(name.as_str().to_string());
-        if self.has_object_prefix(service_local_id, &child)? {
+        if self.has_object_prefix_on_bus(bus, &child)? {
             return Ok(Some(GraphPathEntry::Directory(
                 GraphPathDirectory::Virtual {
                     owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                    local: tree_virtual_local(VIRTUAL_OBJECTS, service_local_id, &child),
+                    local: tree_virtual_local(VIRTUAL_BUS, bus.as_str(), &child),
                 },
             )));
         }
 
-        let Some(object_node) = self.exact_object(service_local_id, segments)? else {
+        let Some(object_node) = self.exact_object_on_bus(bus, segments)? else {
             return Ok(None);
         };
         let key = PropertyKey::new(name.as_str())?;
         if self.resolve_dbus_property(&object_node, &key)?.is_some() {
-            Ok(Some(GraphPathEntry::Property {
+            return Ok(Some(GraphPathEntry::Property {
                 node: object_node,
                 key,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn method_tree_lookup(
-        &self,
-        service_local_id: &str,
-        segments: &[String],
-        name: &PathName,
-    ) -> Result<Option<GraphPathEntry>> {
-        let mut child = segments.to_vec();
-        child.push(name.as_str().to_string());
-        if self.has_object_prefix(service_local_id, &child)? {
-            return Ok(Some(GraphPathEntry::Directory(
-                GraphPathDirectory::Virtual {
-                    owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                    local: tree_virtual_local(VIRTUAL_METHODS, service_local_id, &child),
-                },
-            )));
+            }));
         }
 
-        let Some(object_node) = self.exact_object(service_local_id, segments)? else {
+        let Some(display) = method_display_from_call_file(name.as_str()) else {
             return Ok(None);
         };
-        let Some(method_node) = self.method_by_display(&object_node, name.as_str())? else {
+        let Some(method_node) = self.method_by_display(&object_node, display)? else {
             return Ok(None);
         };
         Ok(Some(GraphPathEntry::Property {
@@ -592,13 +550,9 @@ impl DbusState {
         }))
     }
 
-    fn object_tree_children(
-        &self,
-        service_local_id: &str,
-        segments: &[String],
-    ) -> Result<Vec<GraphPathChild>> {
-        let child_segments = self.child_object_segment_names(service_local_id, segments)?;
-        let reserved_names = child_segments.iter().cloned().collect::<BTreeSet<_>>();
+    fn bus_tree_children(&self, bus: BusKind, segments: &[String]) -> Result<Vec<GraphPathChild>> {
+        let child_segments = self.child_object_segment_names_on_bus(bus, segments)?;
+        let mut used_names = child_segments.iter().cloned().collect::<BTreeSet<_>>();
         let mut children = child_segments
             .into_iter()
             .map(|segment| {
@@ -608,14 +562,17 @@ impl DbusState {
                     name: PathName::new(segment)?,
                     entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
                         owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: tree_virtual_local(VIRTUAL_OBJECTS, service_local_id, &child),
+                        local: tree_virtual_local(VIRTUAL_BUS, bus.as_str(), &child),
                     }),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        if let Some(object_node) = self.exact_object(service_local_id, segments)? {
-            for name in self.dbus_property_names(&object_node, &reserved_names)? {
+        if let Some(object_node) = self.exact_object_on_bus(bus, segments)? {
+            for name in self.dbus_property_names(&object_node, &used_names)? {
+                if !used_names.insert(name.clone()) {
+                    continue;
+                }
                 let key = PropertyKey::new(name.as_str())?;
                 children.push(GraphPathChild {
                     name: PathName::new(name)?,
@@ -625,37 +582,8 @@ impl DbusState {
                     },
                 });
             }
-        }
-
-        Ok(children)
-    }
-
-    fn method_tree_children(
-        &self,
-        service_local_id: &str,
-        segments: &[String],
-    ) -> Result<Vec<GraphPathChild>> {
-        let child_segments = self.child_object_segment_names(service_local_id, segments)?;
-        let reserved_names = child_segments.iter().cloned().collect::<BTreeSet<_>>();
-        let mut children = child_segments
-            .into_iter()
-            .map(|segment| {
-                let mut child = segments.to_vec();
-                child.push(segment.clone());
-                Ok(GraphPathChild {
-                    name: PathName::new(segment)?,
-                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: tree_virtual_local(VIRTUAL_METHODS, service_local_id, &child),
-                    }),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        if let Some(object_node) = self.exact_object(service_local_id, segments)? {
-            for method_node in self.method_targets(&object_node)? {
-                let name = method_display_from_node(&method_node);
-                if reserved_names.contains(&name) {
+            for (name, method_node) in self.dbus_method_call_names(&object_node, &used_names)? {
+                if !used_names.insert(name.clone()) {
                     continue;
                 }
                 children.push(GraphPathChild {
@@ -702,28 +630,72 @@ impl DbusState {
         Ok(names.into_iter().collect())
     }
 
-    fn exact_object(&self, service_local_id: &str, segments: &[String]) -> Result<Option<NodeId>> {
-        Ok(self
-            .object_views(service_local_id)?
-            .into_iter()
-            .find(|view| view.segments == segments)
-            .map(|view| view.node))
+    fn dbus_method_call_names(
+        &self,
+        object_node: &NodeId,
+        reserved_names: &BTreeSet<String>,
+    ) -> Result<Vec<(String, NodeId)>> {
+        let Some((service, object)) = self.object_entry(object_node) else {
+            return Err(node_not_found(object_node));
+        };
+
+        let mut method_counts = BTreeMap::<String, usize>::new();
+        for interface_methods in object.methods.values() {
+            for method in interface_methods.keys() {
+                *method_counts.entry(method.clone()).or_default() += 1;
+            }
+        }
+
+        let mut names = BTreeMap::new();
+        for (interface, interface_methods) in &object.methods {
+            for method in interface_methods.keys() {
+                let method_node = service_method_node(service, object, interface, method)?;
+                let canonical = method_call_file_name(&format!("{interface}.{method}"));
+                if !reserved_names.contains(&canonical) {
+                    names.insert(canonical, method_node.clone());
+                }
+                let short = method_call_file_name(method);
+                if method_counts.get(method) == Some(&1) && !reserved_names.contains(&short) {
+                    names.insert(short, method_node);
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
-    fn has_object_prefix(&self, service_local_id: &str, segments: &[String]) -> Result<bool> {
+    fn exact_object_on_bus(&self, bus: BusKind, segments: &[String]) -> Result<Option<NodeId>> {
+        let matches = self
+            .object_views_on_bus(bus)?
+            .into_iter()
+            .filter(|view| view.segments == segments)
+            .map(|view| view.node)
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [node] => Ok(Some(node.clone())),
+            _ => Err(GraphError::InvalidValue {
+                kind: "D-Bus object path",
+                value: dbus_path_from_segments(segments),
+                reason: "multiple configured services expose this object path",
+            }),
+        }
+    }
+
+    fn has_object_prefix_on_bus(&self, bus: BusKind, segments: &[String]) -> Result<bool> {
         Ok(self
-            .object_views(service_local_id)?
+            .object_views_on_bus(bus)?
             .iter()
             .any(|view| view.segments.starts_with(segments)))
     }
 
-    fn child_object_segment_names(
+    fn child_object_segment_names_on_bus(
         &self,
-        service_local_id: &str,
+        bus: BusKind,
         segments: &[String],
     ) -> Result<Vec<String>> {
         let mut names = self
-            .object_views(service_local_id)?
+            .object_views_on_bus(bus)?
             .into_iter()
             .filter_map(|view| {
                 if view.segments.len() > segments.len() && view.segments.starts_with(segments) {
@@ -739,46 +711,82 @@ impl DbusState {
         Ok(names)
     }
 
-    fn object_views(&self, service_local_id: &str) -> Result<Vec<ObjectPathView>> {
-        let service = self
-            .services
-            .get(service_local_id)
-            .ok_or_else(|| GraphError::NotFound {
-                kind: "D-Bus service",
-                name: service_local_id.to_string(),
-            })?;
-        service
-            .objects
-            .values()
-            .map(|object| {
+    fn object_views_on_bus(&self, bus: BusKind) -> Result<Vec<ObjectPathView>> {
+        self.services_on_bus(bus)
+            .flat_map(|service| {
+                service
+                    .objects
+                    .values()
+                    .map(move |object| (service, object))
+            })
+            .map(|(service, object)| {
                 Ok(ObjectPathView {
                     node: service_object_node(service, object)?,
-                    segments: object_path_segments(&service.config, &object.path),
+                    segments: object_path_segments(&object.path),
                 })
             })
             .collect()
     }
 
-    fn method_targets(&self, object: &NodeId) -> Result<Vec<NodeId>> {
-        self.targets(object, &relation(METHODS_RELATION)?)
-            .or_else(|error| match error {
-                GraphError::NotFound { .. } => Ok(Vec::new()),
-                error => Err(error),
-            })
+    fn services_on_bus(&self, bus: BusKind) -> impl Iterator<Item = &ServiceSnapshot> {
+        self.services
+            .values()
+            .filter(move |service| service.config.bus == bus)
+    }
+
+    fn contains_bus(&self, bus: BusKind) -> bool {
+        self.services_on_bus(bus).next().is_some()
+    }
+
+    fn contains_bus_node(&self, local: &str) -> bool {
+        bus_kind_from_local(local)
+            .map(|bus| self.contains_bus(bus))
+            .unwrap_or(false)
+    }
+
+    fn configured_buses(&self) -> Vec<BusKind> {
+        self.services
+            .values()
+            .map(|service| service.config.bus)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn method_by_display(&self, object: &NodeId, display: &str) -> Result<Option<NodeId>> {
-        Ok(self
-            .method_targets(object)?
-            .into_iter()
-            .find(|method| method_display_from_node(method) == display))
+        let Some((service, object)) = self.object_entry(object) else {
+            return Err(node_not_found(object));
+        };
+
+        let mut method_counts = BTreeMap::<String, usize>::new();
+        for interface_methods in object.methods.values() {
+            for method in interface_methods.keys() {
+                *method_counts.entry(method.clone()).or_default() += 1;
+            }
+        }
+
+        let mut matches = Vec::new();
+        for (interface, methods) in &object.methods {
+            for method in methods.keys() {
+                let canonical = format!("{interface}.{method}");
+                let short = method_counts.get(method) == Some(&1) && display == method;
+                if short || display == canonical {
+                    matches.push(service_method_node(service, object, interface, method)?);
+                }
+            }
+        }
+
+        Ok(if matches.len() == 1 {
+            matches.pop()
+        } else {
+            None
+        })
     }
 
     fn object_entry(&self, node: &NodeId) -> Option<(&ServiceSnapshot, &ObjectSnapshot)> {
         let (service_local_id, local_path) = object_local_parts(node.local())?;
         let service = self.services.get(service_local_id)?;
-        let path = object_full_path(&service.config, local_path);
-        let object = service.objects.get(path.as_str())?;
+        let object = service.objects.get(local_path)?;
         Some((service, object))
     }
 
@@ -962,18 +970,15 @@ pub fn service_node(local_id: &str) -> Result<NodeId> {
     NodeId::new(NodeKind::new(DBUS_SERVICE_KIND)?, local_id)
 }
 
-fn service_object_node(service: &ServiceSnapshot, snapshot: &ObjectSnapshot) -> Result<NodeId> {
+fn service_object_node(_service: &ServiceSnapshot, snapshot: &ObjectSnapshot) -> Result<NodeId> {
     NodeId::new(
         NodeKind::new(DBUS_OBJECT_KIND)?,
-        object_local_id(
-            &snapshot.service_local_id,
-            object_display_path(&service.config, &snapshot.path),
-        ),
+        object_local_id(&snapshot.service_local_id, &snapshot.path),
     )
 }
 
 fn service_method_node(
-    service: &ServiceSnapshot,
+    _service: &ServiceSnapshot,
     object: &ObjectSnapshot,
     interface: &str,
     method: &str,
@@ -981,34 +986,46 @@ fn service_method_node(
     NodeId::new(
         NodeKind::new(DBUS_METHOD_KIND)?,
         method_local_id(
-            &object_local_id(
-                &object.service_local_id,
-                object_display_path(&service.config, &object.path),
-            ),
+            &object_local_id(&object.service_local_id, &object.path),
             method_display_name(object, interface, method),
         ),
     )
 }
 
-fn service_properties(snapshot: &ServiceSnapshot) -> Result<BTreeMap<PropertyKey, LocusValue>> {
+fn bus_properties<'a>(
+    bus: BusKind,
+    services: impl Iterator<Item = &'a ServiceSnapshot>,
+) -> Result<BTreeMap<PropertyKey, LocusValue>> {
     let mut properties = BTreeMap::new();
     insert(&mut properties, "kind", string(DBUS_SERVICE_KIND))?;
     insert(&mut properties, "source", string(SOURCE))?;
-    insert(&mut properties, "bus", string(snapshot.config.bus.as_str()))?;
-    insert(&mut properties, "name", string(&snapshot.config.name))?;
+    insert(&mut properties, "bus", string(bus.as_str()))?;
+    let services = services.collect::<Vec<_>>();
     insert(
         &mut properties,
-        "object-manager-path",
-        string(&snapshot.config.object_manager_path),
+        "services",
+        string(
+            services
+                .iter()
+                .map(|service| service.config.local_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+                .as_str(),
+        ),
     )?;
     insert(
         &mut properties,
-        "active",
-        LocusValue::Bool(snapshot.owner.is_some()),
+        "active-services",
+        string(
+            services
+                .iter()
+                .filter(|service| service.owner.is_some())
+                .map(|service| service.config.local_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+                .as_str(),
+        ),
     )?;
-    if let Some(owner) = snapshot.owner.as_deref() {
-        insert(&mut properties, "owner", string(owner))?;
-    }
     Ok(properties)
 }
 
@@ -1097,20 +1114,21 @@ fn service_snapshot_changes(
     old: &ServiceSnapshot,
     new: &ServiceSnapshot,
 ) -> Result<Vec<GraphChange>> {
+    let bus_node = service_node(new.config.bus.as_str())?;
     let mut changes = vec![
         GraphChange::NodeKindChanged {
             kind: NodeKind::new(DBUS_SERVICE_KIND)?,
         },
         GraphChange::NodeChanged {
-            node: service_node(&new.config.local_id)?,
+            node: bus_node.clone(),
         },
         GraphChange::PropertyChanged {
-            node: service_node(&new.config.local_id)?,
-            key: PropertyKey::new("active")?,
+            node: bus_node.clone(),
+            key: PropertyKey::new("services")?,
         },
         GraphChange::PropertyChanged {
-            node: service_node(&new.config.local_id)?,
-            key: PropertyKey::new("owner")?,
+            node: bus_node.clone(),
+            key: PropertyKey::new("active-services")?,
         },
     ];
 
@@ -1124,7 +1142,7 @@ fn service_snapshot_changes(
             kind: NodeKind::new(DBUS_METHOD_KIND)?,
         });
         changes.push(GraphChange::RelationChanged {
-            source: service_node(&new.config.local_id)?,
+            source: bus_node.clone(),
             relation: relation(OBJECT_RELATION)?,
         });
     }
@@ -1175,6 +1193,9 @@ fn service_snapshot_changes(
         if old_methods != new_methods {
             changes.push(GraphChange::NodeKindChanged {
                 kind: NodeKind::new(DBUS_METHOD_KIND)?,
+            });
+            changes.push(GraphChange::NodeChanged {
+                node: new_node.clone(),
             });
             changes.push(GraphChange::RelationChanged {
                 source: new_node.clone(),
@@ -1238,17 +1259,9 @@ fn object_method_keys(object: &ObjectSnapshot) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-fn service_path_root(name: &str) -> Option<&'static str> {
-    match name {
-        PATH_OBJECTS => Some(VIRTUAL_OBJECTS),
-        PATH_METHODS => Some(VIRTUAL_METHODS),
-        _ => None,
-    }
-}
-
-fn tree_virtual_local(root: &str, service_local_id: &str, segments: &[String]) -> String {
+fn tree_virtual_local(root: &str, local_id: &str, segments: &[String]) -> String {
     std::iter::once(root.to_string())
-        .chain(std::iter::once(service_local_id.to_string()))
+        .chain(std::iter::once(local_id.to_string()))
         .chain(segments.iter().cloned())
         .map(|part| encode_virtual_part(&part))
         .collect::<Vec<_>>()
@@ -1262,31 +1275,29 @@ fn virtual_parts(local: &str) -> Vec<String> {
         .collect()
 }
 
-fn method_display_from_node(method: &NodeId) -> String {
-    method
-        .local()
-        .rsplit_once(':')
-        .map(|(_, display)| display)
-        .unwrap_or(method.local())
-        .to_string()
-}
-
-fn object_path_segments(config: &ServiceConfig, path: &str) -> Vec<String> {
-    let display = object_display_path(config, path);
-    if display == "@" {
-        return Vec::new();
-    }
-
-    let mut segments = display
-        .trim_matches('/')
+fn object_path_segments(path: &str) -> Vec<String> {
+    path.trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if display.starts_with('/') {
-        segments.insert(0, PATH_ABSOLUTE.to_string());
+        .collect()
+}
+
+fn dbus_path_from_segments(segments: &[String]) -> String {
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
     }
-    segments
+}
+
+fn method_call_file_name(display: &str) -> String {
+    format!("{display}{METHOD_CALL_SUFFIX}")
+}
+
+fn method_display_from_call_file(name: &str) -> Option<&str> {
+    name.strip_suffix(METHOD_CALL_SUFFIX)
+        .filter(|display| !display.is_empty())
 }
 
 fn encode_virtual_part(value: impl AsRef<str>) -> String {
@@ -1354,32 +1365,11 @@ fn method_display_name(object: &ObjectSnapshot, interface: &str, method: &str) -
     }
 }
 
-fn object_display_path<'a>(config: &ServiceConfig, path: &'a str) -> &'a str {
-    if path == config.object_manager_path {
-        "@"
-    } else if config.object_manager_path == "/" {
-        path.strip_prefix('/').unwrap_or(path)
-    } else if let Some(stripped) = path
-        .strip_prefix(config.object_manager_path.as_str())
-        .and_then(|path| path.strip_prefix('/'))
-    {
-        stripped
-    } else {
-        path
-    }
-}
-
-fn object_full_path(config: &ServiceConfig, local_path: &str) -> String {
-    if local_path == "@" {
-        config.object_manager_path.clone()
-    } else if local_path.starts_with('/') {
-        local_path.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            config.object_manager_path.trim_end_matches('/'),
-            local_path
-        )
+fn bus_kind_from_local(local: &str) -> Option<BusKind> {
+    match local {
+        "system" => Some(BusKind::System),
+        "session" => Some(BusKind::Session),
+        _ => None,
     }
 }
 

@@ -10,25 +10,31 @@ use super::{
 };
 
 #[test]
-fn exposes_configured_service_node() {
+fn exposes_configured_bus_node() {
     let state = test_state();
     let kind = NodeKind::new(DBUS_SERVICE_KIND).unwrap();
-    let service = service_node("power").unwrap();
+    let service = service_node("system").unwrap();
 
     assert_eq!(state.nodes(&kind).unwrap(), vec![service.clone()]);
     assert!(state.contains_node(&service).unwrap());
 }
 
 #[test]
-fn inactive_service_properties_omit_owner() {
+fn inactive_bus_properties_list_services_without_active_services() {
     let state = test_state();
-    let node = service_node("power").unwrap();
+    let node = service_node("system").unwrap();
 
     assert_eq!(
         state
-            .property(&node, &PropertyKey::new("active").unwrap())
+            .property(&node, &PropertyKey::new("services").unwrap())
             .unwrap(),
-        LocusValue::Bool(false)
+        LocusValue::String("power".to_string())
+    );
+    assert_eq!(
+        state
+            .property(&node, &PropertyKey::new("active-services").unwrap())
+            .unwrap(),
+        LocusValue::String(String::new())
     );
     assert!(
         state
@@ -62,18 +68,18 @@ fn service_snapshot_exposes_objects_and_relations() {
         )
         .expect("snapshot update succeeds");
 
-    let service = service_node("power").unwrap();
+    let service = service_node("system").unwrap();
     let object_node = NodeId::new(
         NodeKind::new(DBUS_OBJECT_KIND).unwrap(),
-        "power:devices/Battery0",
+        "power:/org/example/Power/devices/Battery0",
     )
     .unwrap();
 
     assert_eq!(
         state
-            .property(&service, &PropertyKey::new("active").unwrap())
+            .property(&service, &PropertyKey::new("active-services").unwrap())
             .unwrap(),
-        LocusValue::Bool(true)
+        LocusValue::String("power".to_string())
     );
     assert_eq!(
         state
@@ -117,7 +123,7 @@ fn service_snapshot_exposes_objects_and_relations() {
 }
 
 #[test]
-fn object_node_ids_round_trip_for_paths_outside_object_manager() {
+fn object_node_ids_use_full_dbus_paths() {
     let mut state = test_state();
     let object = object_snapshot(
         "power",
@@ -187,7 +193,11 @@ fn writable_object_properties_are_marked_and_update_cache() {
         )
         .expect("snapshot update succeeds");
 
-    let object_node = NodeId::new(NodeKind::new(DBUS_OBJECT_KIND).unwrap(), "power:@").unwrap();
+    let object_node = NodeId::new(
+        NodeKind::new(DBUS_OBJECT_KIND).unwrap(),
+        "power:/org/example/Power",
+    )
+    .unwrap();
     let key = PropertyKey::new("ActiveProfile").unwrap();
 
     assert!(
@@ -250,12 +260,12 @@ fn object_methods_are_exposed_as_write_only_call_nodes() {
 
     let object_node = NodeId::new(
         NodeKind::new(DBUS_OBJECT_KIND).unwrap(),
-        "power:devices/Keyboard0",
+        "power:/org/example/Power/devices/Keyboard0",
     )
     .unwrap();
     let method_node = NodeId::new(
         NodeKind::new(DBUS_METHOD_KIND).unwrap(),
-        "power:devices/Keyboard0:Connect",
+        "power:/org/example/Power/devices/Keyboard0:Connect",
     )
     .unwrap();
     let call_key = PropertyKey::new("call").unwrap();
@@ -291,7 +301,7 @@ fn object_methods_are_exposed_as_write_only_call_nodes() {
 }
 
 #[test]
-fn service_path_exposes_object_tree_properties_and_methods() {
+fn bus_path_exposes_object_tree_properties_and_method_call_files() {
     let mut state = test_state();
     let mut object = object_snapshot(
         "power",
@@ -321,23 +331,20 @@ fn service_path_exposes_object_tree_properties_and_methods() {
         )
         .expect("snapshot update succeeds");
 
-    let service = service_node("power").unwrap();
+    let service = service_node("system").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let service_children = child_names(&state, &root);
-    assert_eq!(
-        service_children,
-        vec!["objects".to_string(), "methods".to_string()]
-    );
+    assert_eq!(child_names(&state, &root), vec!["org".to_string()]);
 
-    let objects_dir = lookup_dir(&state, &root, "objects");
-    let methods_dir = lookup_dir(&state, &root, "methods");
-    let devices_dir = lookup_dir(&state, &objects_dir, "devices");
+    let org_dir = lookup_dir(&state, &root, "org");
+    let example_dir = lookup_dir(&state, &org_dir, "example");
+    let power_dir = lookup_dir(&state, &example_dir, "Power");
+    let devices_dir = lookup_dir(&state, &power_dir, "devices");
     let keyboard_dir = lookup_dir(&state, &devices_dir, "Keyboard0");
     let listed_children = child_names(&state, &keyboard_dir);
-    assert!(!listed_children.contains(&"@properties".to_string()));
-    assert!(!listed_children.contains(&"@methods".to_string()));
     assert!(listed_children.contains(&"Name".to_string()));
     assert!(listed_children.contains(&"org.example.Power.Device.Name".to_string()));
+    assert!(listed_children.contains(&"Connect.call".to_string()));
+    assert!(listed_children.contains(&"org.example.Power.Device.Connect.call".to_string()));
 
     assert!(matches!(
         state
@@ -345,19 +352,16 @@ fn service_path_exposes_object_tree_properties_and_methods() {
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
-
-    let method_devices_dir = lookup_dir(&state, &methods_dir, "devices");
-    let keyboard_methods_dir = lookup_dir(&state, &method_devices_dir, "Keyboard0");
     assert!(matches!(
         state
-            .path_lookup_child(&keyboard_methods_dir, &"Connect".parse().unwrap())
+            .path_lookup_child(&keyboard_dir, &"Connect.call".parse().unwrap())
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
 }
 
 #[test]
-fn outside_object_manager_paths_are_namespaced_under_absolute() {
+fn bus_path_preserves_full_object_paths_without_absolute_namespace() {
     let mut state = test_state();
     let object = object_snapshot(
         "power",
@@ -378,11 +382,10 @@ fn outside_object_manager_paths_are_namespaced_under_absolute() {
         )
         .expect("snapshot update succeeds");
 
-    let service = service_node("power").unwrap();
+    let service = service_node("system").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let object_dir = lookup_dir(&state, &root, "objects");
-    let absolute_dir = lookup_dir(&state, &object_dir, "_absolute");
-    let org_dir = lookup_dir(&state, &absolute_dir, "org");
+    assert!(!child_names(&state, &root).contains(&"_absolute".to_string()));
+    let org_dir = lookup_dir(&state, &root, "org");
     let other_dir = lookup_dir(&state, &org_dir, "other");
     let device_dir = lookup_dir(&state, &other_dir, "Device0");
 
@@ -395,7 +398,7 @@ fn outside_object_manager_paths_are_namespaced_under_absolute() {
 }
 
 #[test]
-fn root_object_manager_paths_are_exposed_relative_to_object_root() {
+fn root_object_manager_paths_are_exposed_as_full_dbus_paths() {
     let mut state = DbusState::new(vec![ServiceConfig {
         local_id: "bluez".to_string(),
         bus: BusKind::System,
@@ -418,10 +421,9 @@ fn root_object_manager_paths_are_exposed_relative_to_object_root() {
         )
         .expect("snapshot update succeeds");
 
-    let service = service_node("bluez").unwrap();
+    let service = service_node("system").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let object_dir = lookup_dir(&state, &root, "objects");
-    let org_dir = lookup_dir(&state, &object_dir, "org");
+    let org_dir = lookup_dir(&state, &root, "org");
     let bluez_dir = lookup_dir(&state, &org_dir, "bluez");
     let adapter_dir = lookup_dir(&state, &bluez_dir, "hci0");
 
@@ -434,18 +436,120 @@ fn root_object_manager_paths_are_exposed_relative_to_object_root() {
 }
 
 #[test]
+fn session_bus_paths_are_exposed_under_session() {
+    let mut state = DbusState::new(vec![ServiceConfig {
+        local_id: "agentdbus".to_string(),
+        bus: BusKind::Session,
+        name: "io.github.AgentDBus".to_string(),
+        object_manager_path: "/io/github/AgentDBus".to_string(),
+    }]);
+    let object = object_snapshot(
+        "agentdbus",
+        "/io/github/AgentDBus/sessions/codex",
+        BTreeMap::from([(
+            "io.github.AgentDBus.Session".to_string(),
+            BTreeMap::from([(
+                "Status".to_string(),
+                property(LocusValue::String("running".to_string())),
+            )]),
+        )]),
+    );
+    state
+        .set_service_snapshot(
+            "agentdbus",
+            Some(":1.77".to_string()),
+            BTreeMap::from([(object.path.clone(), object)]),
+        )
+        .expect("snapshot update succeeds");
+
+    let session = service_node("session").unwrap();
+    assert_eq!(
+        state
+            .nodes(&NodeKind::new(DBUS_SERVICE_KIND).unwrap())
+            .unwrap(),
+        vec![session.clone()]
+    );
+    let root = GraphPathDirectory::Node(session);
+    let io_dir = lookup_dir(&state, &root, "io");
+    let github_dir = lookup_dir(&state, &io_dir, "github");
+    let agent_dir = lookup_dir(&state, &github_dir, "AgentDBus");
+    let sessions_dir = lookup_dir(&state, &agent_dir, "sessions");
+    let codex_dir = lookup_dir(&state, &sessions_dir, "codex");
+
+    assert!(matches!(
+        state
+            .path_lookup_child(&codex_dir, &"Status".parse().unwrap())
+            .unwrap(),
+        Some(GraphPathEntry::Property { .. })
+    ));
+}
+
+#[test]
+fn ambiguous_methods_require_canonical_call_names() {
+    let mut state = test_state();
+    let mut object = object_snapshot(
+        "power",
+        "/org/example/Power/devices/Keyboard0",
+        BTreeMap::new(),
+    );
+    object.methods = BTreeMap::from([
+        (
+            "org.example.Keyboard".to_string(),
+            BTreeMap::from([(
+                "Connect".to_string(),
+                DbusMethodSnapshot {
+                    input_signature: Vec::new(),
+                },
+            )]),
+        ),
+        (
+            "org.example.Power.Device".to_string(),
+            BTreeMap::from([(
+                "Connect".to_string(),
+                DbusMethodSnapshot {
+                    input_signature: Vec::new(),
+                },
+            )]),
+        ),
+    ]);
+    state
+        .set_service_snapshot(
+            "power",
+            Some(":1.42".to_string()),
+            BTreeMap::from([(object.path.clone(), object)]),
+        )
+        .expect("snapshot update succeeds");
+
+    let root = GraphPathDirectory::Node(service_node("system").unwrap());
+    let keyboard_dir = lookup_dir(
+        &state,
+        &lookup_dir(
+            &state,
+            &lookup_dir(
+                &state,
+                &lookup_dir(&state, &lookup_dir(&state, &root, "org"), "example"),
+                "Power",
+            ),
+            "devices",
+        ),
+        "Keyboard0",
+    );
+    let listed_children = child_names(&state, &keyboard_dir);
+
+    assert!(!listed_children.contains(&"Connect.call".to_string()));
+    assert!(listed_children.contains(&"org.example.Keyboard.Connect.call".to_string()));
+    assert!(listed_children.contains(&"org.example.Power.Device.Connect.call".to_string()));
+}
+
+#[test]
 fn rejects_unconfigured_service_nodes() {
     let state = test_state();
-    let node = NodeId::new(
-        NodeKind::new(DBUS_SERVICE_KIND).unwrap(),
-        "org.freedesktop.Notifications",
-    )
-    .unwrap();
+    let node = service_node("upower").unwrap();
 
     assert!(!state.contains_node(&node).unwrap());
     assert!(
         state
-            .property(&node, &PropertyKey::new("active").unwrap())
+            .property(&node, &PropertyKey::new("services").unwrap())
             .is_err()
     );
 }
