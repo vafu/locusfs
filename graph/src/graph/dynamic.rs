@@ -233,6 +233,41 @@ impl DynamicGraph {
         Ok(())
     }
 
+    pub async fn register_read_only_provider<P>(&self, provider: P) -> Result<()>
+    where
+        P: NodeProvider + PropertyProvider + RelationProvider + Clone,
+    {
+        let kind = provider.kind().clone();
+        self.register_node_provider(provider.clone()).await?;
+        self.register_property_provider(kind.clone(), provider.clone())
+            .await?;
+        self.register_relation_provider(kind, provider).await
+    }
+
+    pub async fn register_read_write_provider<P>(&self, provider: P) -> Result<()>
+    where
+        P: NodeProvider
+            + NodeMutationProvider
+            + PropertyProvider
+            + PropertyMutationProvider
+            + RelationProvider
+            + RelationMutationProvider
+            + Clone,
+    {
+        let kind = provider.kind().clone();
+        self.register_node_provider(provider.clone()).await?;
+        self.register_node_mutation_provider(kind.clone(), provider.clone())
+            .await?;
+        self.register_property_provider(kind.clone(), provider.clone())
+            .await?;
+        self.register_property_mutation_provider(kind.clone(), provider.clone())
+            .await?;
+        self.register_relation_provider(kind.clone(), provider.clone())
+            .await?;
+        self.register_relation_mutation_provider(kind, provider)
+            .await
+    }
+
     pub async fn watch(&self, target: GraphWatchTarget) -> Result<GraphWatch> {
         if let Some(provider) = self.watch_provider_for_target(&target).await {
             return provider.watch(target).await;

@@ -410,27 +410,7 @@ impl LocusFs {
 
         let provider = InMemoryProvider::new(kind.clone());
         self.graph
-            .register_node_provider(provider.clone())
-            .await
-            .map_err(graph_error_to_errno)?;
-        self.graph
-            .register_node_mutation_provider(kind.clone(), provider.clone())
-            .await
-            .map_err(graph_error_to_errno)?;
-        self.graph
-            .register_property_provider(kind.clone(), provider.clone())
-            .await
-            .map_err(graph_error_to_errno)?;
-        self.graph
-            .register_property_mutation_provider(kind.clone(), provider.clone())
-            .await
-            .map_err(graph_error_to_errno)?;
-        self.graph
-            .register_relation_provider(kind.clone(), provider.clone())
-            .await
-            .map_err(graph_error_to_errno)?;
-        self.graph
-            .register_relation_mutation_provider(kind.clone(), provider)
+            .register_read_write_provider(provider)
             .await
             .map_err(graph_error_to_errno)?;
         Ok(FsEntry::KindDir(kind))

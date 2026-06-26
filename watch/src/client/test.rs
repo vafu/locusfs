@@ -47,6 +47,7 @@ async fn read_timeout_bounds_missing_path_retry() {
         mount_root: Path::new("/tmp").to_path_buf(),
         logical_path: "/missing".to_string(),
         watch_file: AsyncFd::new(watch_file.into()).unwrap(),
+        raw_event_buffer: Vec::new(),
     };
 
     let error = watch
@@ -55,4 +56,29 @@ async fn read_timeout_bounds_missing_path_retry() {
         .unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[tokio::test]
+async fn next_event_returns_one_frame_when_read_drains_multiple_frames() {
+    let (watch_file, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    watch_file.set_nonblocking(true).unwrap();
+    let mut watch = Watch {
+        data_path: Path::new("/tmp/locusfs-client-value").to_path_buf(),
+        mount_root: Path::new("/tmp").to_path_buf(),
+        logical_path: "/node/57".to_string(),
+        watch_file: AsyncFd::new(watch_file.into()).unwrap(),
+        raw_event_buffer: b"change\nnode removed node:57\n".to_vec(),
+    };
+
+    assert_eq!(
+        watch.next_event().await.unwrap(),
+        crate::WatchEvent::Change(crate::WatchChange::Change)
+    );
+    assert_eq!(
+        watch.next_event().await.unwrap(),
+        crate::WatchEvent::Change(crate::WatchChange::Node {
+            action: crate::WatchAction::Removed,
+            node: "node:57".to_string(),
+        })
+    );
 }

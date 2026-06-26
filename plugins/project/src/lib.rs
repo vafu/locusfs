@@ -40,24 +40,7 @@ pub async fn register_with_config(
     let kind = NodeKind::new(PROJECT_KIND)?;
     let provider = InMemoryProvider::new(kind.clone());
     let traced_provider = TracedProvider::new("project", provider.clone());
-    graph
-        .register_node_provider(traced_provider.clone())
-        .await?;
-    graph
-        .register_node_mutation_provider(kind.clone(), traced_provider.clone())
-        .await?;
-    graph
-        .register_property_provider(kind.clone(), traced_provider.clone())
-        .await?;
-    graph
-        .register_property_mutation_provider(kind.clone(), traced_provider.clone())
-        .await?;
-    graph
-        .register_relation_provider(kind.clone(), traced_provider.clone())
-        .await?;
-    graph
-        .register_relation_mutation_provider(kind, traced_provider)
-        .await?;
+    graph.register_read_write_provider(traced_provider).await?;
     Ok(ProjectPluginHandle {
         _provider: provider,
     })

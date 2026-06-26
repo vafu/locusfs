@@ -395,6 +395,7 @@ where
         result
     }
 
+    #[cfg(feature = "watch-provider")]
     async fn watch_target(
         &self,
         directory: &GraphPathDirectory,

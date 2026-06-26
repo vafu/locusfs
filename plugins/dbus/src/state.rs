@@ -16,15 +16,13 @@ pub const OBJECT_RELATION: &str = "object";
 pub const METHODS_RELATION: &str = "methods";
 pub const SERVICE_RELATION: &str = "dbus";
 
-const PATH_OBJECT: &str = "object";
-const PATH_PROPERTIES: &str = "@properties";
-const PATH_METHODS: &str = "@methods";
-const PATH_ABSOLUTE: &str = "@absolute";
-const VIRTUAL_OBJECT: &str = "object";
-const VIRTUAL_PROPERTIES: &str = "properties";
+const PATH_OBJECTS: &str = "objects";
+const PATH_METHODS: &str = "methods";
+const PATH_ABSOLUTE: &str = "_absolute";
+const VIRTUAL_OBJECTS: &str = "objects";
 const VIRTUAL_METHODS: &str = "methods";
-const VIRTUAL_METHOD: &str = "method";
 const VIRTUAL_SEPARATOR: &str = "|";
+const CALL_PROPERTY: &str = "call";
 
 const SOURCE: &str = "dbus";
 
@@ -241,16 +239,17 @@ impl DbusState {
         name: &PathName,
     ) -> Result<Option<GraphPathEntry>> {
         match parent {
-            GraphPathDirectory::Node(node)
-                if node.kind().as_str() == DBUS_SERVICE_KIND && name.as_str() == PATH_OBJECT =>
-            {
+            GraphPathDirectory::Node(node) if node.kind().as_str() == DBUS_SERVICE_KIND => {
                 if !self.contains_node(node)? {
                     return Ok(None);
                 }
+                let Some(root) = service_path_root(name.as_str()) else {
+                    return Ok(None);
+                };
                 Ok(Some(GraphPathEntry::Directory(
                     GraphPathDirectory::Virtual {
                         owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: object_virtual_local(node.local(), &[]),
+                        local: tree_virtual_local(root, node.local(), &[]),
                     },
                 )))
             }
@@ -270,13 +269,22 @@ impl DbusState {
                 if !self.contains_node(node)? {
                     return Ok(None);
                 }
-                Ok(Some(vec![GraphPathChild {
-                    name: PathName::new(PATH_OBJECT)?,
-                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: object_virtual_local(node.local(), &[]),
-                    }),
-                }]))
+                Ok(Some(vec![
+                    GraphPathChild {
+                        name: PathName::new(PATH_OBJECTS)?,
+                        entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                            local: tree_virtual_local(VIRTUAL_OBJECTS, node.local(), &[]),
+                        }),
+                    },
+                    GraphPathChild {
+                        name: PathName::new(PATH_METHODS)?,
+                        entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                            local: tree_virtual_local(VIRTUAL_METHODS, node.local(), &[]),
+                        }),
+                    },
+                ]))
             }
             GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUS_SERVICE_KIND => {
                 self.virtual_path_children(local).map(Some)
@@ -468,86 +476,11 @@ impl DbusState {
     fn virtual_path_lookup(&self, local: &str, name: &PathName) -> Result<Option<GraphPathEntry>> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECT) if parts.len() >= 2 => {
-                let service_local_id = parts[1].as_str();
-                let segments = &parts[2..];
-                let segment = name.as_str();
-                if segment == PATH_PROPERTIES {
-                    let Some(object) = self.exact_object(service_local_id, segments)? else {
-                        return Ok(None);
-                    };
-                    return Ok(Some(GraphPathEntry::Directory(
-                        GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: object_node_virtual_local(VIRTUAL_PROPERTIES, &object),
-                        },
-                    )));
-                }
-                if segment == PATH_METHODS {
-                    let Some(object) = self.exact_object(service_local_id, segments)? else {
-                        return Ok(None);
-                    };
-                    return Ok(Some(GraphPathEntry::Directory(
-                        GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: object_node_virtual_local(VIRTUAL_METHODS, &object),
-                        },
-                    )));
-                }
-                let mut child = segments
-                    .iter()
-                    .map(|segment| segment.to_string())
-                    .collect::<Vec<_>>();
-                child.push(segment.to_string());
-                if self.has_object_prefix(service_local_id, &child)? {
-                    Ok(Some(GraphPathEntry::Directory(
-                        GraphPathDirectory::Virtual {
-                            owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                            local: object_virtual_local(service_local_id, &child),
-                        },
-                    )))
-                } else {
-                    Ok(None)
-                }
+            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
+                self.object_tree_lookup(parts[1].as_str(), &parts[2..], name)
             }
-            Some(VIRTUAL_PROPERTIES) if parts.len() == 2 => {
-                let object_local = parts[1].as_str();
-                let object_node = object_node(object_local)?;
-                let key = PropertyKey::new(name.as_str())?;
-                if self.property_spec(&object_node, &key).is_ok() {
-                    Ok(Some(GraphPathEntry::Property {
-                        node: object_node,
-                        key,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
-            Some(VIRTUAL_METHODS) if parts.len() == 2 => {
-                let object_local = parts[1].as_str();
-                let object_node = object_node(object_local)?;
-                let Some(method) = self.method_by_display(&object_node, name.as_str())? else {
-                    return Ok(None);
-                };
-                Ok(Some(GraphPathEntry::Directory(
-                    GraphPathDirectory::Virtual {
-                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                        local: object_node_virtual_local(VIRTUAL_METHOD, &method),
-                    },
-                )))
-            }
-            Some(VIRTUAL_METHOD) if parts.len() == 2 => {
-                let method_local = parts[1].as_str();
-                let method_node = method_node(method_local)?;
-                let key = PropertyKey::new(name.as_str())?;
-                if self.property_spec(&method_node, &key).is_ok() {
-                    Ok(Some(GraphPathEntry::Property {
-                        node: method_node,
-                        key,
-                    }))
-                } else {
-                    Ok(None)
-                }
+            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
+                self.method_tree_lookup(parts[1].as_str(), &parts[2..], name)
             }
             _ => Ok(None),
         }
@@ -556,79 +489,11 @@ impl DbusState {
     fn virtual_path_children(&self, local: &str) -> Result<Vec<GraphPathChild>> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECT) if parts.len() >= 2 => {
-                let service_local_id = parts[1].as_str();
-                let segments = parts[2..].to_vec();
-                let children = self
-                    .child_object_segment_names(service_local_id, &segments)?
-                    .into_iter()
-                    .map(|segment| {
-                        let mut child = segments.clone();
-                        child.push(segment.clone());
-                        Ok(GraphPathChild {
-                            name: PathName::new(segment)?,
-                            entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                                owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                                local: object_virtual_local(service_local_id, &child),
-                            }),
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                // Metadata directories are still addressable through lookup, but
-                // they are not D-Bus object children and must not be emitted in
-                // watched child snapshots.
-                Ok(children)
+            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
+                self.object_tree_children(parts[1].as_str(), &parts[2..])
             }
-            Some(VIRTUAL_PROPERTIES) if parts.len() == 2 => {
-                let object_local = parts[1].as_str();
-                let object_node = object_node(object_local)?;
-                self.properties(&object_node)?
-                    .into_iter()
-                    .map(|spec| {
-                        let key = spec.key().clone();
-                        Ok(GraphPathChild {
-                            name: PathName::new(key.as_str())?,
-                            entry: GraphPathEntry::Property {
-                                node: object_node.clone(),
-                                key,
-                            },
-                        })
-                    })
-                    .collect()
-            }
-            Some(VIRTUAL_METHODS) if parts.len() == 2 => {
-                let object_local = parts[1].as_str();
-                let object_node = object_node(object_local)?;
-                self.method_targets(&object_node)?
-                    .into_iter()
-                    .map(|method| {
-                        Ok(GraphPathChild {
-                            name: PathName::new(method_display_from_node(&method))?,
-                            entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
-                                owner: NodeKind::new(DBUS_SERVICE_KIND)?,
-                                local: object_node_virtual_local(VIRTUAL_METHOD, &method),
-                            }),
-                        })
-                    })
-                    .collect()
-            }
-            Some(VIRTUAL_METHOD) if parts.len() == 2 => {
-                let method_local = parts[1].as_str();
-                let method_node = method_node(method_local)?;
-                self.properties(&method_node)?
-                    .into_iter()
-                    .filter(|spec| spec.key().as_str() == "call")
-                    .map(|spec| {
-                        let key = spec.key().clone();
-                        Ok(GraphPathChild {
-                            name: PathName::new(key.as_str())?,
-                            entry: GraphPathEntry::Property {
-                                node: method_node.clone(),
-                                key,
-                            },
-                        })
-                    })
-                    .collect()
+            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
+                self.method_tree_children(parts[1].as_str(), &parts[2..])
             }
             _ => Ok(Vec::new()),
         }
@@ -637,25 +502,204 @@ impl DbusState {
     fn virtual_path_watch_target(&self, local: &str) -> Result<GraphWatchTarget> {
         let parts = virtual_parts(local);
         match parts.first().map(String::as_str) {
-            Some(VIRTUAL_OBJECT) if parts.len() >= 2 => Ok(GraphWatchTarget::Relation(
-                service_node(&parts[1])?,
-                relation(OBJECT_RELATION)?,
-            )),
-            Some(VIRTUAL_PROPERTIES) if parts.len() == 2 => {
-                Ok(GraphWatchTarget::Node(object_node(&parts[1])?))
+            Some(VIRTUAL_OBJECTS) if parts.len() >= 2 => {
+                let service_local_id = parts[1].as_str();
+                if let Some(object) = self.exact_object(service_local_id, &parts[2..])? {
+                    return Ok(GraphWatchTarget::Node(object));
+                }
+                Ok(GraphWatchTarget::Relation(
+                    service_node(service_local_id)?,
+                    relation(OBJECT_RELATION)?,
+                ))
             }
-            Some(VIRTUAL_METHODS) if parts.len() == 2 => Ok(GraphWatchTarget::Relation(
-                object_node(&parts[1])?,
-                relation(METHODS_RELATION)?,
-            )),
-            Some(VIRTUAL_METHOD) if parts.len() == 2 => {
-                Ok(GraphWatchTarget::Node(method_node(&parts[1])?))
+            Some(VIRTUAL_METHODS) if parts.len() >= 2 => {
+                let service_local_id = parts[1].as_str();
+                if let Some(object) = self.exact_object(service_local_id, &parts[2..])? {
+                    return Ok(GraphWatchTarget::Relation(
+                        object,
+                        relation(METHODS_RELATION)?,
+                    ));
+                }
+                Ok(GraphWatchTarget::Relation(
+                    service_node(service_local_id)?,
+                    relation(OBJECT_RELATION)?,
+                ))
             }
             _ => Err(GraphError::NotFound {
                 kind: "D-Bus virtual path",
                 name: local.to_string(),
             }),
         }
+    }
+
+    fn object_tree_lookup(
+        &self,
+        service_local_id: &str,
+        segments: &[String],
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        let mut child = segments.to_vec();
+        child.push(name.as_str().to_string());
+        if self.has_object_prefix(service_local_id, &child)? {
+            return Ok(Some(GraphPathEntry::Directory(
+                GraphPathDirectory::Virtual {
+                    owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                    local: tree_virtual_local(VIRTUAL_OBJECTS, service_local_id, &child),
+                },
+            )));
+        }
+
+        let Some(object_node) = self.exact_object(service_local_id, segments)? else {
+            return Ok(None);
+        };
+        let key = PropertyKey::new(name.as_str())?;
+        if self.resolve_dbus_property(&object_node, &key)?.is_some() {
+            Ok(Some(GraphPathEntry::Property {
+                node: object_node,
+                key,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn method_tree_lookup(
+        &self,
+        service_local_id: &str,
+        segments: &[String],
+        name: &PathName,
+    ) -> Result<Option<GraphPathEntry>> {
+        let mut child = segments.to_vec();
+        child.push(name.as_str().to_string());
+        if self.has_object_prefix(service_local_id, &child)? {
+            return Ok(Some(GraphPathEntry::Directory(
+                GraphPathDirectory::Virtual {
+                    owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                    local: tree_virtual_local(VIRTUAL_METHODS, service_local_id, &child),
+                },
+            )));
+        }
+
+        let Some(object_node) = self.exact_object(service_local_id, segments)? else {
+            return Ok(None);
+        };
+        let Some(method_node) = self.method_by_display(&object_node, name.as_str())? else {
+            return Ok(None);
+        };
+        Ok(Some(GraphPathEntry::Property {
+            node: method_node,
+            key: PropertyKey::new(CALL_PROPERTY)?,
+        }))
+    }
+
+    fn object_tree_children(
+        &self,
+        service_local_id: &str,
+        segments: &[String],
+    ) -> Result<Vec<GraphPathChild>> {
+        let child_segments = self.child_object_segment_names(service_local_id, segments)?;
+        let reserved_names = child_segments.iter().cloned().collect::<BTreeSet<_>>();
+        let mut children = child_segments
+            .into_iter()
+            .map(|segment| {
+                let mut child = segments.to_vec();
+                child.push(segment.clone());
+                Ok(GraphPathChild {
+                    name: PathName::new(segment)?,
+                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                        local: tree_virtual_local(VIRTUAL_OBJECTS, service_local_id, &child),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if let Some(object_node) = self.exact_object(service_local_id, segments)? {
+            for name in self.dbus_property_names(&object_node, &reserved_names)? {
+                let key = PropertyKey::new(name.as_str())?;
+                children.push(GraphPathChild {
+                    name: PathName::new(name)?,
+                    entry: GraphPathEntry::Property {
+                        node: object_node.clone(),
+                        key,
+                    },
+                });
+            }
+        }
+
+        Ok(children)
+    }
+
+    fn method_tree_children(
+        &self,
+        service_local_id: &str,
+        segments: &[String],
+    ) -> Result<Vec<GraphPathChild>> {
+        let child_segments = self.child_object_segment_names(service_local_id, segments)?;
+        let reserved_names = child_segments.iter().cloned().collect::<BTreeSet<_>>();
+        let mut children = child_segments
+            .into_iter()
+            .map(|segment| {
+                let mut child = segments.to_vec();
+                child.push(segment.clone());
+                Ok(GraphPathChild {
+                    name: PathName::new(segment)?,
+                    entry: GraphPathEntry::Directory(GraphPathDirectory::Virtual {
+                        owner: NodeKind::new(DBUS_SERVICE_KIND)?,
+                        local: tree_virtual_local(VIRTUAL_METHODS, service_local_id, &child),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if let Some(object_node) = self.exact_object(service_local_id, segments)? {
+            for method_node in self.method_targets(&object_node)? {
+                let name = method_display_from_node(&method_node);
+                if reserved_names.contains(&name) {
+                    continue;
+                }
+                children.push(GraphPathChild {
+                    name: PathName::new(name)?,
+                    entry: GraphPathEntry::Property {
+                        node: method_node,
+                        key: PropertyKey::new(CALL_PROPERTY)?,
+                    },
+                });
+            }
+        }
+
+        Ok(children)
+    }
+
+    fn dbus_property_names(
+        &self,
+        object_node: &NodeId,
+        reserved_names: &BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        let Some((_, object)) = self.object_entry(object_node) else {
+            return Err(node_not_found(object_node));
+        };
+
+        let mut property_counts = BTreeMap::<String, usize>::new();
+        for interface_properties in object.interfaces.values() {
+            for property in interface_properties.keys() {
+                *property_counts.entry(property.clone()).or_default() += 1;
+            }
+        }
+
+        let mut names = BTreeSet::new();
+        for (interface, interface_properties) in &object.interfaces {
+            for property in interface_properties.keys() {
+                let canonical = format!("{interface}.{property}");
+                if !reserved_names.contains(&canonical) {
+                    names.insert(canonical);
+                }
+                if property_counts.get(property) == Some(&1) && !reserved_names.contains(property) {
+                    names.insert(property.clone());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
     fn exact_object(&self, service_local_id: &str, segments: &[String]) -> Result<Option<NodeId>> {
@@ -1194,19 +1238,19 @@ fn object_method_keys(object: &ObjectSnapshot) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-fn object_virtual_local(service_local_id: &str, segments: &[String]) -> String {
-    std::iter::once(VIRTUAL_OBJECT.to_string())
+fn service_path_root(name: &str) -> Option<&'static str> {
+    match name {
+        PATH_OBJECTS => Some(VIRTUAL_OBJECTS),
+        PATH_METHODS => Some(VIRTUAL_METHODS),
+        _ => None,
+    }
+}
+
+fn tree_virtual_local(root: &str, service_local_id: &str, segments: &[String]) -> String {
+    std::iter::once(root.to_string())
         .chain(std::iter::once(service_local_id.to_string()))
         .chain(segments.iter().cloned())
         .map(|part| encode_virtual_part(&part))
-        .collect::<Vec<_>>()
-        .join(VIRTUAL_SEPARATOR)
-}
-
-fn object_node_virtual_local(prefix: &str, node: &NodeId) -> String {
-    [prefix, node.local()]
-        .into_iter()
-        .map(encode_virtual_part)
         .collect::<Vec<_>>()
         .join(VIRTUAL_SEPARATOR)
 }
@@ -1216,14 +1260,6 @@ fn virtual_parts(local: &str) -> Vec<String> {
         .split(VIRTUAL_SEPARATOR)
         .map(decode_virtual_part)
         .collect()
-}
-
-fn object_node(local: &str) -> Result<NodeId> {
-    NodeId::new(NodeKind::new(DBUS_OBJECT_KIND)?, local.to_string())
-}
-
-fn method_node(local: &str) -> Result<NodeId> {
-    NodeId::new(NodeKind::new(DBUS_METHOD_KIND)?, local.to_string())
 }
 
 fn method_display_from_node(method: &NodeId) -> String {
@@ -1238,7 +1274,7 @@ fn method_display_from_node(method: &NodeId) -> String {
 fn object_path_segments(config: &ServiceConfig, path: &str) -> Vec<String> {
     let display = object_display_path(config, path);
     if display == "@" {
-        return vec!["@".to_string()];
+        return Vec::new();
     }
 
     let mut segments = display

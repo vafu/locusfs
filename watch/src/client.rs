@@ -136,6 +136,7 @@ pub struct Watch {
     mount_root: PathBuf,
     logical_path: String,
     watch_file: AsyncFd<OwnedFd>,
+    raw_event_buffer: Vec<u8>,
 }
 
 impl Watch {
@@ -171,6 +172,7 @@ impl Watch {
             mount_root,
             logical_path,
             watch_file,
+            raw_event_buffer: Vec::new(),
         })
     }
 
@@ -222,10 +224,18 @@ impl Watch {
 
     /// Waits until this subscription receives a raw watch event payload.
     pub async fn next_raw_event(&mut self) -> io::Result<Vec<u8>> {
+        if let Some(event) = self.pop_raw_event() {
+            return Ok(event);
+        }
         loop {
             let mut guard = self.watch_file.readable().await?;
             match guard.try_io(|watch_file| drain_watch_events(watch_file.get_ref())) {
-                Ok(result) => return result,
+                Ok(result) => {
+                    self.raw_event_buffer.extend(result?);
+                    if let Some(event) = self.pop_raw_event() {
+                        return Ok(event);
+                    }
+                }
                 Err(_would_block) => continue,
             }
         }
@@ -280,6 +290,16 @@ impl Watch {
         })
         .await
         .map_err(|_| timed_out("wait for watch event and read watched path"))?
+    }
+
+    fn pop_raw_event(&mut self) -> Option<Vec<u8>> {
+        let newline = self
+            .raw_event_buffer
+            .iter()
+            .position(|byte| *byte == b'\n')?;
+        let rest = self.raw_event_buffer.split_off(newline + 1);
+        let event = std::mem::replace(&mut self.raw_event_buffer, rest);
+        Some(event)
     }
 }
 

@@ -323,26 +323,34 @@ fn service_path_exposes_object_tree_properties_and_methods() {
 
     let service = service_node("power").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let object_dir = lookup_dir(&state, &root, "object");
-    let devices_dir = lookup_dir(&state, &object_dir, "devices");
+    let service_children = child_names(&state, &root);
+    assert_eq!(
+        service_children,
+        vec!["objects".to_string(), "methods".to_string()]
+    );
+
+    let objects_dir = lookup_dir(&state, &root, "objects");
+    let methods_dir = lookup_dir(&state, &root, "methods");
+    let devices_dir = lookup_dir(&state, &objects_dir, "devices");
     let keyboard_dir = lookup_dir(&state, &devices_dir, "Keyboard0");
     let listed_children = child_names(&state, &keyboard_dir);
     assert!(!listed_children.contains(&"@properties".to_string()));
     assert!(!listed_children.contains(&"@methods".to_string()));
-
-    let properties_dir = lookup_dir(&state, &keyboard_dir, "@properties");
-    let methods_dir = lookup_dir(&state, &keyboard_dir, "@methods");
+    assert!(listed_children.contains(&"Name".to_string()));
+    assert!(listed_children.contains(&"org.example.Power.Device.Name".to_string()));
 
     assert!(matches!(
         state
-            .path_lookup_child(&properties_dir, &"Name".parse().unwrap())
+            .path_lookup_child(&keyboard_dir, &"Name".parse().unwrap())
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
-    let method_dir = lookup_dir(&state, &methods_dir, "Connect");
+
+    let method_devices_dir = lookup_dir(&state, &methods_dir, "devices");
+    let keyboard_methods_dir = lookup_dir(&state, &method_devices_dir, "Keyboard0");
     assert!(matches!(
         state
-            .path_lookup_child(&method_dir, &"call".parse().unwrap())
+            .path_lookup_child(&keyboard_methods_dir, &"Connect".parse().unwrap())
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
@@ -372,16 +380,15 @@ fn outside_object_manager_paths_are_namespaced_under_absolute() {
 
     let service = service_node("power").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let object_dir = lookup_dir(&state, &root, "object");
-    let absolute_dir = lookup_dir(&state, &object_dir, "@absolute");
+    let object_dir = lookup_dir(&state, &root, "objects");
+    let absolute_dir = lookup_dir(&state, &object_dir, "_absolute");
     let org_dir = lookup_dir(&state, &absolute_dir, "org");
     let other_dir = lookup_dir(&state, &org_dir, "other");
     let device_dir = lookup_dir(&state, &other_dir, "Device0");
-    let properties_dir = lookup_dir(&state, &device_dir, "@properties");
 
     assert!(matches!(
         state
-            .path_lookup_child(&properties_dir, &"Name".parse().unwrap())
+            .path_lookup_child(&device_dir, &"Name".parse().unwrap())
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
@@ -413,15 +420,14 @@ fn root_object_manager_paths_are_exposed_relative_to_object_root() {
 
     let service = service_node("bluez").unwrap();
     let root = GraphPathDirectory::Node(service);
-    let object_dir = lookup_dir(&state, &root, "object");
+    let object_dir = lookup_dir(&state, &root, "objects");
     let org_dir = lookup_dir(&state, &object_dir, "org");
     let bluez_dir = lookup_dir(&state, &org_dir, "bluez");
     let adapter_dir = lookup_dir(&state, &bluez_dir, "hci0");
-    let properties_dir = lookup_dir(&state, &adapter_dir, "@properties");
 
     assert!(matches!(
         state
-            .path_lookup_child(&properties_dir, &"Powered".parse().unwrap())
+            .path_lookup_child(&adapter_dir, &"Powered".parse().unwrap())
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));

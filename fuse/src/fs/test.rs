@@ -508,6 +508,31 @@ fn watch_registry_buffers_partial_event_reads() {
 }
 
 #[test]
+fn watch_registry_poll_reports_partial_event_read_buffer() {
+    let node = test_node("57");
+    let mut registry = WatchRegistry::new();
+    let handle = registry.open(&FsEntry::WatchFile).unwrap();
+
+    registry
+        .configure_watch(
+            handle,
+            "/node/57".to_string(),
+            watch::WatchTarget {
+                subject: watch::WatchSubjectKey::Node(node.clone()),
+                dependencies: Vec::new(),
+                ready: true,
+                mode: watch::WatchMode::Changes,
+            },
+            false,
+        )
+        .unwrap();
+    registry.notify_node_change(&node, WatchChange::NodeChanged(node.clone()));
+
+    assert_eq!(registry.read_watch_chunk(handle, 0, 5).unwrap(), b"node ");
+    assert_ne!(registry.poll(handle, None, 0).unwrap(), 0);
+}
+
+#[test]
 fn watch_registry_drains_next_event_after_completed_offset_read() {
     let node = test_node("57");
     let mut registry = WatchRegistry::new();
@@ -997,6 +1022,10 @@ fn missing_node_state_watch_is_indexed_by_kind_for_refresh() {
 
     assert_eq!(
         registry.state_watch_paths_for_subject(&watch::WatchSubjectKey::Kind(kind)),
+        vec![(handle, "/node/57/title".to_string())]
+    );
+    assert_eq!(
+        registry.all_state_watch_paths(),
         vec![(handle, "/node/57/title".to_string())]
     );
 }

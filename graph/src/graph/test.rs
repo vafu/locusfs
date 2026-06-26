@@ -583,6 +583,32 @@ async fn providers_can_be_registered_as_separate_capabilities() {
     ));
 }
 
+#[tokio::test]
+async fn read_write_provider_registration_registers_all_core_capabilities() {
+    let kind = NodeKind::new("project").unwrap();
+    let graph = DynamicGraph::new();
+    let provider = InMemoryProvider::new(kind.clone());
+    let node = NodeId::new(kind, "locusfs").unwrap();
+    let key = PropertyKey::new("name").unwrap();
+    let relation = RelationName::new("child").unwrap();
+    let target = NodeId::new(node.kind().clone(), "docs").unwrap();
+
+    graph.register_read_write_provider(provider).await.unwrap();
+    graph.create_node(&node).await.unwrap();
+    graph.create_node(&target).await.unwrap();
+    graph
+        .set_property(&node, &key, LocusValue::String("LocusFS".to_string()))
+        .await
+        .unwrap();
+    graph.set_link(&node, &relation, &target).await.unwrap();
+
+    assert_eq!(
+        graph.property(&node, &key).await.unwrap(),
+        LocusValue::String("LocusFS".to_string())
+    );
+    assert_eq!(graph.targets(&node, &relation).await.unwrap(), vec![target]);
+}
+
 struct StaticNodeProvider {
     kind: NodeKind,
     node: NodeId,

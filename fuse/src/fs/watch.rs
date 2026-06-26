@@ -307,7 +307,7 @@ impl WatchRegistry {
                 let Some(OpenFileState::Watch(watch)) = self.open_files.get_mut(&handle.0) else {
                     return Err(errno(libc::EBADF));
                 };
-                if !watch.pending_events.is_empty() {
+                if watch.pending_read.is_some() || !watch.pending_events.is_empty() {
                     return Ok(READABLE_EVENTS);
                 }
                 if flags & FUSE_POLL_SCHEDULE_NOTIFY != 0 {
@@ -627,6 +627,24 @@ impl WatchRegistry {
                     return None;
                 }
                 watch.original_path.clone().map(|path| (handle, path))
+            })
+            .collect()
+    }
+
+    pub fn all_state_watch_paths(&self) -> Vec<(FileHandle, String)> {
+        self.open_files
+            .iter()
+            .filter_map(|(handle, state)| {
+                let OpenFileState::Watch(watch) = state else {
+                    return None;
+                };
+                if !matches!(watch.mode, WatchMode::State) {
+                    return None;
+                }
+                watch
+                    .original_path
+                    .clone()
+                    .map(|path| (FileHandle(*handle), path))
             })
             .collect()
     }

@@ -58,8 +58,13 @@ pub(crate) fn spawn_change_invalidator(
                             .await;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            resync_known_state(notifier.clone(), inodes.clone(), watch.clone())
-                                .await;
+                            resync_known_state(
+                                notifier.clone(),
+                                graph.clone(),
+                                inodes.clone(),
+                                watch.clone(),
+                            )
+                            .await;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -343,6 +348,7 @@ async fn invalidate_relation_change(
 
 async fn resync_known_state(
     notifier: SharedKernelNotify,
+    graph: DynamicGraph,
     inodes: SharedInodeTable,
     watch: SharedWatchRegistry,
 ) {
@@ -365,7 +371,8 @@ async fn resync_known_state(
         let mut watch = watch.lock().await;
         watch.notify_all()
     };
-    notify_poll_handles(notifier, handles).await;
+    notify_poll_handles(notifier.clone(), handles).await;
+    refresh_all_state_watchers(notifier, graph, watch).await;
 }
 
 async fn invalidate_known_child(
@@ -484,6 +491,32 @@ async fn refresh_state_watchers_for_subject(
     let paths = {
         let watch = watch.lock().await;
         watch.state_watch_paths_for_subject(&subject)
+    };
+
+    let mut had_poll_waiters = false;
+    for (handle, path) in paths {
+        let result = resolve_watch_state(&graph, &path).await;
+        let (target, state) = match result {
+            Ok((target, state)) => (Ok(target), Some(state)),
+            Err(error) => (Err(error), None),
+        };
+        let handles = {
+            let mut watch = watch.lock().await;
+            watch.apply_retarget_result(handle, path, target, state)
+        };
+        had_poll_waiters |= notify_poll_handles(notifier.clone(), handles).await;
+    }
+    had_poll_waiters
+}
+
+async fn refresh_all_state_watchers(
+    notifier: SharedKernelNotify,
+    graph: DynamicGraph,
+    watch: SharedWatchRegistry,
+) -> bool {
+    let paths = {
+        let watch = watch.lock().await;
+        watch.all_state_watch_paths()
     };
 
     let mut had_poll_waiters = false;
