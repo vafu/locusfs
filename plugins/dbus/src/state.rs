@@ -282,10 +282,7 @@ impl DbusState {
                 if !self.contains_node(node)? {
                     return Ok(None);
                 }
-                Ok(Some(GraphWatchTarget::Relation(
-                    node.clone(),
-                    relation(OBJECT_RELATION)?,
-                )))
+                Ok(Some(GraphWatchTarget::Node(node.clone())))
             }
             GraphPathDirectory::Virtual { owner, local } if owner.as_str() == DBUS_SERVICE_KIND => {
                 self.virtual_path_watch_target(local).map(Some)
@@ -398,62 +395,24 @@ impl DbusState {
     }
 
     fn node_relations(&self, node: &NodeId) -> Result<BTreeMap<RelationName, Vec<NodeId>>> {
-        let mut relations = BTreeMap::new();
         match node.kind().as_str() {
             DBUS_SERVICE_KIND => {
                 let bus = bus_kind_from_local(node.local()).ok_or_else(|| node_not_found(node))?;
                 if !self.contains_bus(bus) {
                     return Err(node_not_found(node));
                 }
-                relations.insert(
-                    relation(OBJECT_RELATION)?,
-                    self.services_on_bus(bus)
-                        .flat_map(|service| {
-                            service
-                                .objects
-                                .values()
-                                .map(|object| service_object_node(service, object))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                );
             }
             DBUS_OBJECT_KIND => {
-                let (service, object) = self
-                    .object_entry(node)
+                self.object_entry(node)
                     .ok_or_else(|| node_not_found(node))?;
-                relations.insert(
-                    relation(SERVICE_RELATION)?,
-                    vec![service_node(service.config.bus.as_str())?],
-                );
-                let methods = object
-                    .methods
-                    .iter()
-                    .flat_map(|(interface, methods)| {
-                        methods
-                            .keys()
-                            .map(|method| service_method_node(service, object, interface, method))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if !methods.is_empty() {
-                    relations.insert(relation(METHODS_RELATION)?, methods);
-                }
             }
             DBUS_METHOD_KIND => {
-                let (service, object, _, _, _) = self
-                    .method_entry(node)
+                self.method_entry(node)
                     .ok_or_else(|| node_not_found(node))?;
-                relations.insert(
-                    relation(SERVICE_RELATION)?,
-                    vec![service_node(service.config.bus.as_str())?],
-                );
-                relations.insert(
-                    relation(OBJECT_RELATION)?,
-                    vec![service_object_node(service, object)?],
-                );
             }
             _ => return Err(node_not_found(node)),
         }
-        Ok(relations)
+        Ok(BTreeMap::new())
     }
 
     fn object(&self, node: &NodeId) -> Option<&ObjectSnapshot> {
@@ -495,13 +454,10 @@ impl DbusState {
                         kind: "D-Bus virtual path",
                         name: local.to_string(),
                     })?;
-                if let Some(object) = self.exact_object_on_bus(bus, &parts[2..])? {
-                    return Ok(GraphWatchTarget::Node(object));
+                if self.exact_object_on_bus(bus, &parts[2..])?.is_some() {
+                    return Ok(GraphWatchTarget::Kind(NodeKind::new(DBUS_OBJECT_KIND)?));
                 }
-                Ok(GraphWatchTarget::Relation(
-                    service_node(bus.as_str())?,
-                    relation(OBJECT_RELATION)?,
-                ))
+                Ok(GraphWatchTarget::Node(service_node(bus.as_str())?))
             }
             _ => Err(GraphError::NotFound {
                 kind: "D-Bus virtual path",

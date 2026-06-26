@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use locusfs_graph::{
-    GraphPathDirectory, GraphPathEntry, LocusValue, NodeId, NodeKind, PropertyKey, RelationName,
+    GraphPathDirectory, GraphPathEntry, GraphWatchTarget, LocusValue, NodeId, NodeKind,
+    PropertyKey, RelationName,
 };
 
 use super::{
@@ -44,7 +45,7 @@ fn inactive_bus_properties_list_services_without_active_services() {
 }
 
 #[test]
-fn service_snapshot_exposes_objects_and_relations() {
+fn service_snapshot_exposes_objects_without_public_relations() {
     let mut state = test_state();
     let object = object_snapshot(
         "power",
@@ -81,17 +82,17 @@ fn service_snapshot_exposes_objects_and_relations() {
             .unwrap(),
         LocusValue::String("power".to_string())
     );
-    assert_eq!(
+    assert!(state.relations(&service).unwrap().is_empty());
+    assert!(
         state
             .targets(&service, &RelationName::new("object").unwrap())
-            .unwrap(),
-        vec![object_node.clone()]
+            .is_err()
     );
-    assert_eq!(
+    assert!(state.relations(&object_node).unwrap().is_empty());
+    assert!(
         state
             .targets(&object_node, &RelationName::new("dbus").unwrap())
-            .unwrap(),
-        vec![service]
+            .is_err()
     );
     assert_eq!(
         state
@@ -270,12 +271,13 @@ fn object_methods_are_exposed_as_write_only_call_nodes() {
     .unwrap();
     let call_key = PropertyKey::new("call").unwrap();
 
-    assert_eq!(
+    assert!(state.relations(&object_node).unwrap().is_empty());
+    assert!(
         state
             .targets(&object_node, &RelationName::new("methods").unwrap())
-            .unwrap(),
-        vec![method_node.clone()]
+            .is_err()
     );
+    assert!(state.contains_node(&method_node).unwrap());
     assert_eq!(
         state
             .property(&method_node, &PropertyKey::new("method").unwrap())
@@ -482,6 +484,12 @@ fn session_bus_paths_are_exposed_under_session() {
             .unwrap(),
         Some(GraphPathEntry::Property { .. })
     ));
+    assert_eq!(
+        state.path_watch_target(&codex_dir).unwrap(),
+        Some(GraphWatchTarget::Kind(
+            NodeKind::new(DBUS_OBJECT_KIND).unwrap()
+        ))
+    );
 }
 
 #[test]
