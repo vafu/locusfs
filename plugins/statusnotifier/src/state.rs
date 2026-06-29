@@ -33,6 +33,14 @@ pub struct StatusNotifierItem {
     pub overlay_icon_name: String,
     pub menu_path: String,
     pub item_is_menu: bool,
+    pub icon_pixmap: Option<StatusNotifierPixmap>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusNotifierPixmap {
+    pub width: u32,
+    pub height: u32,
+    pub argb32_hex: String,
 }
 
 #[derive(Debug, Default)]
@@ -325,6 +333,23 @@ fn item_properties(item: &StatusNotifierItem) -> Result<BTreeMap<PropertyKey, Lo
         "item-is-menu",
         LocusValue::Bool(item.item_is_menu),
     )?;
+    if let Some(pixmap) = &item.icon_pixmap {
+        insert(
+            &mut properties,
+            "icon-pixmap-width",
+            LocusValue::U32(pixmap.width),
+        )?;
+        insert(
+            &mut properties,
+            "icon-pixmap-height",
+            LocusValue::U32(pixmap.height),
+        )?;
+        insert(
+            &mut properties,
+            "icon-pixmap-argb32",
+            string(&pixmap.argb32_hex),
+        )?;
+    }
     Ok(properties)
 }
 

@@ -10,9 +10,12 @@ use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::message::Header;
 use zbus::names::{BusName, InterfaceName, WellKnownName};
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{Array, ObjectPath, OwnedObjectPath, OwnedValue, Structure, Value};
 
-use crate::state::{SharedStatusNotifierState, StatusNotifierItem, item_id, registered_item_name};
+use crate::state::{
+    SharedStatusNotifierState, StatusNotifierItem, StatusNotifierPixmap, item_id,
+    registered_item_name,
+};
 
 const WATCHER_SERVICE: &str = "org.kde.StatusNotifierWatcher";
 const XAPP_WATCHER_SERVICE: &str = "org.x.StatusNotifierWatcher";
@@ -395,6 +398,7 @@ async fn snapshot_item(
         overlay_icon_name: owned_string(&properties, "OverlayIconName").unwrap_or_default(),
         menu_path: owned_object_path(&properties, "Menu").unwrap_or_default(),
         item_is_menu: owned_bool(&properties, "ItemIsMenu").unwrap_or(false),
+        icon_pixmap: owned_pixmap(&properties, "IconPixmap"),
     })
 }
 
@@ -507,6 +511,107 @@ fn publish_changes(graph: &DynamicGraph, changes: Vec<GraphChange>) {
             eprintln!("locusfs-statusnotifier: failed to emit graph change: {error}");
         }
     }
+}
+
+fn owned_pixmap(values: &BTreeMap<String, OwnedValue>, key: &str) -> Option<StatusNotifierPixmap> {
+    values
+        .get(key)
+        .cloned()
+        .and_then(|value| parse_pixmaps(value).ok())
+        .and_then(|pixmaps| {
+            pixmaps
+                .into_iter()
+                .max_by_key(|pixmap| pixmap.width * pixmap.height)
+        })
+}
+
+fn parse_pixmaps(value: OwnedValue) -> Result<Vec<StatusNotifierPixmap>> {
+    let value = Value::from(value);
+    let array = value
+        .downcast::<Array<'_>>()
+        .map_err(|error| pixmap_io(error))?;
+    array
+        .iter()
+        .map(|value| value.try_clone().map_err(pixmap_io).and_then(parse_pixmap))
+        .collect()
+}
+
+fn parse_pixmap(value: Value<'_>) -> Result<StatusNotifierPixmap> {
+    let structure = value
+        .downcast::<Structure<'_>>()
+        .map_err(|error| pixmap_io(error))?;
+    let mut fields = structure.into_fields().into_iter();
+    let width = fields
+        .next()
+        .ok_or_else(|| invalid_pixmap("missing width"))?
+        .try_into()
+        .map_err(|error| pixmap_io(error))?;
+    let height = fields
+        .next()
+        .ok_or_else(|| invalid_pixmap("missing height"))?
+        .try_into()
+        .map_err(|error| pixmap_io(error))?;
+    let bytes = fields
+        .next()
+        .ok_or_else(|| invalid_pixmap("missing data"))?;
+    let bytes = pixmap_bytes(bytes)?;
+    pixmap_from_argb(width, height, bytes)
+}
+
+fn pixmap_bytes(value: Value<'_>) -> Result<Vec<u8>> {
+    let array = value
+        .downcast::<Array<'_>>()
+        .map_err(|error| pixmap_io(error))?;
+    array
+        .iter()
+        .map(|value| value.try_into().map_err(|error| pixmap_io(error)))
+        .collect()
+}
+
+fn pixmap_from_argb(width: i32, height: i32, bytes: Vec<u8>) -> Result<StatusNotifierPixmap> {
+    if width <= 0 || height <= 0 {
+        return Err(invalid_pixmap("dimensions must be positive"));
+    }
+    let width = u32::try_from(width).map_err(|_| invalid_pixmap("width out of range"))?;
+    let height = u32::try_from(height).map_err(|_| invalid_pixmap("height out of range"))?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| invalid_pixmap("dimensions overflow"))?;
+    if bytes.len() != expected as usize {
+        return Err(GraphError::InvalidValue {
+            kind: "StatusNotifier IconPixmap",
+            value: bytes.len().to_string(),
+            reason: "unexpected byte length",
+        });
+    }
+    Ok(StatusNotifierPixmap {
+        width,
+        height,
+        argb32_hex: hex_encode(&bytes),
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn invalid_pixmap(reason: &'static str) -> GraphError {
+    GraphError::InvalidValue {
+        kind: "StatusNotifier IconPixmap",
+        value: String::new(),
+        reason,
+    }
+}
+
+fn pixmap_io(error: impl std::fmt::Display) -> GraphError {
+    GraphError::Io(format!("read StatusNotifier IconPixmap: {error}"))
 }
 
 fn registered_item_target(service_or_path: &str, sender: &str) -> Option<(String, String)> {
