@@ -431,7 +431,13 @@ impl DbusMenuState {
                 let item = self
                     .item(node.local())
                     .ok_or_else(|| node_not_found(node))?;
-                relations.insert(relation(CHILD_RELATION)?, item.child_targets()?);
+                let targets = self
+                    .menus
+                    .get(&item.menu_id)
+                    .map(|menu| menu.item_targets(&item.child_ids))
+                    .transpose()?
+                    .unwrap_or_default();
+                relations.insert(relation(CHILD_RELATION)?, targets);
             }
             _ => return Err(node_not_found(node)),
         }
@@ -544,10 +550,6 @@ impl DbusMenuEndpoint {
 impl DbusMenuItem {
     pub fn local_id(&self) -> String {
         format!("{}:{:04}:{}", self.menu_id, self.position, self.item_id)
-    }
-
-    fn child_targets(&self) -> Result<Vec<NodeId>> {
-        Ok(Vec::new())
     }
 }
 
@@ -757,8 +759,9 @@ mod test {
     use locusfs_graph::{GraphPathDirectory, GraphPathEntry, LocusValue, NodeKind, PropertyKey};
 
     use super::{
-        BusKind, DBUSMENU_ITEM_KIND, DBUSMENU_KIND, DBUSMENU_MENU_KIND, DbusMenuEndpoint,
-        DbusMenuItem, DbusMenuState, ITEM_NODE, MENU_NODE, dbusmenu_node, menu_node,
+        BusKind, CHILD_RELATION, DBUSMENU_ITEM_KIND, DBUSMENU_KIND, DBUSMENU_MENU_KIND,
+        DbusMenuEndpoint, DbusMenuItem, DbusMenuState, ITEM_NODE, MENU_NODE, dbusmenu_node,
+        menu_node,
     };
 
     #[test]
@@ -802,6 +805,78 @@ mod test {
                 .property(&endpoint, &PropertyKey::new("service").unwrap())
                 .unwrap(),
             LocusValue::String("org.example.App".to_string())
+        );
+    }
+
+    #[test]
+    fn exposes_item_children_relation() {
+        let mut menu = DbusMenuEndpoint {
+            local_id: "app:Menu".to_string(),
+            bus: BusKind::Session,
+            service: "org.example.App".to_string(),
+            path: "/Menu".to_string(),
+            revision: 0,
+            root_items: vec![1],
+            items: BTreeMap::new(),
+        };
+        let parent = DbusMenuItem {
+            menu_id: menu.local_id.clone(),
+            bus: BusKind::Session,
+            service: menu.service.clone(),
+            path: menu.path.clone(),
+            item_id: 1,
+            parent_id: None,
+            position: 0,
+            child_ids: vec![2],
+            label: "More".to_string(),
+            enabled: true,
+            visible: true,
+            item_type: String::new(),
+            toggle_type: String::new(),
+            toggle_state: -1,
+            icon_name: String::new(),
+            disposition: String::new(),
+        };
+        let child = DbusMenuItem {
+            menu_id: menu.local_id.clone(),
+            bus: BusKind::Session,
+            service: menu.service.clone(),
+            path: menu.path.clone(),
+            item_id: 2,
+            parent_id: Some(1),
+            position: 0,
+            child_ids: Vec::new(),
+            label: "Child".to_string(),
+            enabled: true,
+            visible: true,
+            item_type: String::new(),
+            toggle_type: String::new(),
+            toggle_state: -1,
+            icon_name: String::new(),
+            disposition: String::new(),
+        };
+        let parent_node = locusfs_graph::NodeId::new(
+            NodeKind::new(DBUSMENU_ITEM_KIND).unwrap(),
+            &parent.local_id(),
+        )
+        .unwrap();
+        let child_node = locusfs_graph::NodeId::new(
+            NodeKind::new(DBUSMENU_ITEM_KIND).unwrap(),
+            &child.local_id(),
+        )
+        .unwrap();
+        menu.items.insert(parent.item_id, parent);
+        menu.items.insert(child.item_id, child);
+        let state = DbusMenuState::new(vec![menu]);
+
+        assert_eq!(
+            state
+                .targets(
+                    &parent_node,
+                    &locusfs_graph::RelationName::new(CHILD_RELATION).unwrap(),
+                )
+                .unwrap(),
+            vec![child_node]
         );
     }
 
