@@ -12,7 +12,7 @@ use zbus::names::{BusName, InterfaceName, WellKnownName};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::state::{SharedStatusNotifierState, StatusNotifierItem, item_id};
+use crate::state::{SharedStatusNotifierState, StatusNotifierItem, item_id, registered_item_name};
 
 const WATCHER_SERVICE: &str = "org.kde.StatusNotifierWatcher";
 const XAPP_WATCHER_SERVICE: &str = "org.x.StatusNotifierWatcher";
@@ -69,13 +69,16 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(ToString::to_string).unwrap_or_default();
+        let registered_item = registered_item_target(service, &sender)
+            .map(|(service_name, path)| registered_item_name(&service_name, &path))
+            .unwrap_or_else(|| service.to_owned());
         self.commands
             .send(WatcherCommand::RegisterItem {
                 service_or_path: service.to_owned(),
                 sender,
             })
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-        Self::status_notifier_item_registered(&emitter, service).await?;
+        Self::status_notifier_item_registered(&emitter, registered_item.as_str()).await?;
         Ok(())
     }
 

@@ -67,7 +67,7 @@ impl StatusNotifierState {
         self.snapshot
             .items
             .values()
-            .map(|item| item.service_name.clone())
+            .map(|item| registered_item_name(&item.service_name, &item.path))
             .collect()
     }
 
@@ -336,6 +336,20 @@ pub fn item_id(service_name: &str, path: &str) -> String {
             char => char,
         })
         .collect()
+}
+
+/// StatusNotifierWatcher-compatible item name.
+///
+/// Items registered with the default object path are exposed as just the bus
+/// name. Items registered by object path need both pieces so consumers can
+/// query the real StatusNotifierItem object instead of assuming
+/// /StatusNotifierItem.
+pub fn registered_item_name(service_name: &str, path: &str) -> String {
+    if path == "/StatusNotifierItem" {
+        service_name.to_owned()
+    } else {
+        format!("{service_name}{path}")
+    }
 }
 
 fn statusnotifier_node(local: &str) -> Result<NodeId> {

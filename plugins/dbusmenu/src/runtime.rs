@@ -95,11 +95,13 @@ async fn watch_status_notifier_menus(
                 let Some(signal) = signal else {
                     return Err(GraphError::Io("StatusNotifierItemRegistered stream ended".to_string()));
                 };
-                let service = signal
+                let item = signal
                     .body()
                     .deserialize::<String>()
                     .map_err(|error| GraphError::Io(format!("read StatusNotifierItemRegistered: {error}")))?;
-                refresh_item(&connection, graph, state, &service, DEFAULT_ITEM_PATH).await;
+                if let Some((service, path)) = registered_item_target(item.as_str()) {
+                    refresh_item(&connection, graph, state, service.as_str(), path.as_str()).await;
+                }
             }
             signal = unregistered.next() => {
                 let Some(signal) = signal else {
@@ -127,10 +129,28 @@ async fn refresh_registered_items(
         .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
         .await
         .map_err(|error| GraphError::Io(format!("read RegisteredStatusNotifierItems: {error}")))?;
-    for service in items {
-        refresh_item(connection, graph, state, &service, DEFAULT_ITEM_PATH).await;
+    for item in items {
+        if let Some((service, path)) = registered_item_target(item.as_str()) {
+            refresh_item(connection, graph, state, service.as_str(), path.as_str()).await;
+        }
     }
     Ok(())
+}
+
+pub(crate) fn registered_item_target(item: &str) -> Option<(String, String)> {
+    if item.is_empty() || item.starts_with('/') {
+        return None;
+    }
+    let Some(path_start) = item.find('/') else {
+        return Some((item.to_owned(), DEFAULT_ITEM_PATH.to_owned()));
+    };
+    let service = &item[..path_start];
+    let path = &item[path_start..];
+    if service.is_empty() || path.is_empty() {
+        None
+    } else {
+        Some((service.to_owned(), path.to_owned()))
+    }
 }
 
 async fn refresh_item(
@@ -311,7 +331,9 @@ fn parse_children(children: Vec<OwnedValue>) -> Result<Vec<LayoutItem>> {
 }
 
 fn raw_layout_from_value(value: OwnedValue) -> Result<RawLayoutItem> {
-    let structure = Structure::try_from(value)
+    let value = Value::from(value);
+    let structure = value
+        .downcast::<Structure<'_>>()
         .map_err(|error| invalid_layout(format!("invalid child structure: {error}")))?;
     raw_layout_from_structure(structure)
 }

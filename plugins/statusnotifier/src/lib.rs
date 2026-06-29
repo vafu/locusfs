@@ -1,5 +1,8 @@
 //! StatusNotifier/AppIndicator graph provider for `locusfs`.
 
+#[cfg(test)]
+mod test;
+
 mod provider;
 mod runtime;
 mod state;

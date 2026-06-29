@@ -1,5 +1,8 @@
 //! DBusMenu graph provider for `locusfs`.
 
+#[cfg(test)]
+mod test;
+
 pub mod config;
 mod provider;
 mod runtime;
