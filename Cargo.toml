@@ -12,6 +12,7 @@ members = [
     "plugins/pipewire",
     "plugins/project",
     "plugins/statusnotifier",
+    "plugins/notifyd",
 ]
 resolver = "3"
 

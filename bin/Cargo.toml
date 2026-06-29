@@ -8,6 +8,7 @@ name = "locusfs"
 path = "src/main.rs"
 
 [dependencies]
+futures-util = { workspace = true }
 libc = "0.2"
 libloading = "0.8"
 locusfs-graph = { path = "../graph", default-features = false, features = ["dynamic"] }
@@ -21,3 +22,4 @@ toml = { workspace = true }
 tracing = "0.1"
 tracing-perfetto-sdk = "1.0.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }

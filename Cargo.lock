@@ -441,6 +441,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "locusfs-bin"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "libc",
  "libloading",
  "locusfs-fuse",
@@ -454,6 +455,7 @@ dependencies = [
  "tracing",
  "tracing-perfetto-sdk",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]
@@ -548,6 +550,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "locusfs-plugin-notifyd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "locusfs-graph",
+ "locusfs-plugin-api",
+ "serde",
+ "tokio",
+ "toml",
+ "zbus",
 ]
 
 [[package]]

@@ -228,15 +228,40 @@ impl Watch {
             return Ok(event);
         }
         loop {
+            let revents = poll_revents(self.watch_file.get_ref())?;
+            check_poll_errors(revents, "watch file")?;
+            if revents & libc::POLLIN != 0 {
+                self.raw_event_buffer
+                    .extend(drain_watch_events(self.watch_file.get_ref())?);
+                if let Some(event) = self.pop_raw_event() {
+                    return Ok(event);
+                }
+                continue;
+            }
+
             let mut guard = self.watch_file.readable().await?;
-            match guard.try_io(|watch_file| drain_watch_events(watch_file.get_ref())) {
+            let mut drained_events = Vec::new();
+            match guard.try_io(
+                |watch_file| match drain_watch_events(watch_file.get_ref()) {
+                    Ok(events) => {
+                        drained_events = events;
+                        Err(io::ErrorKind::WouldBlock.into())
+                    }
+                    Err(error) => Err(error),
+                },
+            ) {
                 Ok(result) => {
-                    self.raw_event_buffer.extend(result?);
+                    result?;
+                }
+                Err(_would_block) => {
+                    if drained_events.is_empty() {
+                        continue;
+                    }
+                    self.raw_event_buffer.extend(drained_events);
                     if let Some(event) = self.pop_raw_event() {
                         return Ok(event);
                     }
                 }
-                Err(_would_block) => continue,
             }
         }
     }
@@ -304,12 +329,6 @@ impl Watch {
 }
 
 fn drain_watch_events(fd: &OwnedFd) -> io::Result<Vec<u8>> {
-    let revents = poll_revents(fd)?;
-    check_poll_errors(revents, "watch file")?;
-    if revents & libc::POLLIN == 0 {
-        return Err(io::ErrorKind::WouldBlock.into());
-    }
-
     let mut buffer = [0_u8; 4096];
     let mut events = Vec::new();
     loop {
@@ -321,6 +340,7 @@ fn drain_watch_events(fd: &OwnedFd) -> io::Result<Vec<u8>> {
             )
         };
         match result {
+            0 if events.is_empty() => return Err(io::ErrorKind::WouldBlock.into()),
             0 => return Ok(events),
             read if read > 0 => {
                 events.extend_from_slice(&buffer[..read as usize]);

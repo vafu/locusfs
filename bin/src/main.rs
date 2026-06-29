@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use crate::config::Config;
 use crate::plugin::PluginManager;
+use futures_util::StreamExt;
 use locusfs_fuse::{FuseMount, FuseMountConfig, mount};
 use locusfs_graph::DynamicGraph;
 use tracing_subscriber::prelude::*;
@@ -70,7 +71,7 @@ async fn run() -> std::result::Result<(), AppError> {
     eprintln!("locusfs mounted at {}", mountpoint.display());
     eprintln!("press Ctrl-C to unmount");
 
-    let shutdown_result = wait_for_shutdown().await;
+    let shutdown_result = wait_for_shutdown(&mount).await;
     plugins.shutdown().await;
     let unmount_result = unmount_with_fallback(mount, &mountpoint).await;
     cleanup_mountpoint(&mountpoint, mountpoint_state).await?;
@@ -269,23 +270,153 @@ async fn default_graph(
     Ok((graph, plugins))
 }
 
-async fn wait_for_shutdown() -> std::result::Result<(), AppError> {
+async fn wait_for_shutdown(mount: &FuseMount) -> std::result::Result<(), AppError> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
 
         let mut interrupt = signal(SignalKind::interrupt())?;
         let mut terminate = signal(SignalKind::terminate())?;
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
+        let mut sleep_events = match PrepareForSleepEvents::connect().await {
+            Ok(events) => Some(events),
+            Err(error) => {
+                eprintln!("locusfs: system sleep watcher disabled: {error}");
+                None
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = interrupt.recv() => return Ok(()),
+                _ = terminate.recv() => return Ok(()),
+                event = next_prepare_for_sleep(&mut sleep_events) => {
+                    match event {
+                        PrepareForSleepEvent::Preparing => {
+                            eprintln!("locusfs: preparing for sleep; waking FUSE watch clients");
+                            mount.resync_known_state().await;
+                            if let Some(events) = sleep_events.as_mut() {
+                                events.release_inhibitor();
+                            }
+                        }
+                        PrepareForSleepEvent::Resumed => {
+                            if let Some(events) = sleep_events.as_mut() {
+                                if let Err(error) = events.reacquire_inhibitor().await {
+                                    eprintln!("locusfs: system sleep watcher stopped: {error}");
+                                    sleep_events = None;
+                                }
+                            }
+                        }
+                        PrepareForSleepEvent::Closed => {
+                            eprintln!("locusfs: system sleep watcher ended");
+                            sleep_events = None;
+                        }
+                        PrepareForSleepEvent::Error(error) => {
+                            eprintln!("locusfs: system sleep watcher stopped: {error}");
+                            sleep_events = None;
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     #[cfg(not(unix))]
     {
+        let _ = mount;
         tokio::signal::ctrl_c().await?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct PrepareForSleepEvents {
+    _connection: zbus::Connection,
+    inhibitor: Option<zbus::zvariant::OwnedFd>,
+    stream: zbus::MessageStream,
+}
+
+#[cfg(unix)]
+impl PrepareForSleepEvents {
+    async fn connect() -> zbus::Result<Self> {
+        use zbus::message::Type as MessageType;
+
+        let connection = zbus::Connection::system().await?;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender("org.freedesktop.login1")?
+            .interface("org.freedesktop.login1.Manager")?
+            .member("PrepareForSleep")?
+            .build();
+        let stream = zbus::MessageStream::for_match_rule(rule, &connection, Some(16)).await?;
+        let inhibitor = Some(acquire_sleep_inhibitor(&connection).await?);
+        Ok(Self {
+            _connection: connection,
+            inhibitor,
+            stream,
+        })
+    }
+
+    async fn next(&mut self) -> Option<zbus::Result<bool>> {
+        self.stream
+            .next()
+            .await
+            .map(|message| message.and_then(|message| message.body().deserialize::<bool>()))
+    }
+
+    fn release_inhibitor(&mut self) {
+        self.inhibitor = None;
+    }
+
+    async fn reacquire_inhibitor(&mut self) -> zbus::Result<()> {
+        self.inhibitor = Some(acquire_sleep_inhibitor(&self._connection).await?);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn acquire_sleep_inhibitor(
+    connection: &zbus::Connection,
+) -> zbus::Result<zbus::zvariant::OwnedFd> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    proxy
+        .call(
+            "Inhibit",
+            &(
+                "sleep",
+                "locusfs",
+                "wake FUSE watch clients before sleep",
+                "delay",
+            ),
+        )
+        .await
+}
+
+#[cfg(unix)]
+enum PrepareForSleepEvent {
+    Preparing,
+    Resumed,
+    Closed,
+    Error(zbus::Error),
+}
+
+#[cfg(unix)]
+async fn next_prepare_for_sleep(
+    events: &mut Option<PrepareForSleepEvents>,
+) -> PrepareForSleepEvent {
+    let Some(events) = events.as_mut() else {
+        return std::future::pending().await;
+    };
+
+    match events.next().await {
+        Some(Ok(true)) => PrepareForSleepEvent::Preparing,
+        Some(Ok(false)) => PrepareForSleepEvent::Resumed,
+        Some(Err(error)) => PrepareForSleepEvent::Error(error),
+        None => PrepareForSleepEvent::Closed,
     }
 }

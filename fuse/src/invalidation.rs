@@ -346,7 +346,7 @@ async fn invalidate_relation_change(
     }
 }
 
-async fn resync_known_state(
+pub(crate) async fn resync_known_state(
     notifier: SharedKernelNotify,
     graph: DynamicGraph,
     inodes: SharedInodeTable,
